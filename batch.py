@@ -801,6 +801,5 @@ async def view_transcript(video_id: str, request: Request, db: Session = Depends
     content = transcript_file.read_text(encoding='utf-8')
     return {"video_id": video_id, "transcript": content}
 
-
 # ============= End batch Module =============
 

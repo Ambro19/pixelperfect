@@ -1,15 +1,12 @@
-# YouTube Content Downloader - .gitignore
-
-# ==========================
-# BACKEND (Python/FastAPI)
-# ==========================
-
 # Python
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
+env/
+venv/
+ENV/
 build/
 develop-eggs/
 dist/
@@ -22,317 +19,44 @@ parts/
 sdist/
 var/
 wheels/
-share/python-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-MANIFEST
-
-# Virtual Environment
-venv/
-env/
-env.local/
-ENV/
-env.bak/
-venv.bak/
-.venv/
-
-# Database files
-*.db
-*.sqlite
-*.sqlite3
-youtube_transcript_downloader.db*
 
 # Environment variables
 .env
 .env.local
-.env.development.local
-.env.test.local
-.env.production.local
-.env.*.local
-frontend/.env
-backend/.env
-*.db.*
-*.pyc
+.env.production
 
-
-# FastAPI specific
-.pytest_cache/
-htmlcov/
-.coverage
-.coverage.*
-coverage.xml
-*.cover
-*.py,cover
-.hypothesis/
-
-# Logs
-*.log
-logs/
-*.log.*
-
-# Temporary files
-*.tmp
-*.temp
-temp/
-tmp/
-
-# ==========================
-# FRONTEND (React/Node.js)
-# ==========================
-
-# Dependencies
-node_modules/
-/.pnp
-.pnp.js
-
-# Production build
-/build
-/dist
-
-# Runtime data
-pids
-*.pid
-*.seed
-*.pid.lock
-
-# Coverage directory used by tools like istanbul
-coverage/
-*.lcov
-
-# nyc test coverage
-.nyc_output
-
-# Dependency directories
-jspm_packages/
-
-# Optional npm cache directory
-.npm
-
-# Optional eslint cache
-.eslintcache
-
-# Microbundle cache
-.rpt2_cache/
-.rts2_cache_cjs/
-.rts2_cache_es/
-.rts2_cache_umd/
-
-# Optional REPL history
-.node_repl_history
-
-# Output of 'npm pack'
-*.tgz
-
-# Yarn
-yarn-error.log*
-.yarn-integrity
-.yarn/cache
-.yarn/unplugged
-.yarn/build-state.yml
-.yarn/install-state.gz
-.pnp.*
-
-# =============================================================================
-# DEVELOPMENT & SYSTEM FILES
-# =============================================================================
-
-# IDEs and editors
+# IDE
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
-*.sublime-project
-*.sublime-workspace
 
-# OS generated files
+# OS
 .DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
 Thumbs.db
-desktop.ini
 
-# Git
-*.orig
-.git/index.lock
-
-# =============================================================================
-# PROJECT SPECIFIC
-# =============================================================================
-
-# Downloaded media files (temporary)
-downloads/
-temp_downloads/
-*.mp3
-*.mp4
-*.webm
-*.m4a
-
-# Backup files
-*.backup
-*.bak
-backup_*
-
-# Test files
-test_output/
-test_downloads/
-
-# Documentation builds
-docs/_build/
-site/
-
-# Stripe test files
-stripe_test/
-
-# SSL certificates (if any)
-*.pem
-*.key
-*.crt
-
-# ===========
-# DEPLOYMENT
-# ===========
-
-# Docker
-Dockerfile.prod
-docker-compose.prod.yml
-.dockerignore
-
-# Deployment configs
-.env.production
-secrets/
-config/production.*
-
-# CDN/Static files
-static/
-media/
-uploads/
-
-# =======================
-# ANALYTICS & MONITORING
-# =======================
-
-# Error tracking
-.sentry-dsn
-sentry.properties
-
-# Monitoring
-newrelic.ini
-.newrelic.yml
-
-# Analytics
-.analytics/
-analytics.json
-
-# ========
-# TESTING
-# ========
-
-# Jest
-coverage/
-*.lcov
-
-# Testing artifacts
-test-results/
-test-report.xml
-junit.xml
-
-# Playwright
-test-results/
-playwright-report/
-playwright/.cache/
-
-# =================
-# PACKAGE MANAGERS
-# =================
-
-# pip
-pip-log.txt
-pip-delete-this-directory.txt
-
-# pipenv
-Pipfile.lock
-
-# Poetry
-poetry.lock
-
-# Conda
-.conda/
-
-# ==================
-# CACHE & TEMPORARY
-# ==================
-
-# General cache
-.cache/
-*.cache
-
-# Babel
-.babel_cache/
-
-# ESLint
-.eslintcache
-
-# Parcel
-.parcel-cache/
-
-# Next.js
-.next/
-
-# Nuxt.js
-.nuxt/
-
-# Gatsby
-.cache/
-public/
-
-# Storybook
-.out
-.storybook-out
-
-# ==============================
-# SECRETS (NEVER COMMIT THESE!)
-# ==============================
-
-# API Keys
-*_api_key*
-*_secret_key*
-api_keys.txt
-secrets.txt
-
-# Stripe
-stripe_keys.txt
-.stripe_*
-
-# Database credentials
-db_credentials.*
-
-# JWT secrets
-jwt_secret*
-
-# OAuth credentials
-oauth_*
-client_secret*
-
-# Batch processing state files
-.batch_jobs_snapshot.json
-batch_jobs_*.json
-
-# Other runtime data you might want to exclude
+# Logs
 *.log
-server_files/
-downloads/
 
-# SQLite
-*.db-shm
-*.db-wal
-# (usually also ignore the DB itself)
+# Database
 *.db
+*.sqlite
 
-cookies.txt
-cookies_base64.txt
-main_important_backup.txt
+# Testing
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Uploads
+uploads/
+screenshots/
+EOF
+
+# Commit and push
+git add .
+git commit -m "Initial commit - PixelPerfect API"
+git push origin main
