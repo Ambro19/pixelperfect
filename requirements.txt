@@ -2,7 +2,7 @@
 # REQUIREMENTS.TXT - PIXELPERFECT API
 # ========================================
 # Python 3.11 Compatible Dependencies
-# Updated: January 2026
+# Updated: January 2026 - Added PyJWT
 
 # Core FastAPI
 fastapi==0.115.0
@@ -17,6 +17,7 @@ greenlet==3.1.1
 
 # Authentication & Security
 python-jose[cryptography]==3.3.0
+PyJWT==2.9.0
 passlib[bcrypt]==1.7.4
 bcrypt==4.2.1
 
