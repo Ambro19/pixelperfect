@@ -1,5 +1,9 @@
+# ========================================
 # main.py - PixelPerfect Screenshot API
+# ========================================
 # Production-ready FastAPI application
+# Author: OneTechly
+# Created: January 2026
 # Updated: January 2026
 
 from pathlib import Path
