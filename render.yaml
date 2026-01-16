@@ -1,121 +1,63 @@
-# render.yaml - Production Ready Configuration
-# Updated: October 2025
-
 services:
   - type: web
-    name: youtube-trans-downloader-api
+    name: pixelperfect-screenshot-api
     env: python
     plan: free
-    
-    # Build Command - Install system dependencies and Python packages
+
     buildCommand: |
-      set -e
-      echo "🔧 Installing system dependencies..."
       apt-get update -qq
       apt-get install -y --no-install-recommends ffmpeg
-      echo "✅ ffmpeg installed"
-      
-      echo "📦 Installing Python dependencies..."
       pip install --upgrade pip
       pip install --no-cache-dir -r requirements.txt
-      echo "✅ Python packages installed"
-      
-      echo "🎯 Verifying yt-dlp installation..."
-      python -m yt_dlp --version || pip install --no-cache-dir --force-reinstall yt-dlp==2024.12.13
-      echo "✅ yt-dlp verified"
-    
-    # Start Command
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1
-    
-    # Health Check
+
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+
     healthCheckPath: /health
-    
-    # Environment Variables
+
     envVars:
-      - key: APP_ENV
-        value: production
-      
       - key: ENVIRONMENT
         value: production
-      
+
+      - key: DEBUG
+        value: false
+
       - key: HOST
         value: 0.0.0.0
-      
+
       - key: PORT
         value: 10000
-      
+
       - key: FRONTEND_URL
-        value: https://onetechly.com
-      
-      # Secret Key (set in Render dashboard)
+        value: https://pixelperfectapi.net
+
+      - key: BACKEND_URL
+        value: https://api.pixelperfectapi.net
+
+      - key: CORS_ORIGINS
+        value: https://pixelperfectapi.net,https://www.pixelperfectapi.net
+
       - key: SECRET_KEY
         sync: false
-      
-      # Stripe Configuration (set in Render dashboard)
+
       - key: STRIPE_SECRET_KEY
         sync: false
-      
       - key: STRIPE_WEBHOOK_SECRET
         sync: false
-      
-      - key: PRO_PRICE_ID
+      - key: STRIPE_PRO_LOOKUP_KEY
+        value: pixelperfect_pro_monthly
+      - key: STRIPE_BUSINESS_LOOKUP_KEY
+        value: pixelperfect_business_monthly
+
+      - key: R2_ENDPOINT_URL
+        value: https://<your_account_id>.r2.cloudflarestorage.com
+      - key: R2_ACCESS_KEY_ID
         sync: false
-      
-      - key: PREMIUM_PRICE_ID
+      - key: R2_SECRET_ACCESS_KEY
         sync: false
-      
-      # Database Connection
-      - key: DATABASE_URL
-        fromDatabase:
-          name: youtube-trans-db
-          property: connectionString
-      
-      # YouTube Download Configuration
-      - key: YTDLP_NO_MTIME
-        value: true
-      
-      # YouTube Cookies (set in Render dashboard OR use Secret Files)
-      # Option 1: Use Secret Files (recommended) - set cookies.txt as secret file
-      # Option 2: Set YTDLP_COOKIES_FILE=/etc/secrets/cookies.txt
-      - key: YTDLP_COOKIES_FILE
-        value: /etc/secrets/cookies.txt
-      
-      # Optional: Rate Limiting Configuration
-      - key: RL_ENABLED
-        value: true
-      
-      - key: RL_DEFAULT_MAX
-        value: 120
-      
-      - key: RL_AUTH_MAX
-        value: 10
-      
-      - key: RL_DL_MAX
-        value: 40
-      
-      # Optional: File Retention
-      - key: FILE_RETENTION_DAYS
-        value: 7
-      
-      # Optional: Email Configuration (for contact form and password reset)
-      - key: SENDGRID_API_KEY
-        sync: false
-      
-      - key: CONTACT_RECIPIENT
-        value: onetechly@gmail.com
-      
+      - key: R2_BUCKET_NAME
+        value: pixelperfect-screenshots
+
       - key: CONTACT_FROM
         value: no-reply@onetechly.com
-      
-      # Password Reset Token TTL (1 hour)
-      - key: RESET_TOKEN_TTL_SECONDS
-        value: 3600
-
-databases:
-  - name: youtube-trans-db
-    plan: free
-    # The free plan includes:
-    # - 1 PostgreSQL database
-    # - Automatic daily backups with 7 day retention
-    # - 256MB RAM, Shared CPU
-    # - 1GB storage (expandable to 5GB when you upgrade)
+      - key: CONTACT_RECIPIENT
+        value: onetechly@gmail.com

@@ -3,13 +3,12 @@
 # ========================================
 # Production-ready FastAPI application
 # Author: OneTechly
-# FIXED: Pydantic V2 + Lifespan handlers + Production-ready
+# Created: January 2026
 # Updated: January 2026
 
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any, Tuple
-from contextlib import asynccontextmanager
 import re, time, socket, logging, jwt, threading, os
 from collections import defaultdict, deque
 
@@ -30,9 +29,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import delete as sqla_delete
 from sqlalchemy.exc import OperationalError
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
-from pydantic import BaseModel, EmailStr, ConfigDict
-
-from routers import pricing
+from pydantic import BaseModel, EmailStr
 
 # Local imports
 from email_utils import send_password_reset_email
@@ -96,13 +93,21 @@ from auth_deps import get_current_user
 from webhook_handler import handle_stripe_webhook
 
 # ============================================================================
+# FILE STORAGE - DEFINED EARLY FOR ROUTER IMPORTS
+# ============================================================================
+
+SCREENSHOTS_DIR = Path(__file__).resolve().parent / "screenshots"
+SCREENSHOTS_DIR.mkdir(exist_ok=True)
+logger.info("📁 Screenshots directory: %s", SCREENSHOTS_DIR)
+
+# ============================================================================
 # IMPORT ROUTERS
 # ============================================================================
 
 # Payment router
 from payment import router as payment_router
 
-# Screenshot router (FIXED IMPORT)
+# Screenshot router
 try:
     from routers.screenshot import router as screenshot_router
     logger.info("✅ Screenshot router imported successfully")
@@ -160,33 +165,6 @@ except Exception as e:
     stripe = None
 
 # ============================================================================
-# LIFESPAN CONTEXT MANAGER (REPLACES @app.on_event)
-# ============================================================================
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Application lifespan handler - replaces deprecated on_event"""
-    # Startup
-    initialize_database()
-    run_startup_migrations(engine)
-
-    logger.info("=" * 60)
-    logger.info("🚀 PixelPerfect Screenshot API Starting")
-    logger.info("=" * 60)
-    logger.info("📝 Environment: %s", ENVIRONMENT)
-    logger.info("📁 Screenshots directory: %s", SCREENSHOTS_DIR)
-    logger.info("🗄️ Database: %s", "PostgreSQL" if "postgres" in DATABASE_URL else "SQLite")
-    logger.info("💳 Stripe configured: %s", bool(stripe and os.getenv("STRIPE_SECRET_KEY")))
-    logger.info("=" * 60)
-    logger.info("✅ Backend started successfully")
-    logger.info("=" * 60)
-    
-    yield
-    
-    # Shutdown
-    logger.info("🛑 Shutting down PixelPerfect API")
-
-# ============================================================================
 # FASTAPI APP
 # ============================================================================
 
@@ -195,7 +173,6 @@ app = FastAPI(
     version="1.0.0",
     description="Professional Website Screenshot API with Playwright",
     default_response_class=ORJSONResponse,
-    lifespan=lifespan,  # ✅ NEW: Lifespan handler instead of on_event
 )
 
 # ============================================================================
@@ -262,8 +239,6 @@ app.add_middleware(
     x_frame_options="DENY",
     server_header="PixelPerfect",
 )
-
-app.include_router(pricing.router)
 
 # ============================================================================
 # MIDDLEWARE - Rate Limiting
@@ -349,12 +324,12 @@ app.add_middleware(
 logger.info("✅ CORS enabled for origins: %s", allow_origins)
 
 # ============================================================================
-# FILE STORAGE
+# MOUNT STATIC FILES - SCREENSHOTS
 # ============================================================================
 
-SCREENSHOTS_DIR = Path(__file__).resolve().parent / "screenshots"
-SCREENSHOTS_DIR.mkdir(exist_ok=True)
-logger.info("📁 Screenshots directory: %s", SCREENSHOTS_DIR)
+# Mount screenshots directory for public access
+app.mount("/screenshots", StaticFiles(directory=str(SCREENSHOTS_DIR)), name="screenshots")
+logger.info("✅ Mounted /screenshots static directory")
 
 # ============================================================================
 # AUTH HELPERS
@@ -442,7 +417,7 @@ def ensure_stripe_customer_for_user(user: User, db: Session) -> None:
 
 
 # ============================================================================
-# PYDANTIC MODELS (✅ FIXED: Pydantic V2 Compatible)
+# PYDANTIC MODELS
 # ============================================================================
 
 class UserCreate(BaseModel):
@@ -452,13 +427,13 @@ class UserCreate(BaseModel):
 
 
 class UserResponse(BaseModel):
-    """✅ FIXED: Using ConfigDict instead of class Config"""
     id: int
     username: Optional[str] = None
     email: str
     created_at: Optional[datetime] = None
 
-    model_config = ConfigDict(from_attributes=True)
+    class Config:
+        from_attributes = True
 
 
 class Token(BaseModel):
@@ -507,6 +482,27 @@ def _idemp_seen(event_id: str) -> bool:
             return True
         _IDEMP_STORE[event_id] = now
         return False
+
+# ============================================================================
+# STARTUP TASKS
+# ============================================================================
+
+@app.on_event("startup")
+async def on_startup():
+    """Application startup tasks"""
+    initialize_database()
+    run_startup_migrations(engine)
+
+    logger.info("=" * 60)
+    logger.info("🚀 PixelPerfect Screenshot API Starting")
+    logger.info("=" * 60)
+    logger.info("📝 Environment: %s", ENVIRONMENT)
+    logger.info("📁 Screenshots directory: %s", SCREENSHOTS_DIR)
+    logger.info("🗄️ Database: %s", "PostgreSQL" if "postgres" in DATABASE_URL else "SQLite")
+    logger.info("💳 Stripe configured: %s", bool(stripe and os.getenv("STRIPE_SECRET_KEY")))
+    logger.info("=" * 60)
+    logger.info("✅ Backend started successfully")
+    logger.info("=" * 60)
 
 # ============================================================================
 # ROUTES - Core
@@ -882,47 +878,32 @@ def subscription_status(
     }
 
 # ============================================================================
-# INCLUDE ROUTERS IN APP
+# INCLUDE ROUTERS - Clean inclusion without double-tagging
 # ============================================================================
 
-# Include screenshot router
+# Screenshot router (primary feature)
 if screenshot_router:
-    try:
-        app.include_router(screenshot_router, tags=["screenshots"])
-        logger.info("✅ Screenshot router loaded")
-    except Exception as e:
-        logger.error(f"❌ Could not include screenshot router: {e}")
+    app.include_router(screenshot_router)
+    logger.info("✅ Screenshot router loaded")
 
-# Include pricing router
+# Pricing router (public pricing info)
 if pricing_router:
-    try:
-        app.include_router(pricing_router, tags=["pricing"])
-        logger.info("✅ Pricing router loaded")
-    except Exception as e:
-        logger.warning(f"⚠️ Could not include pricing router: {e}")
+    app.include_router(pricing_router)
+    logger.info("✅ Pricing router loaded")
 
-# Include batch router
+# Batch router (batch operations)
 if batch_router:
-    try:
-        app.include_router(batch_router, tags=["batch"])
-        logger.info("✅ Batch router loaded")
-    except Exception as e:
-        logger.warning(f"⚠️ Could not include batch router: {e}")
+    app.include_router(batch_router)
+    logger.info("✅ Batch router loaded")
 
-# Include activity router
+# Activity router (user activity tracking)
 if activity_router:
-    try:
-        app.include_router(activity_router, tags=["activity"])
-        logger.info("✅ Activity router loaded")
-    except Exception as e:
-        logger.warning(f"⚠️ Could not include activity router: {e}")
+    app.include_router(activity_router)
+    logger.info("✅ Activity router loaded")
 
-# Include payment router
-try:
-    app.include_router(payment_router, tags=["payments"])
-    logger.info("✅ Payment router loaded")
-except Exception as e:
-    logger.error(f"❌ Could not include payment router: {e}")
+# Payment router (Stripe integration)
+app.include_router(payment_router)
+logger.info("✅ Payment router loaded")
 
 # ============================================================================
 # FRONTEND SPA (Optional)
@@ -934,7 +915,7 @@ if FRONTEND_BUILD.exists():
 
     @app.get("/{full_path:path}", include_in_schema=False)
     def spa_catch_all(full_path: str):
-        if full_path.startswith(("api/", "health", "token", "register", "webhook/")):
+        if full_path.startswith(("api/", "health", "token", "register", "webhook/", "screenshots/")):
             raise HTTPException(status_code=404, detail="Not found")
         
         index_file = FRONTEND_BUILD / "index.html"
@@ -952,7 +933,11 @@ if __name__ == "__main__":
     print(f"Starting PixelPerfect API on 0.0.0.0:8000")
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
 
-##====================================================
+
+# # =================================================================
+# # =================================================================
+
+
 # # ========================================
 # # main.py - PixelPerfect Screenshot API
 # # ========================================
@@ -1839,7 +1824,7 @@ if __name__ == "__main__":
 # # Include screenshot router
 # if screenshot_router:
 #     try:
-#         app.include_router(screenshot_router, tags=["screenshots"])
+#         app.include_router(screenshot_router)
 #         logger.info("✅ Screenshot router loaded")
 #     except Exception as e:
 #         logger.error(f"❌ Could not include screenshot router: {e}")
@@ -1902,6 +1887,4 @@ if __name__ == "__main__":
 #     import uvicorn
 #     print(f"Starting PixelPerfect API on 0.0.0.0:8000")
 #     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
-
-
 
