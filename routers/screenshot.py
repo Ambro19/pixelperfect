@@ -1,10 +1,12 @@
 # backend/routers/screenshot.py
-# PixelPerfect Screenshot API Router - Production Ready
-# Fixed imports and error handling
+# PixelPerfect Screenshot API Router - COMPLETE WITH ALL FEATURES
+# Implements: JS execution, device emulation, element selection, webhooks, PDF support
+# Author: OneTechly
+# Updated: January 2026 - Production-ready
 
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from pydantic import BaseModel, HttpUrl, Field
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from datetime import datetime
 import uuid
 import httpx
@@ -21,21 +23,28 @@ logger = logging.getLogger("pixelperfect")
 router = APIRouter(prefix="/api/v1/screenshot", tags=["Screenshot"])
 
 # ============================================================================
-# PYDANTIC MODELS
+# PYDANTIC MODELS - ENHANCED WITH ALL FEATURES
 # ============================================================================
 
 class ScreenshotRequest(BaseModel):
-    """Screenshot request model"""
+    """Complete screenshot request model with ALL advertised features"""
     url: HttpUrl
     width: int = Field(default=1920, ge=320, le=3840)
     height: int = Field(default=1080, ge=240, le=2160)
     full_page: bool = False
-    format: str = Field(default="png", pattern="^(png|jpeg|webp)$")
+    format: str = Field(default="png", pattern="^(png|jpeg|webp|pdf)$")
     quality: Optional[int] = Field(default=None, ge=0, le=100)
     delay: int = Field(default=0, ge=0, le=10)
     dark_mode: bool = False
     remove_elements: Optional[List[str]] = None
     return_url: bool = True
+    
+    # Advanced features
+    device: Optional[str] = Field(default=None, description="Device preset: iphone_13, pixel_5, ipad_pro")
+    custom_js: Optional[str] = Field(default=None, description="Custom JavaScript to execute", max_length=10000)
+    wait_for_selector: Optional[str] = Field(default=None, description="CSS selector to wait for")
+    target_element: Optional[str] = Field(default=None, description="Target specific element for cropping")
+    webhook_url: Optional[str] = Field(default=None, description="Webhook URL for completion notification")
 
 
 class ScreenshotResponse(BaseModel):
@@ -49,6 +58,13 @@ class ScreenshotResponse(BaseModel):
     size_bytes: int
     created_at: str
     usage: dict
+    device_used: Optional[str] = None
+
+
+class DeviceListResponse(BaseModel):
+    """Available devices response"""
+    devices: List[str]
+    descriptions: Dict[str, str]
 
 
 # ============================================================================
@@ -56,12 +72,7 @@ class ScreenshotResponse(BaseModel):
 # ============================================================================
 
 def check_user_screenshot_limit(user: User) -> tuple[bool, int, int]:
-    """
-    Check if user can create a screenshot
-    
-    Returns:
-        (can_use, current_usage, limit)
-    """
+    """Check if user can create a screenshot"""
     tier_limits = get_tier_limits(user.subscription_tier or "free")
     current = user.usage_screenshots or 0
     limit = tier_limits["screenshots"]
@@ -80,8 +91,45 @@ def increment_user_usage(user: User, db, usage_type: str = "screenshots"):
     db.commit()
 
 
+def check_feature_access(user: User, feature: str) -> bool:
+    """Check if user has access to advanced feature"""
+    tier_limits = get_tier_limits(user.subscription_tier or "free")
+    tier = (user.subscription_tier or "free").lower()
+    
+    feature_access = {
+        "custom_js": tier in ["pro", "business", "premium"],
+        "device_emulation": tier in ["pro", "business", "premium"],
+        "element_selection": tier in ["business", "premium"],
+        "pdf": tier in ["business", "premium"],
+        "webhooks": tier in ["business", "premium"]
+    }
+    
+    return feature_access.get(feature, False)
+
+
+async def send_webhook_notification(webhook_url: str, screenshot_data: Dict[str, Any]):
+    """Send webhook notification (Business tier feature)"""
+    if not webhook_url:
+        return
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                webhook_url,
+                json={
+                    "event": "screenshot.completed",
+                    "data": screenshot_data,
+                    "timestamp": datetime.utcnow().isoformat()
+                },
+                timeout=10.0
+            )
+        logger.info(f"✅ Webhook notification sent to {webhook_url}")
+    except Exception as e:
+        logger.warning(f"⚠️ Webhook notification failed: {e}")
+
+
 # ============================================================================
-# SCREENSHOT ENDPOINTS
+# SCREENSHOT ENDPOINTS - COMPLETE IMPLEMENTATION
 # ============================================================================
 
 @router.post("/", response_model=ScreenshotResponse)
@@ -92,22 +140,36 @@ async def create_screenshot(
     db = Depends(get_db)
 ):
     """
-    Create a screenshot
+    Create a screenshot with COMPLETE feature set
+    
+    ## Core Features
+    - **Lightning Fast**: Captures in < 3 seconds
+    - **Full Customization**: Viewport, formats, quality
+    - **Dark Mode**: Automatic or forced preference
+    - **Full Page**: Capture entire page, no height limit
+    
+    ## Advanced Features (Pro/Business Tiers)
+    - **Mobile Device Emulation**: iPhone, Android, iPad presets
+    - **Custom JavaScript**: Execute code before capture
+    - **Element Selection**: Target & crop specific elements
+    - **PDF Generation**: Generate PDF documents (Business)
+    - **Webhook Notifications**: Real-time completion alerts (Business)
     
     ## Parameters
     - **url**: Website URL to screenshot
     - **width**: Viewport width (320-3840px)
     - **height**: Viewport height (240-2160px)
     - **full_page**: Capture full page or viewport only
-    - **format**: Image format (png, jpeg, webp)
+    - **format**: Image format (png, jpeg, webp, pdf)
     - **quality**: JPEG quality 0-100 (optional)
-    - **delay**: Delay before screenshot in seconds (0-10)
+    - **delay**: Delay before screenshot (0-10s)
     - **dark_mode**: Enable dark mode
-    - **remove_elements**: CSS selectors to remove (e.g., cookie banners)
-    - **return_url**: Return URL or base64 image
-    
-    ## Returns
-    Screenshot metadata and URL
+    - **remove_elements**: CSS selectors to remove
+    - **device**: Device preset (iphone_13, pixel_5, ipad_pro)
+    - **custom_js**: JavaScript to execute (Pro+)
+    - **wait_for_selector**: Wait for element before capture
+    - **target_element**: Crop to specific element (Business+)
+    - **webhook_url**: Completion notification URL (Business+)
     
     ## Example
     ```bash
@@ -116,9 +178,9 @@ async def create_screenshot(
       -H "Content-Type: application/json" \\
       -d '{
         "url": "https://example.com",
-        "width": 1920,
-        "height": 1080,
-        "format": "png"
+        "device": "iphone_13",
+        "dark_mode": true,
+        "custom_js": "document.querySelector('.banner').remove();"
       }'
     ```
     """
@@ -131,19 +193,56 @@ async def create_screenshot(
             detail=f"Screenshot limit reached ({current}/{limit}). Please upgrade your plan."
         )
     
-    # Validate tier-specific limits
+    # Validate tier-specific features
     tier_limits = get_tier_limits(current_user.subscription_tier or "free")
     
+    # Check format access
+    if request.format not in tier_limits.get("formats", ["png", "jpeg"]):
+        raise HTTPException(
+            status_code=403,
+            detail=f"Format '{request.format}' not available in your tier. Please upgrade to Business."
+        )
+    
+    # Check PDF access (Business only)
+    if request.format == "pdf" and not check_feature_access(current_user, "pdf"):
+        raise HTTPException(
+            status_code=403,
+            detail="PDF generation requires Business tier. Please upgrade."
+        )
+    
+    # Check custom JavaScript access
+    if request.custom_js and not check_feature_access(current_user, "custom_js"):
+        raise HTTPException(
+            status_code=403,
+            detail="Custom JavaScript execution requires Pro tier or higher. Please upgrade."
+        )
+    
+    # Check device emulation access
+    if request.device and not check_feature_access(current_user, "device_emulation"):
+        raise HTTPException(
+            status_code=403,
+            detail="Device emulation requires Pro tier or higher. Please upgrade."
+        )
+    
+    # Check element selection access
+    if request.target_element and not check_feature_access(current_user, "element_selection"):
+        raise HTTPException(
+            status_code=403,
+            detail="Element selection requires Business tier. Please upgrade."
+        )
+    
+    # Check webhook access
+    if request.webhook_url and not check_feature_access(current_user, "webhooks"):
+        raise HTTPException(
+            status_code=403,
+            detail="Webhook notifications require Business tier. Please upgrade."
+        )
+    
+    # Check viewport limits
     if request.width > tier_limits.get("max_width", 1920):
         raise HTTPException(
             status_code=400,
             detail=f"Width exceeds tier limit ({tier_limits.get('max_width', 1920)}px). Please upgrade."
-        )
-    
-    if request.format not in tier_limits.get("formats", ["png", "jpeg"]):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Format '{request.format}' not available in your tier. Please upgrade."
         )
     
     try:
@@ -152,7 +251,7 @@ async def create_screenshot(
             logger.info("🔧 Initializing Playwright browser...")
             await screenshot_service.initialize()
         
-        # Capture screenshot
+        # Capture screenshot with ALL features
         start_time = datetime.utcnow()
         
         screenshot_bytes = await screenshot_service.capture_screenshot(
@@ -164,7 +263,11 @@ async def create_screenshot(
             quality=request.quality,
             delay=request.delay,
             dark_mode=request.dark_mode,
-            remove_elements=request.remove_elements
+            remove_elements=request.remove_elements,
+            device=request.device,
+            custom_js=request.custom_js,
+            wait_for_selector=request.wait_for_selector,
+            target_element=request.target_element
         )
         
         processing_time = (datetime.utcnow() - start_time).total_seconds() * 1000  # ms
@@ -178,13 +281,12 @@ async def create_screenshot(
             screenshot_url = await storage_service.upload_screenshot(
                 file_data=screenshot_bytes,
                 filename=filename,
-                content_type=f"image/{request.format}"
+                content_type=f"application/pdf" if request.format == "pdf" else f"image/{request.format}"
             )
             storage_key = filename
         except Exception as e:
             # Fallback to local storage if R2 fails
             logger.warning(f"R2 upload failed, using local storage: {e}")
-            import os
             from pathlib import Path
             
             local_dir = Path("screenshots") / str(current_user.id)
@@ -206,8 +308,8 @@ async def create_screenshot(
             id=screenshot_id,
             user_id=current_user.id,
             url=str(request.url),
-            width=request.width,
-            height=request.height,
+            width=request.width if not request.device else None,
+            height=request.height if not request.device else None,
             full_page=request.full_page,
             format=request.format,
             quality=request.quality,
@@ -232,6 +334,21 @@ async def create_screenshot(
         
         logger.info(f"✅ Screenshot created: {screenshot_id} for user {current_user.id}")
         
+        # Send webhook notification in background (Business tier)
+        if request.webhook_url:
+            background_tasks.add_task(
+                send_webhook_notification,
+                request.webhook_url,
+                {
+                    "screenshot_id": screenshot_id,
+                    "url": str(request.url),
+                    "screenshot_url": screenshot_url,
+                    "format": request.format,
+                    "size_bytes": len(screenshot_bytes),
+                    "processing_time_ms": processing_time
+                }
+            )
+        
         return ScreenshotResponse(
             url=str(request.url),
             screenshot_url=screenshot_url if request.return_url else None,
@@ -241,6 +358,7 @@ async def create_screenshot(
             format=request.format,
             size_bytes=len(screenshot_bytes),
             created_at=screenshot_record.created_at.isoformat(),
+            device_used=request.device,
             usage={
                 "current": current_user.usage_screenshots,
                 "limit": limit,
@@ -251,10 +369,45 @@ async def create_screenshot(
     except httpx.HTTPError as e:
         logger.error(f"HTTP error loading URL {request.url}: {e}")
         raise HTTPException(status_code=400, detail=f"Failed to load URL: {str(e)}")
+    except ValueError as e:
+        # Feature validation errors
+        logger.error(f"Feature validation error: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"Screenshot failed: {e}", exc_info=True)
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Screenshot failed: {str(e)}")
+
+
+@router.get("/devices", response_model=DeviceListResponse)
+async def list_devices(
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Get available device presets for mobile screenshots
+    
+    Requires Pro tier or higher
+    """
+    if not check_feature_access(current_user, "device_emulation"):
+        raise HTTPException(
+            status_code=403,
+            detail="Device emulation requires Pro tier. Please upgrade."
+        )
+    
+    devices = screenshot_service.get_available_devices()
+    
+    descriptions = {
+        "iphone_13": "iPhone 13 (390x844, iOS 15)",
+        "iphone_13_pro_max": "iPhone 13 Pro Max (428x926, iOS 15)",
+        "pixel_5": "Google Pixel 5 (393x851, Android 11)",
+        "ipad_pro": "iPad Pro 11\" (1024x1366, iOS 15)",
+        "desktop": "Desktop (1920x1080, Windows)"
+    }
+    
+    return DeviceListResponse(
+        devices=devices,
+        descriptions=descriptions
+    )
 
 
 @router.get("/{screenshot_id}")
@@ -361,48 +514,36 @@ async def get_usage_stats(
     """Get detailed usage statistics"""
     tier_limits = get_tier_limits(current_user.subscription_tier or "free")
     
+    # Calculate percentage safely
+    screenshots_used = current_user.usage_screenshots or 0
+    screenshots_limit = tier_limits["screenshots"]
+    percentage = round((screenshots_used / screenshots_limit) * 100, 1) if screenshots_limit > 0 else 0
+    
     return {
         "tier": current_user.subscription_tier or "free",
         "usage": {
             "screenshots": {
-                "used": current_user.usage_screenshots or 0,
-                "limit": tier_limits["screenshots"],
-                "remaining": tier_limits["screenshots"] - (current_user.usage_screenshots or 0),
-                "percentage": round(((current_user.usage_screenshots or 0) / tier_limits["screenshots"]) * 100, 1)
+                "used": screenshots_used,
+                "limit": screenshots_limit,
+                "remaining": max(0, screenshots_limit - screenshots_used),
+                "percentage": percentage
             },
             "batch_requests": {
                 "used": current_user.usage_batch_requests or 0,
                 "limit": tier_limits["batch_requests"],
-                "remaining": tier_limits["batch_requests"] - (current_user.usage_batch_requests or 0)
+                "remaining": max(0, tier_limits["batch_requests"] - (current_user.usage_batch_requests or 0))
             },
             "api_calls": {
                 "used": current_user.usage_api_calls or 0
             }
         },
         "limits": tier_limits,
-        "reset_date": current_user.usage_reset_at.isoformat() if current_user.usage_reset_at else None
+        "reset_date": current_user.usage_reset_at.isoformat() if current_user.usage_reset_at else None,
+        "features": {
+            "custom_js": check_feature_access(current_user, "custom_js"),
+            "device_emulation": check_feature_access(current_user, "device_emulation"),
+            "element_selection": check_feature_access(current_user, "element_selection"),
+            "pdf": check_feature_access(current_user, "pdf"),
+            "webhooks": check_feature_access(current_user, "webhooks")
+        }
     }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

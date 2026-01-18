@@ -1,20 +1,49 @@
+# ============================================================================
+# render.yaml - PixelPerfect Screenshot API Production Deployment
+# ============================================================================
+# Updated: January 2026 - Includes Playwright + email-validator fix
+# ============================================================================
+
 services:
   - type: web
-    name: pixelperfect-screenshot-api
+    name: pixelperfect-api
     env: python
-    plan: free
+    plan: starter  # Upgrade from free for better performance
+    region: oregon  # Change to your preferred region
 
+    # ========================================================================
+    # BUILD COMMAND - CRITICAL: Install Playwright browsers
+    # ========================================================================
     buildCommand: |
+      echo "📦 Installing system dependencies..."
       apt-get update -qq
       apt-get install -y --no-install-recommends ffmpeg
+      
+      echo "📦 Installing Python dependencies..."
       pip install --upgrade pip
       pip install --no-cache-dir -r requirements.txt
+      
+      echo "🎭 Installing Playwright browsers..."
+      playwright install chromium
+      playwright install-deps
+      
+      echo "✅ Build complete!"
 
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    # ========================================================================
+    # START COMMAND
+    # ========================================================================
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 2
 
+    # ========================================================================
+    # HEALTH CHECK
+    # ========================================================================
     healthCheckPath: /health
 
+    # ========================================================================
+    # ENVIRONMENT VARIABLES
+    # ========================================================================
     envVars:
+      # Application
       - key: ENVIRONMENT
         value: production
 
@@ -27,6 +56,7 @@ services:
       - key: PORT
         value: 10000
 
+      # URLs
       - key: FRONTEND_URL
         value: https://pixelperfectapi.net
 
@@ -36,28 +66,95 @@ services:
       - key: CORS_ORIGINS
         value: https://pixelperfectapi.net,https://www.pixelperfectapi.net
 
+      # Security (SECRETS - Set in Render Dashboard)
       - key: SECRET_KEY
         sync: false
 
+      # Database (SECRETS - Set in Render Dashboard)
+      - key: DATABASE_URL
+        sync: false
+
+      # Stripe (SECRETS - Set in Render Dashboard)
       - key: STRIPE_SECRET_KEY
         sync: false
+      
+      - key: STRIPE_PUBLISHABLE_KEY
+        sync: false
+      
       - key: STRIPE_WEBHOOK_SECRET
         sync: false
+      
       - key: STRIPE_PRO_LOOKUP_KEY
         value: pixelperfect_pro_monthly
+      
       - key: STRIPE_BUSINESS_LOOKUP_KEY
         value: pixelperfect_business_monthly
 
+      # Cloudflare R2 (SECRETS - Set in Render Dashboard)
       - key: R2_ENDPOINT_URL
-        value: https://<your_account_id>.r2.cloudflarestorage.com
+        value: https://[account-id].r2.cloudflarestorage.com  # Update with your account ID
+      
       - key: R2_ACCESS_KEY_ID
         sync: false
+      
       - key: R2_SECRET_ACCESS_KEY
         sync: false
+      
       - key: R2_BUCKET_NAME
         value: pixelperfect-screenshots
+      
+      - key: R2_PUBLIC_URL
+        value: https://screenshots.pixelperfectapi.net  # Your R2 public domain
 
-      - key: CONTACT_FROM
-        value: no-reply@onetechly.com
+      # File Retention
+      - key: FILE_RETENTION_DAYS
+        value: 7
+
+      # Contact Form
       - key: CONTACT_RECIPIENT
         value: onetechly@gmail.com
+      
+      - key: CONTACT_FROM
+        value: no-reply@onetechly.com
+
+      # Rate Limiting
+      - key: RATE_LIMIT_ENABLED
+        value: true
+      
+      - key: RATE_LIMIT_FREE_TIER
+        value: 120
+
+      # Batch Processing
+      - key: BATCH_WEBHOOK_URL
+        value: ""  # Optional: Webhook for batch completion
+      
+      - key: BATCH_WEBHOOK_SECRET
+        value: ""  # Optional: Webhook signature secret
+
+# ============================================================================
+# DEPLOYMENT CHECKLIST
+# ============================================================================
+# 
+# Before deploying, ensure you have:
+# 
+# 1. Set SECRET_KEY in Render Dashboard:
+#    python -c "import secrets; print(secrets.token_urlsafe(64))"
+# 
+# 2. Set DATABASE_URL (PostgreSQL connection string)
+# 
+# 3. Set all STRIPE_ secrets from your Stripe Dashboard
+# 
+# 4. Set R2_ secrets from Cloudflare R2 dashboard
+# 
+# 5. Update R2_ENDPOINT_URL with your actual account ID
+# 
+# 6. Verify FRONTEND_URL and BACKEND_URL are correct
+# 
+# 7. Create Stripe products with lookup keys:
+#    - pixelperfect_pro_monthly ($49/month)
+#    - pixelperfect_business_monthly ($199/month)
+# 
+# 8. Set up Stripe webhook endpoint:
+#    https://api.pixelperfectapi.net/webhook/stripe
+# 
+# ============================================================================

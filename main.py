@@ -93,6 +93,12 @@ from auth_deps import get_current_user
 from webhook_handler import handle_stripe_webhook
 
 # ============================================================================
+# API KEY SYSTEM IMPORTS
+# ============================================================================
+
+from api_key_system import create_api_key_for_user, run_api_key_migration
+
+# ============================================================================
 # FILE STORAGE - DEFINED EARLY FOR ROUTER IMPORTS
 # ============================================================================
 
@@ -138,6 +144,14 @@ try:
 except ImportError as e:
     logger.warning(f"⚠️ Activity router not found: {e}")
     activity_router = None
+
+# API Keys router
+try:
+    from routers.api_keys import router as api_keys_router
+    logger.info("✅ API Keys router imported successfully")
+except ImportError as e:
+    logger.warning(f"⚠️ API Keys router not found: {e}")
+    api_keys_router = None
 
 # ============================================================================
 # STRIPE CONFIGURATION
@@ -492,6 +506,9 @@ async def on_startup():
     """Application startup tasks"""
     initialize_database()
     run_startup_migrations(engine)
+    
+    # ✅ NEW: Run API key migration
+    run_api_key_migration(engine)
 
     logger.info("=" * 60)
     logger.info("🚀 PixelPerfect Screenshot API Starting")
@@ -564,6 +581,15 @@ def register(user: UserCreate, db: Session = Depends(get_db)):
     db.add(obj)
     db.commit()
     db.refresh(obj)
+    
+    # ✅ NEW: Create API key for new user
+    api_key = None
+    try:
+        api_key, _ = create_api_key_for_user(db, obj.id, "Default API Key")
+        logger.info(f"🔑 API key created for user {username}")
+    except Exception as e:
+        logger.warning(f"⚠️ API key creation skipped: {e}")
+    
     logger.info(f"✅ User created: {username} (ID: {obj.id})")
 
     # Try to create Stripe customer (graceful)
@@ -575,11 +601,17 @@ def register(user: UserCreate, db: Session = Depends(get_db)):
         except Exception as e:
             logger.warning(f"⚠️ Stripe customer creation skipped: {e}")
 
-    return {
+    response_data = {
         "message": "User registered successfully.",
         "account": canonical_account(obj),
         "stripe_customer_id": stripe_customer_id,
     }
+    
+    # ✅ NEW: Return API key ONCE on registration
+    if api_key:
+        response_data["api_key"] = api_key
+    
+    return response_data
 
 
 @app.post("/token")
@@ -905,6 +937,11 @@ if activity_router:
 app.include_router(payment_router)
 logger.info("✅ Payment router loaded")
 
+# API Keys router (API key management)
+if api_keys_router:
+    app.include_router(api_keys_router)
+    logger.info("✅ API Keys router loaded")
+
 # ============================================================================
 # FRONTEND SPA (Optional)
 # ============================================================================
@@ -930,13 +967,10 @@ if FRONTEND_BUILD.exists():
 
 if __name__ == "__main__":
     import uvicorn
-    print(f"Starting PixelPerfect API on 0.0.0.0:8000")
+    print(f"Starting PixelPerfect Screenshot API on 0.0.0.0:8000")
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
 
-
-# # =================================================================
-# # =================================================================
-
+# # =======================================================================    
 
 # # ========================================
 # # main.py - PixelPerfect Screenshot API
@@ -971,14 +1005,15 @@ if __name__ == "__main__":
 # from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 # from pydantic import BaseModel, EmailStr
 
-# from routers import pricing
-
-# #app.include_router(pricing.router)
-
 # # Local imports
 # from email_utils import send_password_reset_email
 # from auth_utils import get_password_hash, verify_password
 # from subscription_sync import sync_user_subscription_from_stripe, _apply_local_overdue_downgrade_if_possible
+
+# # File: backend/routers/api_keys.py
+# from routers.api_keys import router as api_keys_router
+# app.include_router(api_keys_router) # pyright: ignore[reportUndefinedVariable]
+# logger.info("✅ API Keys router loaded")  # pyright: ignore[reportUndefinedVariable]
 
 # # ============================================================================
 # # CONFIGURATION
@@ -1037,13 +1072,21 @@ if __name__ == "__main__":
 # from webhook_handler import handle_stripe_webhook
 
 # # ============================================================================
+# # FILE STORAGE - DEFINED EARLY FOR ROUTER IMPORTS
+# # ============================================================================
+
+# SCREENSHOTS_DIR = Path(__file__).resolve().parent / "screenshots"
+# SCREENSHOTS_DIR.mkdir(exist_ok=True)
+# logger.info("📁 Screenshots directory: %s", SCREENSHOTS_DIR)
+
+# # ============================================================================
 # # IMPORT ROUTERS
 # # ============================================================================
 
 # # Payment router
 # from payment import router as payment_router
 
-# # Screenshot router (FIXED IMPORT)
+# # Screenshot router
 # try:
 #     from routers.screenshot import router as screenshot_router
 #     logger.info("✅ Screenshot router imported successfully")
@@ -1051,7 +1094,7 @@ if __name__ == "__main__":
 #     logger.error(f"❌ Screenshot router import failed: {e}")
 #     screenshot_router = None
 
-# # Pricing router (NEW - from our pricing configuration)
+# # Pricing router
 # try:
 #     from routers.pricing import router as pricing_router
 #     logger.info("✅ Pricing router imported successfully")
@@ -1059,7 +1102,7 @@ if __name__ == "__main__":
 #     logger.warning(f"⚠️ Pricing router not found: {e}")
 #     pricing_router = None
 
-# # Batch router (needs updating for screenshots)
+# # Batch router
 # try:
 #     from routers.batch import router as batch_router
 #     logger.info("✅ Batch router imported successfully")
@@ -1067,7 +1110,7 @@ if __name__ == "__main__":
 #     logger.warning(f"⚠️ Batch router not found: {e}")
 #     batch_router = None
 
-# # Activity router (needs updating for screenshots)
+# # Activity router
 # try:
 #     from routers.activity import router as activity_router
 #     logger.info("✅ Activity router imported successfully")
@@ -1176,8 +1219,6 @@ if __name__ == "__main__":
 #     server_header="PixelPerfect",
 # )
 
-# app.include_router(pricing.router)
-
 # # ============================================================================
 # # MIDDLEWARE - Rate Limiting
 # # ============================================================================
@@ -1262,14 +1303,12 @@ if __name__ == "__main__":
 # logger.info("✅ CORS enabled for origins: %s", allow_origins)
 
 # # ============================================================================
-# # FILE STORAGE
+# # MOUNT STATIC FILES - SCREENSHOTS
 # # ============================================================================
 
-# SCREENSHOTS_DIR = Path(__file__).resolve().parent / "screenshots"
-# SCREENSHOTS_DIR.mkdir(exist_ok=True)
-# logger.info("📁 Screenshots directory: %s", SCREENSHOTS_DIR)
-
-# # app.mount("/screenshots", StaticFiles(directory=str(SCREENSHOTS_DIR)), name="screenshots")
+# # Mount screenshots directory for public access
+# app.mount("/screenshots", StaticFiles(directory=str(SCREENSHOTS_DIR)), name="screenshots")
+# logger.info("✅ Mounted /screenshots static directory")
 
 # # ============================================================================
 # # AUTH HELPERS
@@ -1466,7 +1505,7 @@ if __name__ == "__main__":
 #         "environment": ENVIRONMENT,
 #         "services": {
 #             "stripe": "configured" if os.getenv("STRIPE_SECRET_KEY") else "not_configured",
-#             "playwright": "available",  # Will verify this in screenshot service
+#             "playwright": "available",
 #         },
 #     }
 
@@ -1818,47 +1857,32 @@ if __name__ == "__main__":
 #     }
 
 # # ============================================================================
-# # INCLUDE ROUTERS IN APP
+# # INCLUDE ROUTERS - Clean inclusion without double-tagging
 # # ============================================================================
 
-# # Include screenshot router
+# # Screenshot router (primary feature)
 # if screenshot_router:
-#     try:
-#         app.include_router(screenshot_router)
-#         logger.info("✅ Screenshot router loaded")
-#     except Exception as e:
-#         logger.error(f"❌ Could not include screenshot router: {e}")
+#     app.include_router(screenshot_router)
+#     logger.info("✅ Screenshot router loaded")
 
-# # Include pricing router
+# # Pricing router (public pricing info)
 # if pricing_router:
-#     try:
-#         app.include_router(pricing_router, tags=["pricing"])
-#         logger.info("✅ Pricing router loaded")
-#     except Exception as e:
-#         logger.warning(f"⚠️ Could not include pricing router: {e}")
+#     app.include_router(pricing_router)
+#     logger.info("✅ Pricing router loaded")
 
-# # Include batch router
+# # Batch router (batch operations)
 # if batch_router:
-#     try:
-#         app.include_router(batch_router, tags=["batch"])
-#         logger.info("✅ Batch router loaded")
-#     except Exception as e:
-#         logger.warning(f"⚠️ Could not include batch router: {e}")
+#     app.include_router(batch_router)
+#     logger.info("✅ Batch router loaded")
 
-# # Include activity router
+# # Activity router (user activity tracking)
 # if activity_router:
-#     try:
-#         app.include_router(activity_router, tags=["activity"])
-#         logger.info("✅ Activity router loaded")
-#     except Exception as e:
-#         logger.warning(f"⚠️ Could not include activity router: {e}")
+#     app.include_router(activity_router)
+#     logger.info("✅ Activity router loaded")
 
-# # Include payment router
-# try:
-#     app.include_router(payment_router, tags=["payments"])
-#     logger.info("✅ Payment router loaded")
-# except Exception as e:
-#     logger.error(f"❌ Could not include payment router: {e}")
+# # Payment router (Stripe integration)
+# app.include_router(payment_router)
+# logger.info("✅ Payment router loaded")
 
 # # ============================================================================
 # # FRONTEND SPA (Optional)
@@ -1870,7 +1894,7 @@ if __name__ == "__main__":
 
 #     @app.get("/{full_path:path}", include_in_schema=False)
 #     def spa_catch_all(full_path: str):
-#         if full_path.startswith(("api/", "health", "token", "register", "webhook/")):
+#         if full_path.startswith(("api/", "health", "token", "register", "webhook/", "screenshots/")):
 #             raise HTTPException(status_code=404, detail="Not found")
         
 #         index_file = FRONTEND_BUILD / "index.html"
@@ -1887,4 +1911,5 @@ if __name__ == "__main__":
 #     import uvicorn
 #     print(f"Starting PixelPerfect API on 0.0.0.0:8000")
 #     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
 
