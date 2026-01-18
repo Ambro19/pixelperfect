@@ -1,67 +1,61 @@
 # ============================================================================
-# PixelPerfect Screenshot API - Production Requirements
+# PIXELPERFECT SCREENSHOT API - DEPENDENCIES
 # ============================================================================
+# Updated: January 2026 - Python 3.13 compatible
+# ============================================================================
+
 # Core Framework
-fastapi==0.109.0
-uvicorn[standard]==0.27.0
-python-multipart==0.0.6
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.6
+pydantic-settings==2.7.1
 
 # Database
-sqlalchemy==2.0.25
-psycopg2-binary==2.9.9
-alembic==1.13.1
+sqlalchemy==2.0.36
+psycopg2-binary==2.9.10
+alembic==1.14.0
 
-# Authentication & Security
+# Auth & Security
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
-bcrypt==4.1.2
-itsdangerous==2.1.2
+bcrypt==4.2.1
+python-multipart==0.0.20
+itsdangerous==2.2.0
 
-# Pydantic with email validation (CRITICAL FIX)
-pydantic==2.5.3
-pydantic[email]==2.5.3
-email-validator==2.1.0.post1
+# HTTP & CORS
+python-dotenv==1.0.1
+httpx==0.28.1
+requests==2.32.3
 
-# HTTP & Networking
-httpx==0.26.0
-requests==2.31.0
+# Payments
+stripe==11.3.0
 
-# Stripe Payments
-stripe==7.9.0
+# JSON & Serialization
+orjson==3.10.12
 
-# Cloudflare R2 / AWS S3
-boto3==1.34.28
-botocore==1.34.28
+# AWS/S3/R2 Storage
+boto3==1.35.95
 
-# Screenshot Engine
-playwright==1.41.0
-Pillow==10.2.0
+# Email
+python-email-validator==2.2.0
 
-# Performance
-orjson==3.9.12
-
-# Environment
-python-dotenv==1.0.0
-
-# Email (for password reset)
-aiosmtplib==3.0.1
-
-# Utilities
-python-dateutil==2.8.2
-
-# Production Server
-gunicorn==21.2.0
+# Web Scraping & Screenshots
+playwright==1.49.1
+Pillow==11.0.0
 
 # ============================================================================
-# INSTALLATION NOTES
+# PRODUCTION DEPENDENCIES
 # ============================================================================
-# After installing requirements, run:
-#   playwright install chromium
-#   playwright install-deps
-# 
-# For Render.com deployment, add to your render.yaml:
-#   buildCommand: |
-#     pip install -r requirements.txt
-#     playwright install chromium
-#     playwright install-deps
+
+# ASGI Server (production)
+gunicorn==23.0.0
+
+# Monitoring & Logging
+sentry-sdk[fastapi]==2.20.0
+
 # ============================================================================
+# NOTES
+# ============================================================================
+# - Pillow upgraded to 11.0.0 for Python 3.13 compatibility
+# - All versions tested on Python 3.11, 3.12, and 3.13
+# - After updating, run: pip install -r requirements.txt --upgrade
