@@ -37,7 +37,7 @@ orjson==3.10.12
 boto3==1.35.95
 
 # Email
-python-email-validator==2.2.0
+email-validator==2.2.0
 
 # Web Scraping & Screenshots
 playwright==1.49.1
