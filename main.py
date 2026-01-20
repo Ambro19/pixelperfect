@@ -326,14 +326,25 @@ if ENVIRONMENT != "production":
 else:
     allow_origins = PUBLIC_ORIGINS + ([FRONTEND_URL] if FRONTEND_URL else [])
 
+# ✅ FIXED: Explicit CORS configuration with OPTIONS support
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[o for o in allow_origins if o],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH", "HEAD"],  # Explicit methods
     allow_headers=["*"],
     expose_headers=["Content-Disposition", "Content-Type", "Content-Length"],
+    max_age=3600,  # Cache preflight for 1 hour
 )
+
+# app.add_middleware(
+#     CORSMiddleware,
+#     allow_origins=[o for o in allow_origins if o],
+#     allow_credentials=True,
+#     allow_methods=["*"],
+#     allow_headers=["*"],
+#     expose_headers=["Content-Disposition", "Content-Type", "Content-Length"],
+# )
 
 logger.info("✅ CORS enabled for origins: %s", allow_origins)
 
@@ -551,6 +562,20 @@ def health():
 @app.head("/health")
 def health_head():
     return Response(status_code=200)
+
+# ✅ NEW: Handle CORS preflight for all routes
+@app.options("/{path:path}")
+async def options_handler(path: str):
+    """Handle CORS preflight requests"""
+    return Response(
+        status_code=200,
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH, HEAD",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Max-Age": "3600",
+        }
+    )
 
 # ============================================================================
 # ROUTES - Authentication
