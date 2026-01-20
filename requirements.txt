@@ -16,6 +16,7 @@ psycopg2-binary==2.9.10
 alembic==1.14.0
 
 # Auth & Security
+PyJWT==2.8.0
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
 bcrypt==4.2.1
@@ -52,10 +53,3 @@ gunicorn==23.0.0
 
 # Monitoring & Logging
 sentry-sdk[fastapi]==2.20.0
-
-# ============================================================================
-# NOTES
-# ============================================================================
-# - Pillow upgraded to 11.0.0 for Python 3.13 compatibility
-# - All versions tested on Python 3.11, 3.12, and 3.13
-# - After updating, run: pip install -r requirements.txt --upgrade
