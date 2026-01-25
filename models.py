@@ -1,252 +1,120 @@
-# backend/models.py
-# PixelPerfect Screenshot API - Database Models
-# Updated for screenshot functionality while keeping auth/subscription infrastructure
+# ============================================================================
+# DATABASE MODELS - PixelPerfect Screenshot API
+# ============================================================================
+# File: backend/models.py
 # Author: OneTechly
-# UPDATED: January 2026 - Production-ready with API key system
+# Updated: January 2026 - Added ApiKey model for API key management
+# ============================================================================
 
-import os
-from datetime import datetime
 from sqlalchemy import (
-    Column, Integer, String, DateTime, Boolean, Float, Text, ForeignKey,
-    create_engine, Index
+    Column, Integer, String, DateTime, Boolean, 
+    ForeignKey, Index, create_engine
 )
-from sqlalchemy.orm import sessionmaker, relationship
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session
+from datetime import datetime, timedelta
+import os
+from typing import Dict, Any
+
+# ============================================================================
+# DATABASE CONFIGURATION
+# ============================================================================
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./pixelperfect.db")
 
+# PostgreSQL URL normalization
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg2://", 1)
+elif DATABASE_URL.startswith("postgresql://") and "+psycopg2" not in DATABASE_URL:
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
+
 engine = create_engine(
     DATABASE_URL,
-    future=True,
-    connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {}
+    connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {},
+    pool_pre_ping=True,
 )
 
-from sqlalchemy import event
-
-if "sqlite" in DATABASE_URL:
-    @event.listens_for(engine, "connect")
-    def _set_sqlite_pragma(dbapi_conn, _):
-        cur = dbapi_conn.cursor()
-        cur.execute("PRAGMA foreign_keys=ON")
-        cur.close()
-
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine, future=True)
-
-# SQLAlchemy 2.0 compatible base with fallback
-try:
-    from sqlalchemy.orm import DeclarativeBase
-    class Base(DeclarativeBase):
-        pass
-except Exception:  # SQLAlchemy < 2
-    from sqlalchemy.ext.declarative import declarative_base
-    Base = declarative_base()
-
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
 
 # ============================================================================
-# USER MODEL (Reused from YCD with minor updates)
+# DATABASE DEPENDENCY
+# ============================================================================
+
+def get_db():
+    """Database session dependency for FastAPI"""
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# ============================================================================
+# USER MODEL
 # ============================================================================
 
 class User(Base):
+    """User account model"""
     __tablename__ = "users"
-
+    
     id = Column(Integer, primary_key=True, index=True)
-
-    # Authentication
-    username = Column(String, unique=True, index=True, nullable=False)
-    email = Column(String, unique=True, index=True, nullable=False)
-    hashed_password = Column(String, nullable=False)
-
-    created_at = Column(DateTime, default=datetime.utcnow)
-    is_active = Column(Boolean, default=True)
-
-    # Force password change flag
-    must_change_password = Column(Boolean, nullable=False, default=False, server_default="0")
-
-    # Subscription tier (free, starter, pro, business)
-    subscription_tier = Column(String, default="free")
-    subscription_status = Column(  # legacy column for compatibility
-        String, nullable=False, default="inactive", server_default="inactive"
-    )
-
+    username = Column(String(50), unique=True, index=True, nullable=False)
+    email = Column(String(100), unique=True, index=True, nullable=False)
+    hashed_password = Column(String(255), nullable=False)
+    
     # Stripe integration
-    stripe_customer_id = Column(String, nullable=True, unique=True)
-
-    # ------------------------------------------------------------------
-    # Stripe synchronization fields
-    # ------------------------------------------------------------------
-    stripe_subscription_status = Column(String, nullable=True)
-    stripe_current_period_end = Column(Integer, nullable=True)
-    stripe_current_period_end_dt = Column(DateTime, nullable=True)
-    subscription_expires_at = Column(DateTime, nullable=True)
-    subscription_updated_at = Column(DateTime, nullable=True)
-
-    # ------------------------------------------------------------------
-    # Usage tracking (UPDATED FOR SCREENSHOTS)
-    # ------------------------------------------------------------------
-    # Remove YouTube-specific fields, add screenshot tracking
-    usage_screenshots = Column(Integer, default=0)  # NEW: Screenshot usage
-    usage_batch_requests = Column(Integer, default=0)  # NEW: Batch request usage
-    usage_api_calls = Column(Integer, default=0)  # NEW: Total API calls
+    stripe_customer_id = Column(String(100), unique=True, nullable=True)
     
-    # Keep these for backwards compatibility during transition
-    usage_clean_transcripts = Column(Integer, default=0)  # LEGACY: Will remove later
-    usage_unclean_transcripts = Column(Integer, default=0)  # LEGACY: Will remove later
-    usage_audio_downloads = Column(Integer, default=0)  # LEGACY: Will remove later
-    usage_video_downloads = Column(Integer, default=0)  # LEGACY: Will remove later
-
-    usage_reset_date = Column(DateTime, default=datetime.utcnow)
+    # Subscription
+    subscription_tier = Column(String(20), default="free", nullable=False)
+    subscription_status = Column(String(20), default="active", nullable=True)
+    subscription_id = Column(String(100), unique=True, nullable=True)
+    subscription_ends_at = Column(DateTime, nullable=True)
+    
+    # Usage tracking
+    usage_screenshots = Column(Integer, default=0)
+    usage_batch_requests = Column(Integer, default=0)
+    usage_api_calls = Column(Integer, default=0)
     usage_reset_at = Column(DateTime, nullable=True)
-
-    # DEPRECATED: Old API Key columns (kept for backwards compatibility)
-    # These columns are no longer used - ApiKey table is used instead
-    # Will be removed in a future version
-    api_key = Column(String, nullable=True, unique=True, index=True)
-    api_key_created_at = Column(DateTime, nullable=True)
-    
-    # Webhook URL for notifications (NEW)
-    webhook_url = Column(String(500), nullable=True)
-
-    # Relationships
-    subscriptions = relationship("Subscription", back_populates="user")
-    screenshots = relationship("Screenshot", back_populates="user", cascade="all, delete-orphan")
-    api_keys = relationship("ApiKey", back_populates="user", cascade="all, delete-orphan")  # ✅ FIXED: Added relationship
-    
-    # Keep transcript_downloads for now (backwards compatibility)
-    transcript_downloads = relationship("TranscriptDownload", back_populates="user")
-
-
-# ============================================================================
-# SUBSCRIPTION MODEL (Reused from YCD - no changes needed)
-# ============================================================================
-
-class Subscription(Base):
-    __tablename__ = "subscriptions"
-
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
-
-    tier = Column(String, nullable=False)  # free, starter, pro, business
-    status = Column(String, default="active")
-
-    stripe_subscription_id = Column(String, nullable=True, unique=True)
-    stripe_customer_id = Column(String, nullable=True)
-
-    created_at = Column(DateTime, default=datetime.utcnow, index=True)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
-    cancelled_at = Column(DateTime, nullable=True)
-    expires_at = Column(DateTime, nullable=True)
-
-    extra_data = Column(Text, nullable=True)
-
-    user = relationship("User", back_populates="subscriptions")
-
-
-# ============================================================================
-# SCREENSHOT MODEL (NEW FOR PIXELPERFECT)
-# ============================================================================
-
-class Screenshot(Base):
-    """Screenshot model - stores metadata for captured screenshots"""
-    __tablename__ = "screenshots"
-
-    id = Column(String, primary_key=True)  # UUID
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
-
-    # Screenshot details
-    url = Column(Text, nullable=False)  # Original URL
-    width = Column(Integer, nullable=False)
-    height = Column(Integer, nullable=False)
-    full_page = Column(Boolean, default=False)
-    format = Column(String(10), nullable=False)  # png, jpeg, webp
-    quality = Column(Integer, nullable=True)  # JPEG quality (0-100)
-    
-    # File information
-    size_bytes = Column(Integer, nullable=False)
-    storage_url = Column(Text, nullable=False)  # R2/S3 URL
-    storage_key = Column(String, nullable=True)  # S3 object key
-    
-    # Processing information
-    processing_time_ms = Column(Float, nullable=True)  # Time to capture (milliseconds)
-    status = Column(String, default="completed")  # completed, failed, processing
-    error_message = Column(Text, nullable=True)
-    
-    # Advanced options (stored as flags/values)
-    dark_mode = Column(Boolean, default=False)
-    delay_seconds = Column(Integer, default=0)
-    removed_elements = Column(Text, nullable=True)  # JSON array of CSS selectors
     
     # Metadata
-    created_at = Column(DateTime, default=datetime.utcnow, index=True)
-    expires_at = Column(DateTime, nullable=True)  # Auto-delete after X days
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False)
     
-    # Change detection (for monitoring features)
-    is_baseline = Column(Boolean, default=False)
-    baseline_screenshot_id = Column(String, ForeignKey("screenshots.id"), nullable=True)
-    difference_percentage = Column(Float, nullable=True)
-    has_changes = Column(Boolean, nullable=True)
-
-    # Relationships
-    user = relationship("User", back_populates="screenshots")
-    
-    # Composite indexes for common queries
+    # Indexes
     __table_args__ = (
-        Index("ix_screenshots_user_created", "user_id", "created_at"),
-        Index("ix_screenshots_user_url", "user_id", "url"),
-        Index("ix_screenshots_status", "status"),
+        Index('idx_user_email', 'email'),
+        Index('idx_user_username', 'username'),
+        Index('idx_user_stripe', 'stripe_customer_id'),
     )
 
-
 # ============================================================================
-# API KEY MODEL - UPDATED WITH RELATIONSHIP
+# API KEY MODEL - ✅ NEW
 # ============================================================================
 
 class ApiKey(Base):
     """
-    API Keys for programmatic access to PixelPerfect API
+    API Keys for programmatic access
     
-    Unlike JWT tokens which expire after 24 hours, API keys are permanent
-    until explicitly revoked or regenerated by the user.
-    
-    Security:
-    - Keys are hashed using SHA-256 before storage
-    - Only the hash is stored in the database
-    - Plain text key is shown ONCE upon creation
-    - Prefix (first 11 chars) stored for display purposes
-    
-    Format: pk_{32_hex_characters}
-    Example: pk_a1b2c3d4e5f6...
+    Unlike JWT tokens which expire, API keys are permanent until regenerated.
+    Keys are stored as hashes for security.
     """
     __tablename__ = "api_keys"
     
-    # Primary key
     id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     
-    # Foreign key to users table
-    user_id = Column(
-        Integer,
-        ForeignKey("users.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True
-    )
-    
-    # Security: Store hashed version (SHA-256)
-    # Never store plain text API keys!
+    # Store hashed version for security (never store plain text)
     key_hash = Column(String(64), unique=True, nullable=False, index=True)
     
-    # Display: Store prefix for showing in UI
-    # Example: "pk_12345678..."
+    # Store prefix (first 11 chars) for display: "pk_12345678..."
     key_prefix = Column(String(16), nullable=False)
     
     # Metadata
     name = Column(String(100), default="Default API Key", nullable=False)
-    is_active = Column(Boolean, default=True, nullable=False, index=True)
-    
-    # Tracking
+    is_active = Column(Boolean, default=True, nullable=False)
     last_used_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    
-    # ✅ FIXED: Added relationship back to User
-    user = relationship("User", back_populates="api_keys")
     
     # Indexes for performance
     __table_args__ = (
@@ -254,308 +122,148 @@ class ApiKey(Base):
         Index('idx_api_key_user', 'user_id'),
         Index('idx_api_key_active', 'is_active'),
     )
+
+# ============================================================================
+# SCREENSHOT MODEL
+# ============================================================================
+
+class Screenshot(Base):
+    """Screenshot capture record"""
+    __tablename__ = "screenshots"
     
-    def __repr__(self):
-        return f"<ApiKey(id={self.id}, user_id={self.user_id}, prefix='{self.key_prefix}', active={self.is_active})>"
-
-
-# ============================================================================
-# LEGACY MODEL (Keep for backwards compatibility during transition)
-# ============================================================================
-
-class TranscriptDownload(Base):
-    """
-    LEGACY: YouTube transcript download tracking
-    Keep this table for now to avoid breaking existing users
-    Will be removed in future version
-    """
-    __tablename__ = "transcript_downloads"
-
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
-
-    youtube_id = Column(String, nullable=False, index=True)
-    transcript_type = Column(String, nullable=False)
-
-    quality = Column(String, nullable=True)
-    file_format = Column(String, nullable=True)
-    file_size = Column(Integer, nullable=True)
-    file_path = Column(String, nullable=True)
-
-    processing_time = Column(Float, nullable=True)
-    status = Column(String, default="completed")
-    language = Column(String, default="en")
-
-    created_at = Column(DateTime, default=datetime.utcnow, index=True)
-    error_message = Column(Text, nullable=True)
-
-    user = relationship("User", back_populates="transcript_downloads")
-
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    
+    url = Column(String(500), nullable=False)
+    screenshot_path = Column(String(500), nullable=False)
+    
+    width = Column(Integer, nullable=True)
+    height = Column(Integer, nullable=True)
+    format = Column(String(10), default="png", nullable=False)
+    
+    full_page = Column(Boolean, default=False, nullable=False)
+    dark_mode = Column(Boolean, default=False, nullable=False)
+    
+    status = Column(String(20), default="completed", nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    
     __table_args__ = (
-        Index("ix_transcripts_user_created", "user_id", "created_at"),
+        Index('idx_screenshot_user', 'user_id'),
+        Index('idx_screenshot_created', 'created_at'),
     )
 
-
 # ============================================================================
-# DATABASE HELPERS
-# ============================================================================
-
-def get_db():
-    """Dependency for FastAPI routes"""
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-
-def initialize_database():
-    """
-    Create tables and apply SQLite compatibility patches
-    Handles both fresh installs and migrations from YCD
-    """
-    try:
-        # Only create directories for SQLite databases
-        if DATABASE_URL.startswith("sqlite"):
-            db_path = DATABASE_URL.replace("sqlite:///", "").replace("./", "")
-            db_dir = os.path.dirname(db_path)
-            if db_dir and not os.path.exists(db_dir):
-                os.makedirs(db_dir)
-                print(f"📁 Created database directory: {db_dir}")
-
-        # Create all tables
-        Base.metadata.create_all(bind=engine)
-
-        # SQLite-specific migrations (add columns if missing)
-        if DATABASE_URL.startswith("sqlite"):
-            with engine.begin() as conn:
-                # Get existing columns
-                cols = conn.exec_driver_sql("PRAGMA table_info(users)").fetchall()
-                colnames = {c[1] for c in cols}
-
-                # --- Legacy fields (keep for backwards compatibility) ---
-                if "subscription_status" not in colnames:
-                    conn.exec_driver_sql(
-                        "ALTER TABLE users ADD COLUMN subscription_status TEXT NOT NULL DEFAULT 'inactive'"
-                    )
-
-                if "must_change_password" not in colnames:
-                    conn.exec_driver_sql(
-                        "ALTER TABLE users ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0"
-                    )
-
-                # --- Stripe sync fields ---
-                if "stripe_subscription_status" not in colnames:
-                    conn.exec_driver_sql(
-                        "ALTER TABLE users ADD COLUMN stripe_subscription_status TEXT"
-                    )
-
-                if "stripe_current_period_end" not in colnames:
-                    conn.exec_driver_sql(
-                        "ALTER TABLE users ADD COLUMN stripe_current_period_end INTEGER"
-                    )
-
-                if "stripe_current_period_end_dt" not in colnames:
-                    conn.exec_driver_sql(
-                        "ALTER TABLE users ADD COLUMN stripe_current_period_end_dt DATETIME"
-                    )
-
-                if "subscription_expires_at" not in colnames:
-                    conn.exec_driver_sql(
-                        "ALTER TABLE users ADD COLUMN subscription_expires_at DATETIME"
-                    )
-
-                if "subscription_updated_at" not in colnames:
-                    conn.exec_driver_sql(
-                        "ALTER TABLE users ADD COLUMN subscription_updated_at DATETIME"
-                    )
-
-                if "usage_reset_at" not in colnames:
-                    conn.exec_driver_sql(
-                        "ALTER TABLE users ADD COLUMN usage_reset_at DATETIME"
-                    )
-
-                # --- NEW: Screenshot usage fields ---
-                if "usage_screenshots" not in colnames:
-                    conn.exec_driver_sql(
-                        "ALTER TABLE users ADD COLUMN usage_screenshots INTEGER DEFAULT 0"
-                    )
-                    conn.exec_driver_sql(
-                        "UPDATE users SET usage_screenshots = 0 WHERE usage_screenshots IS NULL"
-                    )
-
-                if "usage_batch_requests" not in colnames:
-                    conn.exec_driver_sql(
-                        "ALTER TABLE users ADD COLUMN usage_batch_requests INTEGER DEFAULT 0"
-                    )
-                    conn.exec_driver_sql(
-                        "UPDATE users SET usage_batch_requests = 0 WHERE usage_batch_requests IS NULL"
-                    )
-
-                if "usage_api_calls" not in colnames:
-                    conn.exec_driver_sql(
-                        "ALTER TABLE users ADD COLUMN usage_api_calls INTEGER DEFAULT 0"
-                    )
-                    conn.exec_driver_sql(
-                        "UPDATE users SET usage_api_calls = 0 WHERE usage_api_calls IS NULL"
-                    )
-
-                # --- DEPRECATED: Old API Key fields (kept for backwards compatibility) ---
-                if "api_key" not in colnames:
-                    conn.exec_driver_sql(
-                        "ALTER TABLE users ADD COLUMN api_key TEXT UNIQUE"
-                    )
-
-                if "api_key_created_at" not in colnames:
-                    conn.exec_driver_sql(
-                        "ALTER TABLE users ADD COLUMN api_key_created_at DATETIME"
-                    )
-
-                # --- NEW: Webhook URL ---
-                if "webhook_url" not in colnames:
-                    conn.exec_driver_sql(
-                        "ALTER TABLE users ADD COLUMN webhook_url TEXT"
-                    )
-
-                # Backfill usage_reset_at if needed
-                try:
-                    conn.exec_driver_sql(
-                        "UPDATE users SET usage_reset_at = usage_reset_date "
-                        "WHERE usage_reset_at IS NULL AND usage_reset_date IS NOT NULL"
-                    )
-                except Exception:
-                    pass
-
-        print(f"✅ Database initialized successfully")
-        print(f"📊 Tables created:")
-        print(f"   - users (auth + subscriptions)")
-        print(f"   - subscriptions (Stripe sync)")
-        print(f"   - screenshots (PixelPerfect)")
-        print(f"   - api_keys (API key management)")
-        print(f"   - transcript_downloads (legacy)")
-        return True
-
-    except Exception as e:
-        print(f"❌ Error initializing database: {e}")
-        raise
-
-
-# ============================================================================
-# USAGE LIMIT HELPERS (UPDATED FOR BATCH PROCESSING)
+# SUBSCRIPTION MODEL
 # ============================================================================
 
-def get_tier_limits(tier: str) -> dict:
-    """
-    Get usage limits for a subscription tier
+class Subscription(Base):
+    """Stripe subscription details"""
+    __tablename__ = "subscriptions"
     
-    PRODUCTION-READY - matches pricing.py and batch.py:
-    - Free: 100 screenshots/month, NO batch processing
-    - Pro: 5,000 screenshots/month ($49), 50 URLs per batch
-    - Business: 50,000 screenshots/month ($199), 100 URLs per batch
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    
+    stripe_subscription_id = Column(String(100), unique=True, nullable=False)
+    stripe_customer_id = Column(String(100), nullable=False)
+    
+    tier = Column(String(20), nullable=False)  # free, pro, business, premium
+    status = Column(String(20), nullable=False)  # active, canceled, past_due, etc.
+    
+    current_period_start = Column(DateTime, nullable=True)
+    current_period_end = Column(DateTime, nullable=True)
+    cancel_at_period_end = Column(Boolean, default=False, nullable=False)
+    
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    
+    __table_args__ = (
+        Index('idx_subscription_user', 'user_id'),
+        Index('idx_subscription_stripe', 'stripe_subscription_id'),
+    )
+
+# ============================================================================
+# TIER LIMITS CONFIGURATION
+# ============================================================================
+
+def get_tier_limits(tier: str) -> Dict[str, Any]:
     """
+    Get usage limits for subscription tier
+    
+    Returns:
+        Dictionary with limits for screenshots, batch_requests, api_calls
+    """
+    tier = (tier or "free").lower()
+    
     limits = {
         "free": {
-            "screenshots": 100,  # ✅ Matches pricing.py
-            "batch_requests": 0,  # ✅ No batch processing for free tier
-            "api_calls_per_minute": 10,
-            "max_batch_size": 0,  # ✅ Critical: 0 means no batch processing
-            "screenshot_retention_days": 7,
-            "max_width": 1920,
-            "max_height": 1080,
-            "formats": ["png", "jpeg"],
-            "webhooks": False,
-            "change_detection": False,
-        },
-        "starter": {
-            "screenshots": 1000,
-            "batch_requests": 100,
-            "api_calls_per_minute": 60,
-            "max_batch_size": 25,
-            "screenshot_retention_days": 30,
-            "max_width": 3840,
-            "max_height": 2160,
-            "formats": ["png", "jpeg", "webp"],
-            "webhooks": False,
-            "change_detection": False,
+            "screenshots": 100,
+            "batch_requests": 0,  # Not available
+            "api_calls": 1000,
         },
         "pro": {
-            "screenshots": 5000,  # ✅ Matches pricing.py ($49/month)
-            "batch_requests": 500,
-            "api_calls_per_minute": 100,
-            "max_batch_size": 50,  # ✅ Matches batch.py PRO_MAX_BATCH
-            "screenshot_retention_days": 90,
-            "max_width": 3840,
-            "max_height": 2160,
-            "formats": ["png", "jpeg", "webp"],
-            "webhooks": True,
-            "change_detection": True,
+            "screenshots": 1000,
+            "batch_requests": 50,
+            "api_calls": 10000,
         },
         "business": {
-            "screenshots": 50000,  # ✅ Matches pricing.py ($199/month)
-            "batch_requests": 5000,
-            "api_calls_per_minute": 500,
-            "max_batch_size": 100,  # ✅ Matches batch.py BUSINESS_MAX_BATCH
-            "screenshot_retention_days": 365,
-            "max_width": 3840,
-            "max_height": 2160,
-            "formats": ["png", "jpeg", "webp", "pdf"],
-            "webhooks": True,
-            "change_detection": True,
-            "priority_processing": True,
+            "screenshots": 5000,
+            "batch_requests": 200,
+            "api_calls": 50000,
+        },
+        "premium": {
+            "screenshots": "unlimited",
+            "batch_requests": "unlimited",
+            "api_calls": "unlimited",
         },
     }
-    return limits.get(tier.lower(), limits["free"])
+    
+    return limits.get(tier, limits["free"])
 
+# ============================================================================
+# USAGE RESET HELPER
+# ============================================================================
 
-def check_usage_limits(user: User, usage_type: str = "screenshots") -> tuple[bool, str]:
+def reset_monthly_usage(user: User, db: Session) -> None:
     """
-    Check if user can perform an action based on their tier limits
+    Reset user's monthly usage counters
     
-    Returns: (can_use, message)
+    Called at the start of each billing cycle
     """
-    tier_limits = get_tier_limits(user.subscription_tier)
-    
-    if usage_type == "screenshots":
-        current = user.usage_screenshots
-        limit = tier_limits["screenshots"]
-        
-        if current >= limit:
-            return False, f"Monthly screenshot limit reached ({limit}). Upgrade to increase limit."
-        return True, f"Usage: {current}/{limit} screenshots this month"
-    
-    elif usage_type == "batch_requests":
-        current = user.usage_batch_requests
-        limit = tier_limits["batch_requests"]
-        
-        if current >= limit:
-            return False, f"Monthly batch request limit reached ({limit}). Upgrade for more."
-        return True, f"Usage: {current}/{limit} batch requests this month"
-    
-    return True, "OK"
-
-
-def increment_usage(user: User, db, usage_type: str = "screenshots"):
-    """Increment usage counter for user"""
-    if usage_type == "screenshots":
-        user.usage_screenshots += 1
-    elif usage_type == "batch_requests":
-        user.usage_batch_requests += 1
-    
-    user.usage_api_calls += 1
-    db.commit()
-
-
-def reset_monthly_usage(user: User, db):
-    """Reset all usage counters for a user"""
     user.usage_screenshots = 0
     user.usage_batch_requests = 0
     user.usage_api_calls = 0
-    user.usage_reset_at = datetime.utcnow()
-    user.usage_reset_date = datetime.utcnow()  # Keep for backwards compatibility
+    user.usage_reset_at = datetime.utcnow() + timedelta(days=30)
     db.commit()
-    print(f"✅ Usage reset for user {user.username}")
 
-# # ========================================
+# ============================================================================
+# DATABASE INITIALIZATION
+# ============================================================================
+
+def initialize_database():
+    """
+    Create all database tables
+    
+    Call this on application startup
+    """
+    Base.metadata.create_all(bind=engine)
+    print("✅ Database tables created successfully")
+
+# ============================================================================
+# USAGE EXAMPLE
+# ============================================================================
+
+"""
+# In main.py:
+
+from models import User, ApiKey, Screenshot, Subscription
+from models import get_db, initialize_database, get_tier_limits
+
+@app.on_event("startup")
+async def on_startup():
+    initialize_database()
+"""
+
+# # =====================================================
 # # backend/models.py
 # # PixelPerfect Screenshot API - Database Models
 # # Updated for screenshot functionality while keeping auth/subscription infrastructure
@@ -873,11 +581,13 @@ def reset_monthly_usage(user: User, db):
 #     Handles both fresh installs and migrations from YCD
 #     """
 #     try:
-#         db_path = DATABASE_URL.replace("sqlite:///", "").replace("./", "")
-#         db_dir = os.path.dirname(db_path)
-#         if db_dir and not os.path.exists(db_dir):
-#             os.makedirs(db_dir)
-#             print(f"📁 Created database directory: {db_dir}")
+#         # Only create directories for SQLite databases
+#         if DATABASE_URL.startswith("sqlite"):
+#             db_path = DATABASE_URL.replace("sqlite:///", "").replace("./", "")
+#             db_dir = os.path.dirname(db_path)
+#             if db_dir and not os.path.exists(db_dir):
+#                 os.makedirs(db_dir)
+#                 print(f"📁 Created database directory: {db_dir}")
 
 #         # Create all tables
 #         Base.metadata.create_all(bind=engine)
@@ -1110,5 +820,4 @@ def reset_monthly_usage(user: User, db):
 #     user.usage_reset_date = datetime.utcnow()  # Keep for backwards compatibility
 #     db.commit()
 #     print(f"✅ Usage reset for user {user.username}")
-
 

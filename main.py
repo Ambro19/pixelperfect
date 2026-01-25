@@ -3,10 +3,10 @@
 # PIXELPERFECT SCREENSHOT API - BACKEND
 # ========================================
 # Author: OneTechly
-# Updated: January 2026 - FIXED BILLING ENDPOINT
+# Updated: January 2026 - ADDED API KEY ENDPOINT
 #
-# Key Fix: Changed /billing/checkout-session → /billing/create_checkout_session
-# This matches the frontend call in Pricing.js
+# ✅ NEW: /api/keys/current endpoint for retrieving API keys
+# ✅ FIXED: Billing endpoint matches frontend
 # ========================================
 
 from pathlib import Path
@@ -44,6 +44,7 @@ from models import (
     User,
     Screenshot,
     Subscription,
+    ApiKey,  # ✅ NEW: Import ApiKey model
     get_db,
     initialize_database,
     engine,
@@ -53,7 +54,13 @@ from models import (
 from db_migrations import run_startup_migrations
 from auth_deps import get_current_user
 from webhook_handler import handle_stripe_webhook
-from api_key_system import create_api_key_for_user, run_api_key_migration
+
+# ✅ NEW: Import API key system functions
+from api_key_system import (
+    create_api_key_for_user,
+    run_api_key_migration,
+    validate_api_key,
+)
 
 # ----------------------------------------------------------------------------
 # CONFIG
@@ -276,11 +283,12 @@ class BillingCheckoutIn(BaseModel):
 async def on_startup():
     initialize_database()
     run_startup_migrations(engine)
-    run_api_key_migration(engine)
+    run_api_key_migration(engine)  # ✅ NEW: Create api_keys table
 
     logger.info("============================================================")
     logger.info("PixelPerfect starting - ENV=%s DB=%s", ENVIRONMENT, DATABASE_URL)
     logger.info("Stripe configured: %s", bool(stripe and os.getenv("STRIPE_SECRET_KEY")))
+    logger.info("✅ API key system initialized")
     logger.info("============================================================")
 
 # ----------------------------------------------------------------------------
@@ -331,9 +339,11 @@ def register(user: UserCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(obj)
 
+    # ✅ NEW: Create API key for new user
     api_key = None
     try:
         api_key, _ = create_api_key_for_user(db, obj.id, "Default API Key")
+        logger.info(f"✅ Created API key for new user {obj.id}")
     except Exception as e:
         logger.warning("API key creation skipped: %s", e)
 
@@ -418,6 +428,62 @@ def reset_password(payload: ResetPasswordIn, db: Session = Depends(get_db)):
     return {"ok": True}
 
 # ----------------------------------------------------------------------------
+# ✅ NEW: API KEY ENDPOINT
+# ----------------------------------------------------------------------------
+@app.get("/api/keys/current")
+async def get_current_api_key(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Get or create API key for current user
+    
+    Returns:
+        - api_key: The API key (only shown on first creation)
+        - key_prefix: Display version (e.g., "pk_abc12345...")
+        - created_at: When the key was created
+        - last_used_at: When the key was last used
+    
+    Note: If user has no API key, one is automatically created
+    """
+    # Get existing active API key
+    api_key_record = db.query(ApiKey).filter(
+        ApiKey.user_id == current_user.id,
+        ApiKey.is_active == True
+    ).first()
+    
+    # If no API key exists, create one
+    if not api_key_record:
+        try:
+            api_key, api_key_record = create_api_key_for_user(
+                db=db,
+                user_id=current_user.id,
+                name="Default API Key"
+            )
+            logger.info(f"✅ Created API key for user {current_user.id}")
+            
+            # Return the plain text key (ONLY on first creation)
+            return {
+                "api_key": api_key,
+                "key_prefix": api_key_record.key_prefix,
+                "created_at": api_key_record.created_at.isoformat() if api_key_record.created_at else None,
+                "last_used_at": api_key_record.last_used_at.isoformat() if api_key_record.last_used_at else None,
+                "message": "⚠️ Save this key securely. It won't be shown again!"
+            }
+        except Exception as e:
+            logger.error(f"❌ API key creation failed for user {current_user.id}: {e}")
+            raise HTTPException(status_code=500, detail="Failed to create API key")
+    
+    # Return existing key info (without plain text key)
+    return {
+        "key_prefix": api_key_record.key_prefix,
+        "created_at": api_key_record.created_at.isoformat() if api_key_record.created_at else None,
+        "last_used_at": api_key_record.last_used_at.isoformat() if api_key_record.last_used_at else None,
+        "name": api_key_record.name,
+        "message": "API key already exists. For security, the full key cannot be displayed."
+    }
+
+# ----------------------------------------------------------------------------
 # Stripe webhook
 # ----------------------------------------------------------------------------
 _IDEMP_STORE: Dict[str, float] = {}
@@ -463,22 +529,14 @@ async def stripe_webhook_endpoint(request: Request):
     return await handle_stripe_webhook(request)
 
 # ----------------------------------------------------------------------------
-# ✅ CRITICAL FIX: Billing endpoint renamed to match frontend
-# Changed from /billing/checkout-session to /billing/create_checkout_session
-# This is what Pricing.js is calling!
+# Billing endpoint (matches frontend)
 # ----------------------------------------------------------------------------
 def _lookup_key(plan: str, billing_cycle: str) -> Optional[str]:
-    """
-    Lookup Stripe price based on plan and billing cycle.
-    Uses environment variables for flexibility:
-    - STRIPE_PRO_LOOKUP_KEY_MONTHLY / STRIPE_PRO_LOOKUP_KEY_YEARLY
-    - STRIPE_BUSINESS_LOOKUP_KEY_MONTHLY / STRIPE_BUSINESS_LOOKUP_KEY_YEARLY
-    - STRIPE_PREMIUM_LOOKUP_KEY_MONTHLY / STRIPE_PREMIUM_LOOKUP_KEY_YEARLY
-    """
+    """Lookup Stripe price based on plan and billing cycle"""
     plan = (plan or "").lower().strip()
     billing_cycle = (billing_cycle or "monthly").lower().strip()
 
-    # Try to get yearly-specific key first
+    # Try yearly-specific key first
     if billing_cycle == "yearly":
         k = os.getenv(f"STRIPE_{plan.upper()}_LOOKUP_KEY_YEARLY")
         if k:
@@ -489,26 +547,13 @@ def _lookup_key(plan: str, billing_cycle: str) -> Optional[str]:
     return k.strip() if k else None
 
 
-@app.post("/billing/create_checkout_session")  # ✅ FIXED: Was /billing/checkout-session
+@app.post("/billing/create_checkout_session")
 def create_checkout_session(
     payload: BillingCheckoutIn,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """
-    ✅ FIXED ENDPOINT: Create Stripe Checkout Session
-    
-    This endpoint was renamed from /billing/checkout-session to /billing/create_checkout_session
-    to match what the frontend Pricing.js component is calling.
-    
-    Request Body:
-    - plan: "pro" | "business" | "premium"
-    - billing_cycle: "monthly" | "yearly"
-    
-    Returns:
-    - url: Stripe Checkout redirect URL
-    - id: Checkout Session ID
-    """
+    """Create Stripe Checkout Session"""
     if not stripe or not os.getenv("STRIPE_SECRET_KEY"):
         raise HTTPException(status_code=503, detail="Stripe is not configured")
 
@@ -586,13 +631,7 @@ def create_checkout_session(
 # ----------------------------------------------------------------------------
 @app.get("/subscription_status")
 def subscription_status(request: Request, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """
-    Get user's subscription status with optional Stripe sync.
-    
-    Query params:
-    - sync=1: Force sync with Stripe (slower but accurate)
-    - sync=0: Use cached data (faster)
-    """
+    """Get user's subscription status with optional Stripe sync"""
     # Apply local overdue downgrade check
     try:
         _apply_local_overdue_downgrade_if_possible(current_user, db)
@@ -658,13 +697,24 @@ if __name__ == "__main__":
     print(f"📡 Backend: http://0.0.0.0:8000")
     print(f"🌐 Frontend: {FRONTEND_URL}")
     print(f"💳 Stripe: {'✅ Configured' if stripe else '❌ Not configured'}")
+    print(f"🔑 API Keys: ✅ Enabled")
     print("=" * 80)
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
 
 #-------------------- End of main.py-------------------------------
 
-# #=========================================================================
+# #============================================
 # # backend/main.py
+# # ========================================
+# # PIXELPERFECT SCREENSHOT API - BACKEND
+# # ========================================
+# # Author: OneTechly
+# # Updated: January 2026 - FIXED BILLING ENDPOINT
+# #
+# # Key Fix: Changed /billing/checkout-session → /billing/create_checkout_session
+# # This matches the frontend call in Pricing.js
+# # ========================================
+
 # from pathlib import Path
 # from datetime import datetime, timedelta
 # from typing import Optional, Dict, Any
@@ -1119,13 +1169,22 @@ if __name__ == "__main__":
 #     return await handle_stripe_webhook(request)
 
 # # ----------------------------------------------------------------------------
-# # Billing: create checkout session (THIS FIXES YOUR UPGRADE BUTTON FLOW)
+# # ✅ CRITICAL FIX: Billing endpoint renamed to match frontend
+# # Changed from /billing/checkout-session to /billing/create_checkout_session
+# # This is what Pricing.js is calling!
 # # ----------------------------------------------------------------------------
 # def _lookup_key(plan: str, billing_cycle: str) -> Optional[str]:
+#     """
+#     Lookup Stripe price based on plan and billing cycle.
+#     Uses environment variables for flexibility:
+#     - STRIPE_PRO_LOOKUP_KEY_MONTHLY / STRIPE_PRO_LOOKUP_KEY_YEARLY
+#     - STRIPE_BUSINESS_LOOKUP_KEY_MONTHLY / STRIPE_BUSINESS_LOOKUP_KEY_YEARLY
+#     - STRIPE_PREMIUM_LOOKUP_KEY_MONTHLY / STRIPE_PREMIUM_LOOKUP_KEY_YEARLY
+#     """
 #     plan = (plan or "").lower().strip()
 #     billing_cycle = (billing_cycle or "monthly").lower().strip()
 
-#     # Prefer explicit yearly keys if you have them
+#     # Try to get yearly-specific key first
 #     if billing_cycle == "yearly":
 #         k = os.getenv(f"STRIPE_{plan.upper()}_LOOKUP_KEY_YEARLY")
 #         if k:
@@ -1135,44 +1194,74 @@ if __name__ == "__main__":
 #     k = os.getenv(f"STRIPE_{plan.upper()}_LOOKUP_KEY_MONTHLY") or os.getenv(f"STRIPE_{plan.upper()}_LOOKUP_KEY")
 #     return k.strip() if k else None
 
-# @app.post("/billing/checkout-session")
+
+# @app.post("/billing/create_checkout_session")  # ✅ FIXED: Was /billing/checkout-session
 # def create_checkout_session(
 #     payload: BillingCheckoutIn,
 #     current_user: User = Depends(get_current_user),
 #     db: Session = Depends(get_db),
 # ):
+#     """
+#     ✅ FIXED ENDPOINT: Create Stripe Checkout Session
+    
+#     This endpoint was renamed from /billing/checkout-session to /billing/create_checkout_session
+#     to match what the frontend Pricing.js component is calling.
+    
+#     Request Body:
+#     - plan: "pro" | "business" | "premium"
+#     - billing_cycle: "monthly" | "yearly"
+    
+#     Returns:
+#     - url: Stripe Checkout redirect URL
+#     - id: Checkout Session ID
+#     """
 #     if not stripe or not os.getenv("STRIPE_SECRET_KEY"):
 #         raise HTTPException(status_code=503, detail="Stripe is not configured")
 
+#     # Validate plan
 #     plan = (payload.plan or "").lower().strip()
 #     if plan not in {"pro", "business", "premium"}:
-#         raise HTTPException(status_code=400, detail="Invalid plan")
+#         raise HTTPException(status_code=400, detail="Invalid plan. Must be: pro, business, or premium")
 
+#     # Validate billing cycle
 #     billing_cycle = (payload.billing_cycle or "monthly").lower().strip()
 #     if billing_cycle not in {"monthly", "yearly"}:
-#         raise HTTPException(status_code=400, detail="Invalid billing_cycle")
+#         raise HTTPException(status_code=400, detail="Invalid billing_cycle. Must be: monthly or yearly")
 
+#     # Ensure user has Stripe customer ID
 #     ensure_stripe_customer_for_user(current_user, db)
 #     customer_id = getattr(current_user, "stripe_customer_id", None)
 #     if not customer_id:
-#         raise HTTPException(status_code=400, detail="User missing Stripe customer id")
+#         raise HTTPException(status_code=400, detail="User missing Stripe customer ID. Please contact support.")
 
+#     # Get the lookup key for this plan/cycle combination
 #     lookup_key = _lookup_key(plan, billing_cycle)
 #     if not lookup_key:
+#         logger.error(f"Missing Stripe lookup key for {plan} ({billing_cycle})")
 #         raise HTTPException(
 #             status_code=500,
-#             detail=f"Missing Stripe lookup key for {plan} ({billing_cycle}). Set STRIPE_{plan.upper()}_LOOKUP_KEY_MONTHLY and optionally _YEARLY.",
+#             detail=f"Missing Stripe configuration for {plan} ({billing_cycle}). "
+#                    f"Please set STRIPE_{plan.upper()}_LOOKUP_KEY_MONTHLY and optionally _YEARLY in environment.",
 #         )
 
 #     try:
+#         # Get Price ID from Stripe using lookup key
 #         prices = stripe.Price.list(lookup_keys=[lookup_key], limit=1)
 #         if not prices.data:
-#             raise HTTPException(status_code=500, detail=f"No Stripe Price found for lookup_key={lookup_key}")
+#             logger.error(f"No Stripe Price found for lookup_key={lookup_key}")
+#             raise HTTPException(
+#                 status_code=500, 
+#                 detail=f"No Stripe Price found for lookup_key={lookup_key}. Please check Stripe Dashboard."
+#             )
+        
 #         price_id = prices.data[0].id
+#         logger.info(f"✅ Found Stripe Price: {price_id} for {plan} ({billing_cycle})")
 
+#         # Build redirect URLs
 #         success_url = f"{FRONTEND_URL}/dashboard?checkout=success"
 #         cancel_url = f"{FRONTEND_URL}/pricing?checkout=cancel"
 
+#         # Create Stripe Checkout Session
 #         session = stripe.checkout.Session.create(
 #             mode="subscription",
 #             customer=customer_id,
@@ -1181,39 +1270,73 @@ if __name__ == "__main__":
 #             cancel_url=cancel_url,
 #             allow_promotion_codes=True,
 #             client_reference_id=str(current_user.id),
-#             metadata={"app_user_id": str(current_user.id), "plan": plan, "billing_cycle": billing_cycle},
+#             metadata={
+#                 "app_user_id": str(current_user.id),
+#                 "plan": plan,
+#                 "billing_cycle": billing_cycle,
+#             },
 #         )
+        
+#         logger.info(f"✅ Stripe Checkout Session created: {session.id} for user {current_user.id}")
 #         return {"url": session.url, "id": session.id}
+        
 #     except HTTPException:
 #         raise
 #     except Exception as e:
-#         logger.exception("Checkout session create failed")
-#         raise HTTPException(status_code=500, detail=f"Stripe error: {e}")
+#         logger.exception(f"❌ Checkout session create failed for user {current_user.id}")
+#         raise HTTPException(status_code=500, detail=f"Stripe error: {str(e)}")
+
 
 # # ----------------------------------------------------------------------------
-# # Subscription status (kept from your logic)
+# # Subscription status (sync with Stripe)
 # # ----------------------------------------------------------------------------
 # @app.get("/subscription_status")
 # def subscription_status(request: Request, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+#     """
+#     Get user's subscription status with optional Stripe sync.
+    
+#     Query params:
+#     - sync=1: Force sync with Stripe (slower but accurate)
+#     - sync=0: Use cached data (faster)
+#     """
+#     # Apply local overdue downgrade check
 #     try:
 #         _apply_local_overdue_downgrade_if_possible(current_user, db)
 #     except Exception as e:
 #         logger.warning("Local downgrade check failed: %s", e)
 
+#     # Sync with Stripe if requested
 #     if request.query_params.get("sync") == "1":
 #         try:
 #             sync_user_subscription_from_stripe(current_user, db)
 #         except Exception as e:
 #             logger.warning("Stripe sync failed: %s", e)
 
+#     # Get current tier and usage
 #     tier = (getattr(current_user, "subscription_tier", "free") or "free").lower()
 #     tier_limits = get_tier_limits(tier)
+    
 #     usage = {
 #         "screenshots": getattr(current_user, "usage_screenshots", 0) or 0,
 #         "batch_requests": getattr(current_user, "usage_batch_requests", 0) or 0,
 #         "api_calls": getattr(current_user, "usage_api_calls", 0) or 0,
 #     }
-#     return {"tier": tier, "usage": usage, "limits": tier_limits, "account": canonical_account(current_user)}
+    
+#     # Get next reset date if available
+#     next_reset = getattr(current_user, "usage_reset_at", None)
+    
+#     response = {
+#         "tier": tier,
+#         "usage": usage,
+#         "limits": tier_limits,
+#         "account": canonical_account(current_user),
+#     }
+    
+#     if next_reset:
+#         response["next_reset"] = next_reset.isoformat() if isinstance(next_reset, datetime) else next_reset
+    
+#     return response
+
 
 # # ----------------------------------------------------------------------------
 # # Optional SPA mount (keep if you use it)
@@ -1236,7 +1359,13 @@ if __name__ == "__main__":
 # # ----------------------------------------------------------------------------
 # if __name__ == "__main__":
 #     import uvicorn
-#     print("Starting PixelPerfect Screenshot API on http://0.0.0.0:8000")
+#     print("=" * 80)
+#     print("🚀 Starting PixelPerfect Screenshot API")
+#     print(f"📡 Backend: http://0.0.0.0:8000")
+#     print(f"🌐 Frontend: {FRONTEND_URL}")
+#     print(f"💳 Stripe: {'✅ Configured' if stripe else '❌ Not configured'}")
+#     print("=" * 80)
 #     uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
 
+# #-------------------- End of main.py-------------------------------
 
