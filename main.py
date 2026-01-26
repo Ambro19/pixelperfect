@@ -15,11 +15,17 @@
 # ============================================================================
 # WINDOWS FIX - MUST BE FIRST!
 # ============================================================================
+# ======================================================================
+# WINDOWS EVENT LOOP POLICY (Playwright needs subprocess support)
+# MUST be set BEFORE anything that may touch asyncio/playwright/uvicorn.
+# ======================================================================
 import sys
 
 if sys.platform == 'win32':
     import asyncio
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    #asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
 
 # ============================================================================
 # NOW your imports start...
