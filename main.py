@@ -5,39 +5,31 @@
 # Author: OneTechly
 # Updated: January 2026 - PRODUCTION READY
 #
-# FIXES:
-# ✅ Screenshot API endpoints integrated
-# ✅ Batch processing support
-# ✅ API key management
-# ✅ Stripe billing integration
+# Key update (Jan 2026):
+# ✅ Playwright init is NON-FATAL in production (Render-safe)
+# ✅ /health reports screenshot_service readiness + last error
 # ========================================
 
 # ============================================================================
 # WINDOWS FIX - MUST BE FIRST!
 # ============================================================================
-# ======================================================================
-# WINDOWS EVENT LOOP POLICY (Playwright needs subprocess support)
-# MUST be set BEFORE anything that may touch asyncio/playwright/uvicorn.
-# ======================================================================
 import sys
-
-if sys.platform == 'win32':
+if sys.platform == "win32":
     import asyncio
-    #asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    # Proactor is fine for your sync-in-threadpool approach; keep consistent with your runner logs.
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
-
 # ============================================================================
-# NOW your imports start...
+# Imports
 # ============================================================================
 import os
-from fastapi import FastAPI, HTTPException, Depends
-# ... rest of imports ...
-
+import time
+import socket
+import logging
+import threading
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
-import time, socket, logging, threading, os
 
 from dotenv import load_dotenv, find_dotenv
 load_dotenv()
@@ -53,7 +45,6 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.types import ASGIApp
 
 from sqlalchemy.orm import Session
-from sqlalchemy import delete as sqla_delete
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 from pydantic import BaseModel, EmailStr
 
@@ -86,7 +77,7 @@ from api_key_system import (
     validate_api_key,
 )
 
-# Screenshot service imports
+# Screenshot service + endpoints
 from screenshot_service import screenshot_service
 from screenshot_endpoints import (
     capture_screenshot_endpoint,
@@ -95,7 +86,6 @@ from screenshot_endpoints import (
     ScreenshotRequest,
     BatchScreenshotRequest,
 )
-
 
 # ----------------------------------------------------------------------------
 # CONFIG
@@ -123,7 +113,7 @@ FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000").rstrip("/")
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000").rstrip("/")
 
 # ----------------------------------------------------------------------------
-# Stripe init
+# Stripe init (non-fatal)
 # ----------------------------------------------------------------------------
 stripe = None
 try:
@@ -144,6 +134,26 @@ app = FastAPI(
     description="Professional Website Screenshot API with Playwright",
     default_response_class=ORJSONResponse,
 )
+
+# ----------------------------------------------------------------------------
+# Screenshot Service Readiness (NEW)
+# ----------------------------------------------------------------------------
+# We track Playwright init status in memory so Render can stay up even if
+# browsers aren't present yet.
+SCREENSHOT_READY: bool = False
+SCREENSHOT_LAST_ERROR: Optional[str] = None
+SCREENSHOT_LAST_ERROR_AT: Optional[str] = None
+
+def _set_screenshot_ready(val: bool, err: Optional[str] = None):
+    global SCREENSHOT_READY, SCREENSHOT_LAST_ERROR, SCREENSHOT_LAST_ERROR_AT
+    SCREENSHOT_READY = bool(val)
+    if err:
+        SCREENSHOT_LAST_ERROR = str(err)
+        SCREENSHOT_LAST_ERROR_AT = datetime.utcnow().isoformat()
+    elif val:
+        # Clear on success
+        SCREENSHOT_LAST_ERROR = None
+        SCREENSHOT_LAST_ERROR_AT = None
 
 # ----------------------------------------------------------------------------
 # Security headers middleware (CSP aligned with Stripe)
@@ -205,7 +215,7 @@ app.add_middleware(
 )
 
 # ----------------------------------------------------------------------------
-# CORS (use env if provided, else sane defaults)
+# CORS
 # ----------------------------------------------------------------------------
 PUBLIC_ORIGINS = [
     "https://pixelperfectapi.net",
@@ -230,7 +240,6 @@ app.add_middleware(
     expose_headers=["Content-Disposition", "Content-Type", "Content-Length"],
     max_age=3600,
 )
-
 logger.info("CORS enabled for: %s", allow_origins)
 
 # ----------------------------------------------------------------------------
@@ -316,24 +325,44 @@ class BillingCheckoutIn(BaseModel):
 # ----------------------------------------------------------------------------
 @app.on_event("startup")
 async def on_startup():
-    """Initialize database, migrations, and screenshot service"""
+    """
+    Initialize database, migrations, api keys, and screenshot service.
+
+    IMPORTANT:
+    - Screenshot service init is NON-FATAL in production so Render doesn't crash
+      if Playwright browsers are missing temporarily.
+    """
     initialize_database()
     run_startup_migrations(engine)
     run_api_key_migration(engine)
-    await screenshot_service.initialize()
+
+    # Try to initialize Playwright; do NOT crash production if it fails.
+    try:
+        await screenshot_service.initialize()
+        _set_screenshot_ready(True)
+    except Exception as e:
+        _set_screenshot_ready(False, err=e)
+        # In development: fail fast so you notice immediately.
+        if not IS_PROD:
+            raise
+        logger.exception("⚠️ Screenshot service init failed (non-fatal in production).")
 
     logger.info("============================================================")
     logger.info("PixelPerfect starting - ENV=%s DB=%s", ENVIRONMENT, DATABASE_URL)
     logger.info("Stripe configured: %s", bool(stripe and os.getenv("STRIPE_SECRET_KEY")))
     logger.info("✅ API key system initialized")
-    logger.info("✅ Screenshot service initialized")
+    logger.info("📸 Screenshot service ready: %s", SCREENSHOT_READY)
+    if SCREENSHOT_LAST_ERROR:
+        logger.info("📸 Screenshot last error: %s", SCREENSHOT_LAST_ERROR)
     logger.info("============================================================")
-
 
 @app.on_event("shutdown")
 async def on_shutdown():
     """Gracefully shutdown screenshot service"""
-    await screenshot_service.close()
+    try:
+        await screenshot_service.close()
+    except Exception:
+        logger.exception("Screenshot service close failed (ignored).")
     logger.info("✅ Screenshot service closed gracefully")
 
 # ----------------------------------------------------------------------------
@@ -349,7 +378,12 @@ def health():
         "status": "healthy",
         "timestamp": datetime.utcnow().isoformat(),
         "environment": ENVIRONMENT,
-        "services": {"stripe": "configured" if os.getenv("STRIPE_SECRET_KEY") else "not_configured"},
+        "services": {
+            "stripe": "configured" if os.getenv("STRIPE_SECRET_KEY") else "not_configured",
+            "screenshot_service": "ready" if SCREENSHOT_READY else "not_ready",
+        },
+        "screenshot_service_error": SCREENSHOT_LAST_ERROR,
+        "screenshot_service_error_at": SCREENSHOT_LAST_ERROR_AT,
     }
 
 @app.head("/health")
@@ -384,11 +418,10 @@ def register(user: UserCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(obj)
 
-    # Create API key for new user
     api_key = None
     try:
         api_key, _ = create_api_key_for_user(db, obj.id, "Default API Key")
-        logger.info(f"✅ Created API key for new user {obj.id}")
+        logger.info("✅ Created API key for new user %s", obj.id)
     except Exception as e:
         logger.warning("API key creation skipped: %s", e)
 
@@ -480,24 +513,11 @@ async def get_current_api_key(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """
-    Get or create API key for current user
-    
-    Returns:
-        - api_key: The API key (only shown on first creation)
-        - key_prefix: Display version (e.g., "pk_abc12345...")
-        - created_at: When the key was created
-        - last_used_at: When the key was last used
-    
-    Note: If user has no API key, one is automatically created
-    """
-    # Get existing active API key
     api_key_record = db.query(ApiKey).filter(
         ApiKey.user_id == current_user.id,
         ApiKey.is_active == True
     ).first()
-    
-    # If no API key exists, create one
+
     if not api_key_record:
         try:
             api_key, api_key_record = create_api_key_for_user(
@@ -505,9 +525,7 @@ async def get_current_api_key(
                 user_id=current_user.id,
                 name="Default API Key"
             )
-            logger.info(f"✅ Created API key for user {current_user.id}")
-            
-            # Return the plain text key (ONLY on first creation)
+            logger.info("✅ Created API key for user %s", current_user.id)
             return {
                 "api_key": api_key,
                 "key_prefix": api_key_record.key_prefix,
@@ -516,10 +534,9 @@ async def get_current_api_key(
                 "message": "⚠️ Save this key securely. It won't be shown again!"
             }
         except Exception as e:
-            logger.error(f"❌ API key creation failed for user {current_user.id}: {e}")
+            logger.error("❌ API key creation failed for user %s: %s", current_user.id, e)
             raise HTTPException(status_code=500, detail="Failed to create API key")
-    
-    # Return existing key info (without plain text key)
+
     return {
         "key_prefix": api_key_record.key_prefix,
         "created_at": api_key_record.created_at.isoformat() if api_key_record.created_at else None,
@@ -528,18 +545,11 @@ async def get_current_api_key(
         "message": "API key already exists. For security, the full key cannot be displayed."
     }
 
-
 @app.post("/api/keys/regenerate")
 async def regenerate_api_key(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """
-    🔄 Regenerate API key
-    
-    Deactivates old key and generates a new one.
-    The old key will stop working immediately.
-    """
     return await regenerate_api_key_endpoint(current_user, db)
 
 # ----------------------------------------------------------------------------
@@ -551,23 +561,7 @@ async def capture_screenshot(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """
-    📸 Capture a screenshot of a website
-    
-    **Features:**
-    - Multiple formats (PNG, JPEG, WebP, PDF)
-    - Custom viewport sizes
-    - Full-page capture
-    - Dark mode emulation
-    
-    **Rate Limits:**
-    - Free: 100/month
-    - Pro: 1000/month
-    - Business: 5000/month
-    - Premium: Unlimited
-    """
     return await capture_screenshot_endpoint(request, current_user, db)
-
 
 @app.post("/api/v1/batch/submit")
 async def batch_screenshot(
@@ -575,14 +569,6 @@ async def batch_screenshot(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """
-    📦 Capture multiple screenshots in one request
-    
-    **Pro+ Feature Only**
-    
-    Capture up to 50 screenshots in a single batch job.
-    Results are processed asynchronously.
-    """
     return await batch_screenshot_endpoint(request, current_user, db)
 
 # ----------------------------------------------------------------------------
@@ -634,20 +620,16 @@ async def stripe_webhook_endpoint(request: Request):
 # Billing endpoint (matches frontend)
 # ----------------------------------------------------------------------------
 def _lookup_key(plan: str, billing_cycle: str) -> Optional[str]:
-    """Lookup Stripe price based on plan and billing cycle"""
     plan = (plan or "").lower().strip()
     billing_cycle = (billing_cycle or "monthly").lower().strip()
 
-    # Try yearly-specific key first
     if billing_cycle == "yearly":
         k = os.getenv(f"STRIPE_{plan.upper()}_LOOKUP_KEY_YEARLY")
         if k:
             return k.strip()
 
-    # Fall back to monthly key
     k = os.getenv(f"STRIPE_{plan.upper()}_LOOKUP_KEY_MONTHLY") or os.getenv(f"STRIPE_{plan.upper()}_LOOKUP_KEY")
     return k.strip() if k else None
-
 
 @app.post("/billing/create_checkout_session")
 def create_checkout_session(
@@ -655,30 +637,25 @@ def create_checkout_session(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Create Stripe Checkout Session"""
     if not stripe or not os.getenv("STRIPE_SECRET_KEY"):
         raise HTTPException(status_code=503, detail="Stripe is not configured")
 
-    # Validate plan
     plan = (payload.plan or "").lower().strip()
     if plan not in {"pro", "business", "premium"}:
         raise HTTPException(status_code=400, detail="Invalid plan. Must be: pro, business, or premium")
 
-    # Validate billing cycle
     billing_cycle = (payload.billing_cycle or "monthly").lower().strip()
     if billing_cycle not in {"monthly", "yearly"}:
         raise HTTPException(status_code=400, detail="Invalid billing_cycle. Must be: monthly or yearly")
 
-    # Ensure user has Stripe customer ID
     ensure_stripe_customer_for_user(current_user, db)
     customer_id = getattr(current_user, "stripe_customer_id", None)
     if not customer_id:
         raise HTTPException(status_code=400, detail="User missing Stripe customer ID. Please contact support.")
 
-    # Get the lookup key for this plan/cycle combination
     lookup_key = _lookup_key(plan, billing_cycle)
     if not lookup_key:
-        logger.error(f"Missing Stripe lookup key for {plan} ({billing_cycle})")
+        logger.error("Missing Stripe lookup key for %s (%s)", plan, billing_cycle)
         raise HTTPException(
             status_code=500,
             detail=f"Missing Stripe configuration for {plan} ({billing_cycle}). "
@@ -686,23 +663,20 @@ def create_checkout_session(
         )
 
     try:
-        # Get Price ID from Stripe using lookup key
         prices = stripe.Price.list(lookup_keys=[lookup_key], limit=1)
         if not prices.data:
-            logger.error(f"No Stripe Price found for lookup_key={lookup_key}")
+            logger.error("No Stripe Price found for lookup_key=%s", lookup_key)
             raise HTTPException(
-                status_code=500, 
+                status_code=500,
                 detail=f"No Stripe Price found for lookup_key={lookup_key}. Please check Stripe Dashboard."
             )
-        
-        price_id = prices.data[0].id
-        logger.info(f"✅ Found Stripe Price: {price_id} for {plan} ({billing_cycle})")
 
-        # Build redirect URLs
+        price_id = prices.data[0].id
+        logger.info("✅ Found Stripe Price: %s for %s (%s)", price_id, plan, billing_cycle)
+
         success_url = f"{FRONTEND_URL}/dashboard?checkout=success"
         cancel_url = f"{FRONTEND_URL}/pricing?checkout=cancel"
 
-        # Create Stripe Checkout Session
         session = stripe.checkout.Session.create(
             mode="subscription",
             customer=customer_id,
@@ -717,63 +691,57 @@ def create_checkout_session(
                 "billing_cycle": billing_cycle,
             },
         )
-        
-        logger.info(f"✅ Stripe Checkout Session created: {session.id} for user {current_user.id}")
+
+        logger.info("✅ Stripe Checkout Session created: %s for user %s", session.id, current_user.id)
         return {"url": session.url, "id": session.id}
-        
+
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception(f"❌ Checkout session create failed for user {current_user.id}")
+        logger.exception("❌ Checkout session create failed for user %s", current_user.id)
         raise HTTPException(status_code=500, detail=f"Stripe error: {str(e)}")
-
 
 # ----------------------------------------------------------------------------
 # Subscription status (sync with Stripe)
 # ----------------------------------------------------------------------------
 @app.get("/subscription_status")
 def subscription_status(request: Request, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Get user's subscription status with optional Stripe sync"""
-    # Apply local overdue downgrade check
     try:
         _apply_local_overdue_downgrade_if_possible(current_user, db)
     except Exception as e:
         logger.warning("Local downgrade check failed: %s", e)
 
-    # Sync with Stripe if requested
     if request.query_params.get("sync") == "1":
         try:
             sync_user_subscription_from_stripe(current_user, db)
         except Exception as e:
             logger.warning("Stripe sync failed: %s", e)
 
-    # Get current tier and usage
     tier = (getattr(current_user, "subscription_tier", "free") or "free").lower()
     tier_limits = get_tier_limits(tier)
-    
+
     usage = {
         "screenshots": getattr(current_user, "usage_screenshots", 0) or 0,
         "batch_requests": getattr(current_user, "usage_batch_requests", 0) or 0,
         "api_calls": getattr(current_user, "usage_api_calls", 0) or 0,
     }
-    
-    # Get next reset date if available
+
     next_reset = getattr(current_user, "usage_reset_at", None)
-    
+
     response = {
         "tier": tier,
         "usage": usage,
         "limits": tier_limits,
         "account": canonical_account(current_user),
     }
-    
+
     if next_reset:
         response["next_reset"] = next_reset.isoformat() if isinstance(next_reset, datetime) else next_reset
-    
+
     return response
 
 # ----------------------------------------------------------------------------
-# Optional SPA mount (keep if you use it)
+# Optional SPA mount
 # ----------------------------------------------------------------------------
 FRONTEND_BUILD = Path(__file__).resolve().parents[1] / "frontend" / "build"
 if FRONTEND_BUILD.exists():
@@ -789,17 +757,8 @@ if FRONTEND_BUILD.exists():
         raise HTTPException(status_code=404, detail="Frontend not built")
 
 # ----------------------------------------------------------------------------
-# Entry point
+# Entry point (local dev only)
 # ----------------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
-    print("=" * 80)
-    print("🚀 Starting PixelPerfect Screenshot API")
-    print(f"📡 Backend: http://0.0.0.0:8000")
-    print(f"🌐 Frontend: {FRONTEND_URL}")
-    print(f"💳 Stripe: {'✅ Configured' if stripe else '❌ Not configured'}")
-    print(f"🔑 API Keys: ✅ Enabled")
-    print(f"📸 Screenshot Service: ✅ Ready")
-    print("=" * 80)
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
-

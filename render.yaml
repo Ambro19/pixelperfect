@@ -1,135 +1,93 @@
-# ============================================================================
-# render.yaml - PixelPerfect Screenshot API Production Deployment
-# ============================================================================
-# Updated: January 2026 - Includes Playwright + email-validator fix
-# ============================================================================
-
 services:
   - type: web
     name: pixelperfect-api
     env: python
-    plan: starter  # Upgrade from free for better performance
-    region: oregon  # Change to your preferred region
+    plan: starter
+    region: oregon
 
-    # ========================================================================
-    # BUILD COMMAND - CRITICAL: Install Playwright browsers
-    # ========================================================================
     buildCommand: |
+      set -e
+
       echo "📦 Installing system dependencies..."
       apt-get update -qq
       apt-get install -y --no-install-recommends ffmpeg
-      
-      echo "📦 Installing Python dependencies..."
-      pip install --upgrade pip
+      rm -rf /var/lib/apt/lists/*
+
+      echo "🐍 Installing Python dependencies..."
+      python -m pip install --upgrade pip
       pip install --no-cache-dir -r requirements.txt
-      
-      echo "🎭 Installing Playwright browsers..."
-      playwright install chromium
-      playwright install-deps
-      
+
+      echo "🎭 Installing Playwright Chromium (with OS deps)..."
+      python -m playwright install --with-deps chromium
+
       echo "✅ Build complete!"
 
-    # ========================================================================
-    # START COMMAND
-    # ========================================================================
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 2
-
-    # ========================================================================
-    # HEALTH CHECK
-    # ========================================================================
     healthCheckPath: /health
 
-    # ========================================================================
-    # ENVIRONMENT VARIABLES
-    # ========================================================================
     envVars:
-      # Application
       - key: ENVIRONMENT
         value: production
-
       - key: DEBUG
-        value: false
-
+        value: "false"
       - key: HOST
         value: 0.0.0.0
 
-      - key: PORT
-        value: 10000
+      # IMPORTANT: do NOT set PORT manually; Render injects it automatically.
 
-      # URLs
       - key: FRONTEND_URL
         value: https://pixelperfectapi.net
-
       - key: BACKEND_URL
         value: https://api.pixelperfectapi.net
-
       - key: CORS_ORIGINS
         value: https://pixelperfectapi.net,https://www.pixelperfectapi.net
 
-      # Security (SECRETS - Set in Render Dashboard)
       - key: SECRET_KEY
         sync: false
-
-      # Database (SECRETS - Set in Render Dashboard)
       - key: DATABASE_URL
         sync: false
 
-      # Stripe (SECRETS - Set in Render Dashboard)
       - key: STRIPE_SECRET_KEY
         sync: false
-      
       - key: STRIPE_PUBLISHABLE_KEY
         sync: false
-      
       - key: STRIPE_WEBHOOK_SECRET
         sync: false
-      
+
       - key: STRIPE_PRO_LOOKUP_KEY
         value: pixelperfect_pro_monthly
-      
       - key: STRIPE_BUSINESS_LOOKUP_KEY
         value: pixelperfect_business_monthly
 
-      # Cloudflare R2 (SECRETS - Set in Render Dashboard)
       - key: R2_ENDPOINT_URL
-        value: https://[account-id].r2.cloudflarestorage.com  # Update with your account ID
-      
+        value: https://[account-id].r2.cloudflarestorage.com
       - key: R2_ACCESS_KEY_ID
         sync: false
-      
       - key: R2_SECRET_ACCESS_KEY
         sync: false
-      
       - key: R2_BUCKET_NAME
         value: pixelperfect-screenshots
-      
       - key: R2_PUBLIC_URL
-        value: https://screenshots.pixelperfectapi.net  # Your R2 public domain
+        value: https://screenshots.pixelperfectapi.net
 
-      # File Retention
       - key: FILE_RETENTION_DAYS
-        value: 7
+        value: "7"
 
-      # Contact Form
       - key: CONTACT_RECIPIENT
         value: onetechly@gmail.com
-      
       - key: CONTACT_FROM
         value: no-reply@onetechly.com
 
-      # Rate Limiting
       - key: RATE_LIMIT_ENABLED
-        value: true
-      
+        value: "true"
       - key: RATE_LIMIT_FREE_TIER
-        value: 120
+        value: "120"
 
-      # Batch Processing
       - key: BATCH_WEBHOOK_URL
-        value: ""  # Optional: Webhook for batch completion
-      
+        value: ""
       - key: BATCH_WEBHOOK_SECRET
-        value: ""  # Optional: Webhook signature secret
+        value: ""
+
 
 # ============================================================================
 # DEPLOYMENT CHECKLIST
