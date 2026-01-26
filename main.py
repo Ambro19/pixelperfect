@@ -3,10 +3,12 @@
 # PIXELPERFECT SCREENSHOT API - BACKEND
 # ========================================
 # Author: OneTechly
-# Updated: January 2026 - ADDED API KEY ENDPOINT
+# Updated: January 2026 - PRODUCTION READY
 #
-# ✅ NEW: /api/keys/current endpoint for retrieving API keys
-# ✅ FIXED: Billing endpoint matches frontend
+# ✅ Screenshot API endpoints integrated
+# ✅ Batch processing support
+# ✅ API key management
+# ✅ Stripe billing integration
 # ========================================
 
 from pathlib import Path
@@ -44,7 +46,7 @@ from models import (
     User,
     Screenshot,
     Subscription,
-    ApiKey,  # ✅ NEW: Import ApiKey model
+    ApiKey,
     get_db,
     initialize_database,
     engine,
@@ -55,12 +57,22 @@ from db_migrations import run_startup_migrations
 from auth_deps import get_current_user
 from webhook_handler import handle_stripe_webhook
 
-# ✅ NEW: Import API key system functions
 from api_key_system import (
     create_api_key_for_user,
     run_api_key_migration,
     validate_api_key,
 )
+
+# Screenshot service imports
+from screenshot_service import screenshot_service
+from screenshot_endpoints import (
+    capture_screenshot_endpoint,
+    batch_screenshot_endpoint,
+    regenerate_api_key_endpoint,
+    ScreenshotRequest,
+    BatchScreenshotRequest,
+)
+
 
 # ----------------------------------------------------------------------------
 # CONFIG
@@ -277,19 +289,29 @@ class BillingCheckoutIn(BaseModel):
     billing_cycle: str = "monthly"  # monthly | yearly
 
 # ----------------------------------------------------------------------------
-# Startup
+# Startup & Shutdown
 # ----------------------------------------------------------------------------
 @app.on_event("startup")
 async def on_startup():
+    """Initialize database, migrations, and screenshot service"""
     initialize_database()
     run_startup_migrations(engine)
-    run_api_key_migration(engine)  # ✅ NEW: Create api_keys table
+    run_api_key_migration(engine)
+    await screenshot_service.initialize()
 
     logger.info("============================================================")
     logger.info("PixelPerfect starting - ENV=%s DB=%s", ENVIRONMENT, DATABASE_URL)
     logger.info("Stripe configured: %s", bool(stripe and os.getenv("STRIPE_SECRET_KEY")))
     logger.info("✅ API key system initialized")
+    logger.info("✅ Screenshot service initialized")
     logger.info("============================================================")
+
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    """Gracefully shutdown screenshot service"""
+    await screenshot_service.close()
+    logger.info("✅ Screenshot service closed gracefully")
 
 # ----------------------------------------------------------------------------
 # Core routes
@@ -339,7 +361,7 @@ def register(user: UserCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(obj)
 
-    # ✅ NEW: Create API key for new user
+    # Create API key for new user
     api_key = None
     try:
         api_key, _ = create_api_key_for_user(db, obj.id, "Default API Key")
@@ -428,7 +450,7 @@ def reset_password(payload: ResetPasswordIn, db: Session = Depends(get_db)):
     return {"ok": True}
 
 # ----------------------------------------------------------------------------
-# ✅ NEW: API KEY ENDPOINT
+# API Key Management
 # ----------------------------------------------------------------------------
 @app.get("/api/keys/current")
 async def get_current_api_key(
@@ -482,6 +504,63 @@ async def get_current_api_key(
         "name": api_key_record.name,
         "message": "API key already exists. For security, the full key cannot be displayed."
     }
+
+
+@app.post("/api/keys/regenerate")
+async def regenerate_api_key(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    🔄 Regenerate API key
+    
+    Deactivates old key and generates a new one.
+    The old key will stop working immediately.
+    """
+    return await regenerate_api_key_endpoint(current_user, db)
+
+# ----------------------------------------------------------------------------
+# Screenshot API Endpoints
+# ----------------------------------------------------------------------------
+@app.post("/api/v1/screenshot")
+async def capture_screenshot(
+    request: ScreenshotRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    📸 Capture a screenshot of a website
+    
+    **Features:**
+    - Multiple formats (PNG, JPEG, WebP, PDF)
+    - Custom viewport sizes
+    - Full-page capture
+    - Dark mode emulation
+    
+    **Rate Limits:**
+    - Free: 100/month
+    - Pro: 1000/month
+    - Business: 5000/month
+    - Premium: Unlimited
+    """
+    return await capture_screenshot_endpoint(request, current_user, db)
+
+
+@app.post("/api/v1/batch/submit")
+async def batch_screenshot(
+    request: BatchScreenshotRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    📦 Capture multiple screenshots in one request
+    
+    **Pro+ Feature Only**
+    
+    Capture up to 50 screenshots in a single batch job.
+    Results are processed asynchronously.
+    """
+    return await batch_screenshot_endpoint(request, current_user, db)
 
 # ----------------------------------------------------------------------------
 # Stripe webhook
@@ -670,7 +749,6 @@ def subscription_status(request: Request, current_user: User = Depends(get_curre
     
     return response
 
-
 # ----------------------------------------------------------------------------
 # Optional SPA mount (keep if you use it)
 # ----------------------------------------------------------------------------
@@ -698,21 +776,20 @@ if __name__ == "__main__":
     print(f"🌐 Frontend: {FRONTEND_URL}")
     print(f"💳 Stripe: {'✅ Configured' if stripe else '❌ Not configured'}")
     print(f"🔑 API Keys: ✅ Enabled")
+    print(f"📸 Screenshot Service: ✅ Ready")
     print("=" * 80)
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
 
-#-------------------- End of main.py-------------------------------
-
-# #============================================
+#c # =======================================================
 # # backend/main.py
 # # ========================================
 # # PIXELPERFECT SCREENSHOT API - BACKEND
 # # ========================================
 # # Author: OneTechly
-# # Updated: January 2026 - FIXED BILLING ENDPOINT
+# # Updated: January 2026 - ADDED API KEY ENDPOINT
 # #
-# # Key Fix: Changed /billing/checkout-session → /billing/create_checkout_session
-# # This matches the frontend call in Pricing.js
+# # ✅ NEW: /api/keys/current endpoint for retrieving API keys
+# # ✅ FIXED: Billing endpoint matches frontend
 # # ========================================
 
 # from pathlib import Path
@@ -750,6 +827,7 @@ if __name__ == "__main__":
 #     User,
 #     Screenshot,
 #     Subscription,
+#     ApiKey,  # ✅ NEW: Import ApiKey model
 #     get_db,
 #     initialize_database,
 #     engine,
@@ -759,7 +837,21 @@ if __name__ == "__main__":
 # from db_migrations import run_startup_migrations
 # from auth_deps import get_current_user
 # from webhook_handler import handle_stripe_webhook
-# from api_key_system import create_api_key_for_user, run_api_key_migration
+
+# # ✅ NEW: Import API key system functions
+# from api_key_system import (
+#     create_api_key_for_user,
+#     run_api_key_migration,
+#     validate_api_key,
+# )
+
+# from screenshot_service import screenshot_service
+# from screenshot_endpoints import (
+#     capture_screenshot_endpoint,
+#     ScreenshotRequest,
+#     BatchScreenshotRequest,
+# )
+
 
 # # ----------------------------------------------------------------------------
 # # CONFIG
@@ -982,11 +1074,13 @@ if __name__ == "__main__":
 # async def on_startup():
 #     initialize_database()
 #     run_startup_migrations(engine)
-#     run_api_key_migration(engine)
+#     run_api_key_migration(engine)  # ✅ NEW: Create api_keys table
+#     await screenshot_service.initialize()  # ✅ ADD
 
 #     logger.info("============================================================")
 #     logger.info("PixelPerfect starting - ENV=%s DB=%s", ENVIRONMENT, DATABASE_URL)
 #     logger.info("Stripe configured: %s", bool(stripe and os.getenv("STRIPE_SECRET_KEY")))
+#     logger.info("✅ API key system initialized")
 #     logger.info("============================================================")
 
 # # ----------------------------------------------------------------------------
@@ -1037,9 +1131,11 @@ if __name__ == "__main__":
 #     db.commit()
 #     db.refresh(obj)
 
+#     # ✅ NEW: Create API key for new user
 #     api_key = None
 #     try:
 #         api_key, _ = create_api_key_for_user(db, obj.id, "Default API Key")
+#         logger.info(f"✅ Created API key for new user {obj.id}")
 #     except Exception as e:
 #         logger.warning("API key creation skipped: %s", e)
 
@@ -1124,6 +1220,62 @@ if __name__ == "__main__":
 #     return {"ok": True}
 
 # # ----------------------------------------------------------------------------
+# # ✅ NEW: API KEY ENDPOINT
+# # ----------------------------------------------------------------------------
+# @app.get("/api/keys/current")
+# async def get_current_api_key(
+#     db: Session = Depends(get_db),
+#     current_user: User = Depends(get_current_user)
+# ):
+#     """
+#     Get or create API key for current user
+    
+#     Returns:
+#         - api_key: The API key (only shown on first creation)
+#         - key_prefix: Display version (e.g., "pk_abc12345...")
+#         - created_at: When the key was created
+#         - last_used_at: When the key was last used
+    
+#     Note: If user has no API key, one is automatically created
+#     """
+#     # Get existing active API key
+#     api_key_record = db.query(ApiKey).filter(
+#         ApiKey.user_id == current_user.id,
+#         ApiKey.is_active == True
+#     ).first()
+    
+#     # If no API key exists, create one
+#     if not api_key_record:
+#         try:
+#             api_key, api_key_record = create_api_key_for_user(
+#                 db=db,
+#                 user_id=current_user.id,
+#                 name="Default API Key"
+#             )
+#             logger.info(f"✅ Created API key for user {current_user.id}")
+            
+#             # Return the plain text key (ONLY on first creation)
+#             return {
+#                 "api_key": api_key,
+#                 "key_prefix": api_key_record.key_prefix,
+#                 "created_at": api_key_record.created_at.isoformat() if api_key_record.created_at else None,
+#                 "last_used_at": api_key_record.last_used_at.isoformat() if api_key_record.last_used_at else None,
+#                 "message": "⚠️ Save this key securely. It won't be shown again!"
+#             }
+#         except Exception as e:
+#             logger.error(f"❌ API key creation failed for user {current_user.id}: {e}")
+#             raise HTTPException(status_code=500, detail="Failed to create API key")
+    
+#     # Return existing key info (without plain text key)
+#     return {
+#         "key_prefix": api_key_record.key_prefix,
+#         "created_at": api_key_record.created_at.isoformat() if api_key_record.created_at else None,
+#         "last_used_at": api_key_record.last_used_at.isoformat() if api_key_record.last_used_at else None,
+#         "name": api_key_record.name,
+#         "message": "API key already exists. For security, the full key cannot be displayed."
+#     }
+
+# # ----------------------------------------------------------------------------
 # # Stripe webhook
 # # ----------------------------------------------------------------------------
 # _IDEMP_STORE: Dict[str, float] = {}
@@ -1169,22 +1321,14 @@ if __name__ == "__main__":
 #     return await handle_stripe_webhook(request)
 
 # # ----------------------------------------------------------------------------
-# # ✅ CRITICAL FIX: Billing endpoint renamed to match frontend
-# # Changed from /billing/checkout-session to /billing/create_checkout_session
-# # This is what Pricing.js is calling!
+# # Billing endpoint (matches frontend)
 # # ----------------------------------------------------------------------------
 # def _lookup_key(plan: str, billing_cycle: str) -> Optional[str]:
-#     """
-#     Lookup Stripe price based on plan and billing cycle.
-#     Uses environment variables for flexibility:
-#     - STRIPE_PRO_LOOKUP_KEY_MONTHLY / STRIPE_PRO_LOOKUP_KEY_YEARLY
-#     - STRIPE_BUSINESS_LOOKUP_KEY_MONTHLY / STRIPE_BUSINESS_LOOKUP_KEY_YEARLY
-#     - STRIPE_PREMIUM_LOOKUP_KEY_MONTHLY / STRIPE_PREMIUM_LOOKUP_KEY_YEARLY
-#     """
+#     """Lookup Stripe price based on plan and billing cycle"""
 #     plan = (plan or "").lower().strip()
 #     billing_cycle = (billing_cycle or "monthly").lower().strip()
 
-#     # Try to get yearly-specific key first
+#     # Try yearly-specific key first
 #     if billing_cycle == "yearly":
 #         k = os.getenv(f"STRIPE_{plan.upper()}_LOOKUP_KEY_YEARLY")
 #         if k:
@@ -1195,26 +1339,13 @@ if __name__ == "__main__":
 #     return k.strip() if k else None
 
 
-# @app.post("/billing/create_checkout_session")  # ✅ FIXED: Was /billing/checkout-session
+# @app.post("/billing/create_checkout_session")
 # def create_checkout_session(
 #     payload: BillingCheckoutIn,
 #     current_user: User = Depends(get_current_user),
 #     db: Session = Depends(get_db),
 # ):
-#     """
-#     ✅ FIXED ENDPOINT: Create Stripe Checkout Session
-    
-#     This endpoint was renamed from /billing/checkout-session to /billing/create_checkout_session
-#     to match what the frontend Pricing.js component is calling.
-    
-#     Request Body:
-#     - plan: "pro" | "business" | "premium"
-#     - billing_cycle: "monthly" | "yearly"
-    
-#     Returns:
-#     - url: Stripe Checkout redirect URL
-#     - id: Checkout Session ID
-#     """
+#     """Create Stripe Checkout Session"""
 #     if not stripe or not os.getenv("STRIPE_SECRET_KEY"):
 #         raise HTTPException(status_code=503, detail="Stripe is not configured")
 
@@ -1292,13 +1423,7 @@ if __name__ == "__main__":
 # # ----------------------------------------------------------------------------
 # @app.get("/subscription_status")
 # def subscription_status(request: Request, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-#     """
-#     Get user's subscription status with optional Stripe sync.
-    
-#     Query params:
-#     - sync=1: Force sync with Stripe (slower but accurate)
-#     - sync=0: Use cached data (faster)
-#     """
+#     """Get user's subscription status with optional Stripe sync"""
 #     # Apply local overdue downgrade check
 #     try:
 #         _apply_local_overdue_downgrade_if_possible(current_user, db)
@@ -1337,7 +1462,6 @@ if __name__ == "__main__":
     
 #     return response
 
-
 # # ----------------------------------------------------------------------------
 # # Optional SPA mount (keep if you use it)
 # # ----------------------------------------------------------------------------
@@ -1364,6 +1488,7 @@ if __name__ == "__main__":
 #     print(f"📡 Backend: http://0.0.0.0:8000")
 #     print(f"🌐 Frontend: {FRONTEND_URL}")
 #     print(f"💳 Stripe: {'✅ Configured' if stripe else '❌ Not configured'}")
+#     print(f"🔑 API Keys: ✅ Enabled")
 #     print("=" * 80)
 #     uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
 
