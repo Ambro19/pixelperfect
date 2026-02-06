@@ -3,6 +3,7 @@
 # ============================================================================
 # Updated: February 2026
 # Includes Pillow for WebP support
+# Python 3.13 compatible
 # ============================================================================
 
 # Core Framework
@@ -16,6 +17,7 @@ alembic==1.14.0
 psycopg2-binary==2.9.10
 
 # Authentication & Security
+PyJWT==2.9.0
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
 bcrypt==4.2.1
@@ -31,7 +33,7 @@ aiosmtplib==3.0.2
 # Screenshot Service
 playwright==1.49.1
 
-# Image Processing (NEW - Required for WebP support)
+# Image Processing (Required for WebP support)
 Pillow>=10.0.0
 
 # Utilities
@@ -50,14 +52,17 @@ httpx==0.28.1
 # ============================================================================
 # Installation Instructions
 # ============================================================================
-# 
+#
 # Standard Installation:
 #   pip install -r requirements.txt
 #
 # Playwright Browsers (REQUIRED):
-#   python -m playwright install --with-deps chromium
+#   python -m playwright install chromium
 #
-# Note: The --with-deps flag is CRITICAL on Linux/Ubuntu to install
-# system dependencies like browser libraries.
+# Note: On Render.com, use this build command:
+#   pip install -r requirements.txt && python -m playwright install chromium
+#
+# The --with-deps flag causes authentication failures on Render, so it's
+# been removed. Render's Ubuntu image already includes necessary system deps.
 #
 # ============================================================================
