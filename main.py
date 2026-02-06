@@ -492,43 +492,6 @@ def token_login_json(req: LoginJSON, db: Session = Depends(get_db)):
     token = create_access_token({"sub": user.username}, timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
     return {"access_token": token, "token_type": "bearer", "user": canonical_account(user)}
 
-#========================= REPLACED ===========================
-
-# @app.post("/token")
-# def token_login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
-#     username_input = (form.username or "").strip()
-#     password_input = form.password or ""
-
-#     user = db.query(User).filter(User.username == username_input).first()
-#     if not user or not verify_password(password_input, user.hashed_password):
-#         raise HTTPException(status_code=401, detail="Incorrect username or password")
-
-#     try:
-#         ensure_stripe_customer_for_user(user, db)
-#     except Exception:
-#         pass
-
-#     token = create_access_token({"sub": user.username}, timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
-#     return {"access_token": token, "token_type": "bearer", "user": canonical_account(user)}
-
-# @app.post("/token_json")
-# def token_login_json(req: LoginJSON, db: Session = Depends(get_db)):
-#     username_input = (req.username or "").strip()
-#     password_input = req.password or ""
-
-#     user = db.query(User).filter(User.username == username_input).first()
-#     if not user or not verify_password(password_input, user.hashed_password):
-#         raise HTTPException(status_code=401, detail="Incorrect username or password")
-
-#     try:
-#         ensure_stripe_customer_for_user(user, db)
-#     except Exception:
-#         pass
-
-#     token = create_access_token({"sub": user.username}, timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
-#     return {"access_token": token, "token_type": "bearer", "user": canonical_account(user)}
-#========================= REPLACED ===========================
-
 @app.get("/users/me", response_model=UserResponse)
 def read_users_me(current_user: User = Depends(get_current_user)):
     return current_user

@@ -1,58 +1,63 @@
 # ============================================================================
-# PIXELPERFECT SCREENSHOT API - DEPENDENCIES
+# PixelPerfect Screenshot API - Python Dependencies
 # ============================================================================
-# Updated: January 2026 - Python 3.13 compatible
+# Updated: February 2026
+# Includes Pillow for WebP support
 # ============================================================================
 
 # Core Framework
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
-pydantic==2.10.6
-pydantic-settings==2.7.1
+python-multipart==0.0.20
 
 # Database
 sqlalchemy==2.0.36
-psycopg2-binary==2.9.10
 alembic==1.14.0
+psycopg2-binary==2.9.10
 
-# Auth & Security
-PyJWT==2.8.0
+# Authentication & Security
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
 bcrypt==4.2.1
-python-multipart==0.0.20
 itsdangerous==2.2.0
+pydantic[email]==2.10.5
 
-# HTTP & CORS
-python-dotenv==1.0.1
-httpx==0.28.1
-requests==2.32.3
-
-# Payments
+# Stripe Integration
 stripe==11.3.0
 
-# JSON & Serialization
-orjson==3.10.12
-
-# AWS/S3/R2 Storage
-boto3==1.35.95
-
 # Email
-email-validator==2.2.0
+aiosmtplib==3.0.2
 
-# Web Scraping & Screenshots
+# Screenshot Service
 playwright==1.49.1
-Pillow==11.0.0
 
-# Playwright in Linux containers
-certifi==2024.12.14
+# Image Processing (NEW - Required for WebP support)
+Pillow>=10.0.0
+
+# Utilities
+python-dotenv==1.0.1
+orjson==3.10.14
+requests==2.32.3
+
+# AWS/S3 (Optional for Premium features)
+boto3==1.35.92
+
+# Development
+pytest==8.3.4
+pytest-asyncio==0.24.0
+httpx==0.28.1
 
 # ============================================================================
-# PRODUCTION DEPENDENCIES
+# Installation Instructions
 # ============================================================================
-
-# ASGI Server (production)
-gunicorn==23.0.0
-
-# Monitoring & Logging
-sentry-sdk[fastapi]==2.20.0
+# 
+# Standard Installation:
+#   pip install -r requirements.txt
+#
+# Playwright Browsers (REQUIRED):
+#   python -m playwright install --with-deps chromium
+#
+# Note: The --with-deps flag is CRITICAL on Linux/Ubuntu to install
+# system dependencies like browser libraries.
+#
+# ============================================================================
