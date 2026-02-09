@@ -818,11 +818,14 @@ if FRONTEND_BUILD.exists():
 
     @app.get("/{full_path:path}", include_in_schema=False)
     def spa_catch_all(full_path: str):
-        if full_path.startsWith(("api/", "health", "token", "register", "webhook/", "screenshots/")):
+        # ✅ FIXED: Changed startsWith → startswith
+        if full_path.startswith(("api/", "health", "token", "register", "webhook/", "screenshots/")):
             raise HTTPException(status_code=404, detail="Not found")
+        
         index_file = FRONTEND_BUILD / "index.html"
         if index_file.exists():
             return HTMLResponse(index_file.read_text(encoding="utf-8"))
+        
         raise HTTPException(status_code=404, detail="Frontend not built")
 
 # ----------------------------------------------------------------------------
@@ -831,4 +834,32 @@ if FRONTEND_BUILD.exists():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
+
+# ----------------------------------------------------------------------------
+# END of main.py module
+# ----------------------------------------------------------------------------
+
+
+# # ----------------------------------------------------------------------------
+# # Optional SPA mount
+# # ----------------------------------------------------------------------------
+# FRONTEND_BUILD = Path(__file__).resolve().parents[1] / "frontend" / "build"
+# if FRONTEND_BUILD.exists():
+#     app.mount("/_spa", StaticFiles(directory=str(FRONTEND_BUILD), html=True), name="spa")
+
+#     @app.get("/{full_path:path}", include_in_schema=False)
+#     def spa_catch_all(full_path: str):
+#         if full_path.startsWith(("api/", "health", "token", "register", "webhook/", "screenshots/")):
+#             raise HTTPException(status_code=404, detail="Not found")
+#         index_file = FRONTEND_BUILD / "index.html"
+#         if index_file.exists():
+#             return HTMLResponse(index_file.read_text(encoding="utf-8"))
+#         raise HTTPException(status_code=404, detail="Frontend not built")
+
+# # ----------------------------------------------------------------------------
+# # Entry point (local dev only)
+# # ----------------------------------------------------------------------------
+# if __name__ == "__main__":
+#     import uvicorn
+#     uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
 
