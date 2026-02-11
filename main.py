@@ -8,7 +8,9 @@
 # ✅ FIXES APPLIED:
 # - WebP Content-Type header fix (custom StaticFiles)
 # - CORS credentials for Firefox
-# - Better login error handling
+# - Better login error messages
+# - ✅ FIX: Added `servers` to FastAPI → Swagger UI loads in production
+# - ✅ FIX: CSP/X-Frame-Options skipped for /docs paths → Swagger UI renders
 # ========================================
 
 # =====================================================================
@@ -170,13 +172,32 @@ except Exception as e:
     stripe = None
 
 # ----------------------------------------------------------------------------
-# FastAPI app
+# ✅ FIX #1: FastAPI app — added `servers` list
+# ----------------------------------------------------------------------------
+# WHY THIS FIXES THE BLANK /docs PAGE:
+#
+# Without `servers`, FastAPI generates an openapi.json with no explicit
+# server URL. Swagger UI then uses the browser's current origin as the
+# base URL for all API requests. On Render.com the internal address is
+# "pixelperfect-api-mi7t:10000" — a hostname that only exists inside
+# Render's private network. Your browser can't reach it, so Swagger UI
+# fetches openapi.json, gets a network error silently, and renders nothing.
+#
+# With `servers`, Swagger UI always uses the correct public HTTPS URL.
+# BACKEND_URL must be set in your Render environment variables:
+#   BACKEND_URL=https://pixelperfect-api-mi7t.onrender.com
 # ----------------------------------------------------------------------------
 app = FastAPI(
     title="PixelPerfect Screenshot API",
     version="1.0.0",
     description="Professional Website Screenshot API with Playwright",
     default_response_class=ORJSONResponse,
+    servers=[
+        {"url": BACKEND_URL, "description": "Current environment"},
+        {"url": "https://pixelperfect-api-mi7t.onrender.com", "description": "Production (Render)"},
+        {"url": "https://api.pixelperfectapi.net", "description": "Production (Custom Domain)"},
+        {"url": "http://localhost:8000", "description": "Local development"},
+    ],
 )
 
 # ----------------------------------------------------------------------------
@@ -202,8 +223,23 @@ def _set_screenshot_ready(val: bool, err: Optional[str] = None):
         SCREENSHOT_LAST_ERROR_AT = None
 
 # ----------------------------------------------------------------------------
-# Security headers middleware
+# ✅ FIX #2: Security headers middleware — skip CSP for /docs and /redoc
 # ----------------------------------------------------------------------------
+# WHY THIS ALSO FIXES THE BLANK /docs PAGE:
+#
+# Your PROD_CSP contains `script-src 'self'` which blocks the inline
+# scripts and eval() calls that Swagger UI's JavaScript uses internally.
+# The browser executes those scripts silently without console errors
+# (because CSP violations don't always show up obviously), so the page
+# HTML loads (you can see the title "PixelPerfect Screenshot API - Swagger UI"
+# in the tab) but no content ever renders.
+#
+# The fix: skip sending X-Frame-Options and Content-Security-Policy headers
+# for /docs, /redoc, and /openapi.json paths only. All other routes keep
+# the full strict PROD_CSP. This is the safest possible approach.
+# ----------------------------------------------------------------------------
+_DOCS_PATHS = {"/docs", "/redoc", "/openapi.json"}
+
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     def __init__(
         self,
@@ -226,16 +262,26 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next):
         response = await call_next(request)
+        path = request.url.path
+
+        # These headers apply to ALL routes
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
-        response.headers["X-Frame-Options"] = self.x_frame_options
         response.headers["Referrer-Policy"] = self.referrer_policy
         response.headers.setdefault("X-XSS-Protection", "0")
         if self.server_header is not None:
             response.headers["Server"] = self.server_header
         if self.hsts and request.url.scheme == "https":
-            response.headers["Strict-Transport-Security"] = f"max-age={self.hsts_max_age}; includeSubDomains"
-        if self.csp:
-            response.headers["Content-Security-Policy"] = self.csp
+            response.headers["Strict-Transport-Security"] = (
+                f"max-age={self.hsts_max_age}; includeSubDomains"
+            )
+
+        # ✅ FIX: Skip X-Frame-Options and CSP for Swagger/Redoc docs paths only
+        is_docs_path = path in _DOCS_PATHS or path.startswith("/docs")
+        if not is_docs_path:
+            response.headers["X-Frame-Options"] = self.x_frame_options
+            if self.csp:
+                response.headers["Content-Security-Policy"] = self.csp
+
         return response
 
 DEV_CSP = None
@@ -838,28 +884,3 @@ if __name__ == "__main__":
 # ----------------------------------------------------------------------------
 # END of main.py module
 # ----------------------------------------------------------------------------
-
-
-# # ----------------------------------------------------------------------------
-# # Optional SPA mount
-# # ----------------------------------------------------------------------------
-# FRONTEND_BUILD = Path(__file__).resolve().parents[1] / "frontend" / "build"
-# if FRONTEND_BUILD.exists():
-#     app.mount("/_spa", StaticFiles(directory=str(FRONTEND_BUILD), html=True), name="spa")
-
-#     @app.get("/{full_path:path}", include_in_schema=False)
-#     def spa_catch_all(full_path: str):
-#         if full_path.startsWith(("api/", "health", "token", "register", "webhook/", "screenshots/")):
-#             raise HTTPException(status_code=404, detail="Not found")
-#         index_file = FRONTEND_BUILD / "index.html"
-#         if index_file.exists():
-#             return HTMLResponse(index_file.read_text(encoding="utf-8"))
-#         raise HTTPException(status_code=404, detail="Frontend not built")
-
-# # ----------------------------------------------------------------------------
-# # Entry point (local dev only)
-# # ----------------------------------------------------------------------------
-# if __name__ == "__main__":
-#     import uvicorn
-#     uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
-
