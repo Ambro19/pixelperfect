@@ -1,28 +1,9 @@
 services:
   - type: web
     name: pixelperfect-api
-    env: python
+    env: docker
     plan: starter
     region: oregon
-
-    buildCommand: |
-      set -e
-
-      echo "📦 Installing system dependencies..."
-      apt-get update -qq
-      apt-get install -y --no-install-recommends ffmpeg
-      rm -rf /var/lib/apt/lists/*
-
-      echo "🐍 Installing Python dependencies..."
-      python -m pip install --upgrade pip
-      pip install --no-cache-dir -r requirements.txt
-
-      echo "🎭 Installing Playwright Chromium (with OS deps)..."
-      python -m playwright install --with-deps chromium
-
-      echo "✅ Build complete!"
-
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 2
     healthCheckPath: /health
 
     envVars:
@@ -30,10 +11,6 @@ services:
         value: production
       - key: DEBUG
         value: "false"
-      - key: HOST
-        value: 0.0.0.0
-
-      # IMPORTANT: do NOT set PORT manually; Render injects it automatically.
 
       - key: FRONTEND_URL
         value: https://pixelperfectapi.net
@@ -53,40 +30,6 @@ services:
         sync: false
       - key: STRIPE_WEBHOOK_SECRET
         sync: false
-
-      - key: STRIPE_PRO_LOOKUP_KEY
-        value: pixelperfect_pro_monthly
-      - key: STRIPE_BUSINESS_LOOKUP_KEY
-        value: pixelperfect_business_monthly
-
-      - key: R2_ENDPOINT_URL
-        value: https://[account-id].r2.cloudflarestorage.com
-      - key: R2_ACCESS_KEY_ID
-        sync: false
-      - key: R2_SECRET_ACCESS_KEY
-        sync: false
-      - key: R2_BUCKET_NAME
-        value: pixelperfect-screenshots
-      - key: R2_PUBLIC_URL
-        value: https://screenshots.pixelperfectapi.net
-
-      - key: FILE_RETENTION_DAYS
-        value: "7"
-
-      - key: CONTACT_RECIPIENT
-        value: onetechly@gmail.com
-      - key: CONTACT_FROM
-        value: no-reply@onetechly.com
-
-      - key: RATE_LIMIT_ENABLED
-        value: "true"
-      - key: RATE_LIMIT_FREE_TIER
-        value: "120"
-
-      - key: BATCH_WEBHOOK_URL
-        value: ""
-      - key: BATCH_WEBHOOK_SECRET
-        value: ""
 
 
 # ============================================================================
