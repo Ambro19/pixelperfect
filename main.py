@@ -5,18 +5,10 @@
 # Author: OneTechly
 # Updated: February 2026 - PRODUCTION READY
 #
-# ✅ FIXES APPLIED (existing):
-# - WebP Content-Type header fix (custom StaticFiles)
-# - CORS credentials for Firefox
-# - Better login error messages
-# - Added `servers` to FastAPI → Swagger UI uses correct public base URL
-# - Docs paths forcibly strip CSP/XFO/COOP/COEP (Swagger always renders)
-# - Starlette MutableHeaders safe header delete helper
-#
-# ✅ NEW (Option 2 Tier Concurrency):
-# - Per-user concurrency limiter using asyncio semaphores
-# - Starter=2, Pro=3, Business=5 (no env var duplicates needed)
-# - Implemented as a yield dependency on screenshot routes
+# Key production fixes in this drop-in:
+# ✅ Swagger servers list uses correct public URLs (no stale Render internal hostnames)
+# ✅ CORS origins normalized for custom domain deployment
+# ✅ Keeps your docs-safe security headers, WebP static, tier concurrency, and Playwright readiness
 # ========================================
 
 # =====================================================================
@@ -37,7 +29,7 @@ import threading
 import asyncio
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, AsyncGenerator
+from typing import Optional, Dict, Any, AsyncGenerator, List
 
 from dotenv import load_dotenv, find_dotenv
 load_dotenv()
@@ -62,7 +54,10 @@ from passlib.context import CryptContext
 # Local imports
 from email_utils import send_password_reset_email
 from auth_utils import get_password_hash, verify_password
-from subscription_sync import sync_user_subscription_from_stripe, _apply_local_overdue_downgrade_if_possible
+from subscription_sync import (
+    sync_user_subscription_from_stripe,
+    _apply_local_overdue_downgrade_if_possible,
+)
 
 from models import (
     User,
@@ -105,7 +100,6 @@ import mimetypes
 
 if ".webp" not in mimetypes.types_map:
     mimetypes.add_type("image/webp", ".webp")
-    logging.info("✅ Registered .webp MIME type: image/webp")
 
 class CustomStaticFiles(StaticFiles):
     async def get_response(self, path: str, scope):
@@ -150,8 +144,12 @@ logger.setLevel(logging.INFO)
 
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development").lower()
 IS_PROD = ENVIRONMENT == "production"
-FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000").rstrip("/")
-BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000").rstrip("/")
+
+FRONTEND_URL = (os.getenv("FRONTEND_URL", "http://localhost:3000") or "").rstrip("/")
+BACKEND_URL = (os.getenv("BACKEND_URL", "http://localhost:8000") or "").rstrip("/")
+
+# Your canonical production API domain (custom domain you just verified)
+PROD_API_DOMAIN = "https://api.pixelperfectapi.net"
 
 # =====================================================================
 # Stripe init (non-fatal)
@@ -169,27 +167,24 @@ except Exception as e:
 # =====================================================================
 # ✅ Option 2 - Tier concurrency (NO env var duplicates)
 # =====================================================================
-# You can tweak these numbers safely anytime.
 TIER_CONCURRENCY: Dict[str, int] = {
     "starter": 2,
     "pro": 3,
     "business": 5,
 }
 
-# How long a request will wait to acquire a slot before returning 429.
-# (This is a global behavior knob; NOT a tier setting.)
-CONCURRENCY_ACQUIRE_TIMEOUT_SECONDS = float(os.getenv("CONCURRENCY_ACQUIRE_TIMEOUT_SECONDS", "5"))
+CONCURRENCY_ACQUIRE_TIMEOUT_SECONDS = float(
+    os.getenv("CONCURRENCY_ACQUIRE_TIMEOUT_SECONDS", "5")
+)
 
 def _normalize_tier(raw: Optional[str]) -> str:
     t = (raw or "").strip().lower()
-    # Common aliases
     if t in {"starter", "basic"}:
         return "starter"
     if t in {"pro", "premium"}:
         return "pro"
     if t in {"business", "enterprise"}:
         return "business"
-    # Many systems use "free" in DB — treat as starter unless you want free=1
     if t in {"free", ""}:
         return "starter"
     return t
@@ -199,9 +194,6 @@ def _tier_limit_for_user(user: User) -> int:
     return int(TIER_CONCURRENCY.get(tier, TIER_CONCURRENCY["starter"]))
 
 class _UserLimiter:
-    """
-    Per-user semaphore with safe resizing when tier changes.
-    """
     __slots__ = ("sem", "limit", "active", "pending_limit")
 
     def __init__(self, limit: int):
@@ -210,7 +202,6 @@ class _UserLimiter:
         self.active = 0
         self.pending_limit: Optional[int] = None
 
-# Global in-process store (works best with a single Uvicorn worker)
 _USER_LIMITERS: Dict[int, _UserLimiter] = {}
 _USER_LIMITERS_LOCK = asyncio.Lock()
 
@@ -222,7 +213,6 @@ async def _get_user_limiter(user_id: int, desired_limit: int) -> _UserLimiter:
             _USER_LIMITERS[user_id] = lim
             return lim
 
-        # If tier changed, only resize safely when no active jobs
         if int(desired_limit) != int(lim.limit):
             if lim.active == 0:
                 lim = _UserLimiter(desired_limit)
@@ -235,23 +225,18 @@ async def enforce_tier_concurrency(
     request: Request,
     current_user: User = Depends(get_current_user),
 ) -> AsyncGenerator[None, None]:
-    """
-    Yield dependency:
-    - Acquire user's tier semaphore
-    - Proceed
-    - Always release (even on error)
-    """
     user_id = int(getattr(current_user, "id", 0) or 0)
     if user_id <= 0:
-        # Should never happen if auth is correct
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     desired = _tier_limit_for_user(current_user)
     limiter = await _get_user_limiter(user_id, desired)
 
-    # Acquire a slot with timeout
     try:
-        await asyncio.wait_for(limiter.sem.acquire(), timeout=CONCURRENCY_ACQUIRE_TIMEOUT_SECONDS)
+        await asyncio.wait_for(
+            limiter.sem.acquire(),
+            timeout=CONCURRENCY_ACQUIRE_TIMEOUT_SECONDS
+        )
     except asyncio.TimeoutError:
         tier = _normalize_tier(getattr(current_user, "subscription_tier", None))
         raise HTTPException(
@@ -267,32 +252,50 @@ async def enforce_tier_concurrency(
     try:
         yield
     finally:
-        # Always release
         limiter.active -= 1
         limiter.sem.release()
 
-        # Apply pending tier resize only when user becomes idle
         if limiter.active == 0 and limiter.pending_limit is not None:
             pending = limiter.pending_limit
             limiter.pending_limit = None
             async with _USER_LIMITERS_LOCK:
-                # Replace limiter with new size
                 _USER_LIMITERS[user_id] = _UserLimiter(pending)
 
 # =====================================================================
 # FastAPI app — servers list (Swagger base URL fix)
 # =====================================================================
+def _build_servers() -> List[Dict[str, str]]:
+    """
+    Swagger UI 'servers' should match real reachable public endpoints.
+    Avoid hardcoding internal Render hostnames that change.
+    """
+    servers: List[Dict[str, str]] = []
+
+    if BACKEND_URL:
+        servers.append({"url": BACKEND_URL, "description": "Current environment"})
+
+    # Always include your canonical custom production domain
+    servers.append({"url": PROD_API_DOMAIN, "description": "Production (Custom Domain)"})
+
+    # Local dev helper
+    servers.append({"url": "http://localhost:8000", "description": "Local development"})
+
+    # De-dupe by url, preserve order
+    seen = set()
+    unique = []
+    for s in servers:
+        u = (s.get("url") or "").rstrip("/")
+        if u and u not in seen:
+            seen.add(u)
+            unique.append({"url": u, "description": s.get("description", "")})
+    return unique
+
 app = FastAPI(
     title="PixelPerfect Screenshot API",
     version="1.0.0",
     description="Professional Website Screenshot API with Playwright",
     default_response_class=ORJSONResponse,
-    servers=[
-        {"url": BACKEND_URL, "description": "Current environment"},
-        {"url": "https://pixelperfect-api-mi7t.onrender.com", "description": "Production (Render)"},
-        {"url": "https://api.pixelperfectapi.net", "description": "Production (Custom Domain)"},
-        {"url": "http://localhost:8000", "description": "Local development"},
-    ],
+    servers=_build_servers(),
 )
 
 # Include History Router
@@ -422,9 +425,11 @@ DEV_ORIGINS = [
 
 extra = (os.getenv("CORS_ORIGINS") or "").strip()
 extra_list = [x.strip() for x in extra.split(",") if x.strip()]
-allow_origins = list(dict.fromkeys(
-    PUBLIC_ORIGINS + DEV_ORIGINS + extra_list + ([FRONTEND_URL] if FRONTEND_URL else [])
-))
+
+# Also include FRONTEND_URL automatically (if set)
+auto_frontend = [FRONTEND_URL] if FRONTEND_URL else []
+
+allow_origins = list(dict.fromkeys(PUBLIC_ORIGINS + DEV_ORIGINS + extra_list + auto_frontend))
 
 app.add_middleware(
     CORSMiddleware,
@@ -534,12 +539,16 @@ async def on_startup():
         _set_screenshot_ready(True)
     except Exception as e:
         _set_screenshot_ready(False, err=e)
+        # In production, do NOT crash the whole API if Playwright fails.
         if not IS_PROD:
             raise
         logger.exception("⚠️ Screenshot service init failed (non-fatal in production).")
 
     logger.info("============================================================")
     logger.info("PixelPerfect starting - ENV=%s DB=%s", ENVIRONMENT, DATABASE_URL)
+    logger.info("Frontend URL: %s", FRONTEND_URL or "(unset)")
+    logger.info("Backend URL: %s", BACKEND_URL or "(unset)")
+    logger.info("Custom API Domain: %s", PROD_API_DOMAIN)
     logger.info("Stripe configured: %s", bool(stripe and os.getenv("STRIPE_SECRET_KEY")))
     logger.info("✅ API key system initialized")
     logger.info("📸 Screenshot service ready: %s", SCREENSHOT_READY)
@@ -561,7 +570,13 @@ async def on_shutdown():
 # =====================================================================
 @app.get("/")
 def root():
-    return {"message": "PixelPerfect Screenshot API", "status": "running", "version": "1.0.0"}
+    return {
+        "message": "PixelPerfect Screenshot API",
+        "status": "running",
+        "version": "1.0.0",
+        "docs": "/docs",
+        "ready": SCREENSHOT_READY,
+    }
 
 @app.get("/health")
 def health():
@@ -779,7 +794,7 @@ async def regenerate_api_key(
 @app.post("/api/v1/screenshot")
 async def capture_screenshot(
     request: ScreenshotRequest,
-    _guard: None = Depends(enforce_tier_concurrency),  # ✅ concurrency guard
+    _guard: None = Depends(enforce_tier_concurrency),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -788,7 +803,7 @@ async def capture_screenshot(
 @app.post("/api/v1/batch/submit")
 async def batch_screenshot(
     request: BatchScreenshotRequest,
-    _guard: None = Depends(enforce_tier_concurrency),  # ✅ concurrency guard
+    _guard: None = Depends(enforce_tier_concurrency),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -983,12 +998,8 @@ if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
 
-# ----------------------------------------------------------------------------
-# END of main.py
-# ----------------------------------------------------------------------------
 
-
-
+# # ===============================================
 # # backend/main.py
 # # ========================================
 # # PIXELPERFECT SCREENSHOT API - BACKEND
@@ -996,13 +1007,18 @@ if __name__ == "__main__":
 # # Author: OneTechly
 # # Updated: February 2026 - PRODUCTION READY
 # #
-# # ✅ FIXES APPLIED:
+# # ✅ FIXES APPLIED (existing):
 # # - WebP Content-Type header fix (custom StaticFiles)
 # # - CORS credentials for Firefox
 # # - Better login error messages
 # # - Added `servers` to FastAPI → Swagger UI uses correct public base URL
-# # - ✅ MOST RELIABLE FIX: Docs paths forcibly strip CSP/XFO/COOP/COEP (Swagger always renders)
-# # - ✅ FIX (Render crash): Starlette MutableHeaders has no .pop() → safe delete helper
+# # - Docs paths forcibly strip CSP/XFO/COOP/COEP (Swagger always renders)
+# # - Starlette MutableHeaders safe header delete helper
+# #
+# # ✅ NEW (Option 2 Tier Concurrency):
+# # - Per-user concurrency limiter using asyncio semaphores
+# # - Starter=2, Pro=3, Business=5 (no env var duplicates needed)
+# # - Implemented as a yield dependency on screenshot routes
 # # ========================================
 
 # # =====================================================================
@@ -1010,8 +1026,8 @@ if __name__ == "__main__":
 # # =====================================================================
 # import sys
 # if sys.platform == "win32":
-#     import asyncio
-#     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+#     import asyncio as _asyncio
+#     _asyncio.set_event_loop_policy(_asyncio.WindowsProactorEventLoopPolicy())
 
 # # =====================================================================
 # # Imports
@@ -1020,9 +1036,10 @@ if __name__ == "__main__":
 # import time
 # import logging
 # import threading
+# import asyncio
 # from pathlib import Path
 # from datetime import datetime, timedelta
-# from typing import Optional, Dict, Any
+# from typing import Optional, Dict, Any, AsyncGenerator
 
 # from dotenv import load_dotenv, find_dotenv
 # load_dotenv()
@@ -1093,10 +1110,6 @@ if __name__ == "__main__":
 #     logging.info("✅ Registered .webp MIME type: image/webp")
 
 # class CustomStaticFiles(StaticFiles):
-#     """
-#     ✅ Custom StaticFiles that ensures correct Content-Type for all formats
-#     Fixes WebP files showing as binary instead of images.
-#     """
 #     async def get_response(self, path: str, scope):
 #         response = await super().get_response(path, scope)
 
@@ -1156,6 +1169,119 @@ if __name__ == "__main__":
 #     stripe = None
 
 # # =====================================================================
+# # ✅ Option 2 - Tier concurrency (NO env var duplicates)
+# # =====================================================================
+# # You can tweak these numbers safely anytime.
+# TIER_CONCURRENCY: Dict[str, int] = {
+#     "starter": 2,
+#     "pro": 3,
+#     "business": 5,
+# }
+
+# # How long a request will wait to acquire a slot before returning 429.
+# # (This is a global behavior knob; NOT a tier setting.)
+# CONCURRENCY_ACQUIRE_TIMEOUT_SECONDS = float(os.getenv("CONCURRENCY_ACQUIRE_TIMEOUT_SECONDS", "5"))
+
+# def _normalize_tier(raw: Optional[str]) -> str:
+#     t = (raw or "").strip().lower()
+#     # Common aliases
+#     if t in {"starter", "basic"}:
+#         return "starter"
+#     if t in {"pro", "premium"}:
+#         return "pro"
+#     if t in {"business", "enterprise"}:
+#         return "business"
+#     # Many systems use "free" in DB — treat as starter unless you want free=1
+#     if t in {"free", ""}:
+#         return "starter"
+#     return t
+
+# def _tier_limit_for_user(user: User) -> int:
+#     tier = _normalize_tier(getattr(user, "subscription_tier", None))
+#     return int(TIER_CONCURRENCY.get(tier, TIER_CONCURRENCY["starter"]))
+
+# class _UserLimiter:
+#     """
+#     Per-user semaphore with safe resizing when tier changes.
+#     """
+#     __slots__ = ("sem", "limit", "active", "pending_limit")
+
+#     def __init__(self, limit: int):
+#         self.sem = asyncio.Semaphore(limit)
+#         self.limit = int(limit)
+#         self.active = 0
+#         self.pending_limit: Optional[int] = None
+
+# # Global in-process store (works best with a single Uvicorn worker)
+# _USER_LIMITERS: Dict[int, _UserLimiter] = {}
+# _USER_LIMITERS_LOCK = asyncio.Lock()
+
+# async def _get_user_limiter(user_id: int, desired_limit: int) -> _UserLimiter:
+#     async with _USER_LIMITERS_LOCK:
+#         lim = _USER_LIMITERS.get(user_id)
+#         if lim is None:
+#             lim = _UserLimiter(desired_limit)
+#             _USER_LIMITERS[user_id] = lim
+#             return lim
+
+#         # If tier changed, only resize safely when no active jobs
+#         if int(desired_limit) != int(lim.limit):
+#             if lim.active == 0:
+#                 lim = _UserLimiter(desired_limit)
+#                 _USER_LIMITERS[user_id] = lim
+#             else:
+#                 lim.pending_limit = int(desired_limit)
+#         return lim
+
+# async def enforce_tier_concurrency(
+#     request: Request,
+#     current_user: User = Depends(get_current_user),
+# ) -> AsyncGenerator[None, None]:
+#     """
+#     Yield dependency:
+#     - Acquire user's tier semaphore
+#     - Proceed
+#     - Always release (even on error)
+#     """
+#     user_id = int(getattr(current_user, "id", 0) or 0)
+#     if user_id <= 0:
+#         # Should never happen if auth is correct
+#         raise HTTPException(status_code=401, detail="Unauthorized")
+
+#     desired = _tier_limit_for_user(current_user)
+#     limiter = await _get_user_limiter(user_id, desired)
+
+#     # Acquire a slot with timeout
+#     try:
+#         await asyncio.wait_for(limiter.sem.acquire(), timeout=CONCURRENCY_ACQUIRE_TIMEOUT_SECONDS)
+#     except asyncio.TimeoutError:
+#         tier = _normalize_tier(getattr(current_user, "subscription_tier", None))
+#         raise HTTPException(
+#             status_code=429,
+#             detail=(
+#                 f"Too many concurrent screenshots for your plan (tier={tier}, limit={desired}). "
+#                 f"Please retry in a moment or upgrade for higher concurrency."
+#             ),
+#             headers={"Retry-After": "1"},
+#         )
+
+#     limiter.active += 1
+#     try:
+#         yield
+#     finally:
+#         # Always release
+#         limiter.active -= 1
+#         limiter.sem.release()
+
+#         # Apply pending tier resize only when user becomes idle
+#         if limiter.active == 0 and limiter.pending_limit is not None:
+#             pending = limiter.pending_limit
+#             limiter.pending_limit = None
+#             async with _USER_LIMITERS_LOCK:
+#                 # Replace limiter with new size
+#                 _USER_LIMITERS[user_id] = _UserLimiter(pending)
+
+# # =====================================================================
 # # FastAPI app — servers list (Swagger base URL fix)
 # # =====================================================================
 # app = FastAPI(
@@ -1192,22 +1318,12 @@ if __name__ == "__main__":
 #         SCREENSHOT_LAST_ERROR_AT = None
 
 # # =====================================================================
-# # ✅ MOST RELIABLE FIX: Security headers middleware
-# # - Keeps strict CSP/XFO for normal routes
-# # - For docs paths: FORCE-REMOVES CSP/XFO/COOP/COEP even if set elsewhere
-# #
-# # ✅ FIX (Render crash):
-# #   Starlette MutableHeaders does NOT implement .pop()
-# #   so we remove headers via `del headers[key]` safely.
+# # Security headers middleware (docs-safe)
 # # =====================================================================
 # _DOCS_PREFIXES = ("/docs", "/redoc")
 # _DOCS_EXACT = {"/openapi.json"}
 
 # def _remove_header(headers, key: str) -> None:
-#     """
-#     Starlette response.headers is a MutableHeaders (not a dict) and does NOT support .pop().
-#     This safely removes a header if present.
-#     """
 #     try:
 #         del headers[key]
 #     except KeyError:
@@ -1237,7 +1353,7 @@ if __name__ == "__main__":
 #         response = await call_next(request)
 
 #         path = request.url.path or "/"
-#         norm = path.rstrip("/")  # normalize /docs/ -> /docs
+#         norm = path.rstrip("/")
 
 #         is_docs_path = (
 #             norm in _DOCS_EXACT
@@ -1246,7 +1362,6 @@ if __name__ == "__main__":
 #             or path.startswith("/docs/oauth2-redirect")
 #         )
 
-#         # Always set these (safe)
 #         response.headers.setdefault("X-Content-Type-Options", "nosniff")
 #         response.headers["Referrer-Policy"] = self.referrer_policy
 #         response.headers.setdefault("X-XSS-Protection", "0")
@@ -1258,7 +1373,6 @@ if __name__ == "__main__":
 #                 f"max-age={self.hsts_max_age}; includeSubDomains"
 #             )
 
-#         # ✅ Docs routes: remove anything that can break Swagger UI rendering
 #         if is_docs_path:
 #             _remove_header(response.headers, "Content-Security-Policy")
 #             _remove_header(response.headers, "X-Frame-Options")
@@ -1267,7 +1381,6 @@ if __name__ == "__main__":
 #             _remove_header(response.headers, "Cross-Origin-Resource-Policy")
 #             return response
 
-#         # Normal routes: enforce strict headers
 #         response.headers["X-Frame-Options"] = self.x_frame_options
 #         if self.csp:
 #             response.headers["Content-Security-Policy"] = self.csp
@@ -1334,7 +1447,6 @@ if __name__ == "__main__":
 # app.mount("/screenshots", CustomStaticFiles(directory=str(SCREENSHOTS_DIR)), name="screenshots")
 # logger.info("✅ Screenshot static files mounted with WebP support")
 
-# # Optional nicety: prevent /favicon.ico 405 spam
 # @app.get("/favicon.ico", include_in_schema=False)
 # def favicon():
 #     return Response(status_code=204)
@@ -1435,8 +1547,7 @@ if __name__ == "__main__":
 #     logger.info("📸 Screenshot service ready: %s", SCREENSHOT_READY)
 #     if SCREENSHOT_LAST_ERROR:
 #         logger.info("📸 Screenshot last error: %s", SCREENSHOT_LAST_ERROR)
-#     logger.info("✅ History router included")
-#     logger.info("✅ WebP Content-Type support enabled")
+#     logger.info("✅ Tier concurrency enabled: %s", TIER_CONCURRENCY)
 #     logger.info("============================================================")
 
 # @app.on_event("shutdown")
@@ -1466,6 +1577,7 @@ if __name__ == "__main__":
 #         },
 #         "screenshot_service_error": SCREENSHOT_LAST_ERROR,
 #         "screenshot_service_error_at": SCREENSHOT_LAST_ERROR_AT,
+#         "tier_concurrency": TIER_CONCURRENCY,
 #     }
 
 # @app.head("/health")
@@ -1477,7 +1589,7 @@ if __name__ == "__main__":
 #     return Response(status_code=200)
 
 # # =====================================================================
-# # Auth routes
+# # Auth routes (UNCHANGED)
 # # =====================================================================
 # @app.post("/register")
 # def register(user: UserCreate, db: Session = Depends(get_db)):
@@ -1664,10 +1776,12 @@ if __name__ == "__main__":
 
 # # =====================================================================
 # # Screenshot API Endpoints
+# # ✅ NOW ENFORCED BY TIER CONCURRENCY
 # # =====================================================================
 # @app.post("/api/v1/screenshot")
 # async def capture_screenshot(
 #     request: ScreenshotRequest,
+#     _guard: None = Depends(enforce_tier_concurrency),  # ✅ concurrency guard
 #     current_user: User = Depends(get_current_user),
 #     db: Session = Depends(get_db),
 # ):
@@ -1676,13 +1790,14 @@ if __name__ == "__main__":
 # @app.post("/api/v1/batch/submit")
 # async def batch_screenshot(
 #     request: BatchScreenshotRequest,
+#     _guard: None = Depends(enforce_tier_concurrency),  # ✅ concurrency guard
 #     current_user: User = Depends(get_current_user),
 #     db: Session = Depends(get_db),
 # ):
 #     return await batch_screenshot_endpoint(request, current_user, db)
 
 # # =====================================================================
-# # Stripe webhook
+# # Stripe webhook + billing + subscription_status (UNCHANGED)
 # # =====================================================================
 # _IDEMP_STORE: Dict[str, float] = {}
 # _IDEMP_TTL_SEC = 24 * 3600
@@ -1726,9 +1841,6 @@ if __name__ == "__main__":
 #     request.state.verified_event = event
 #     return await handle_stripe_webhook(request)
 
-# # =====================================================================
-# # Billing endpoint
-# # =====================================================================
 # def _lookup_key(plan: str, billing_cycle: str) -> Optional[str]:
 #     plan = (plan or "").lower().strip()
 #     billing_cycle = (billing_cycle or "monthly").lower().strip()
@@ -1811,9 +1923,6 @@ if __name__ == "__main__":
 #         logger.exception("❌ Checkout session create failed for user %s", current_user.id)
 #         raise HTTPException(status_code=500, detail=f"Stripe error: {str(e)}")
 
-# # =====================================================================
-# # Subscription status
-# # =====================================================================
 # @app.get("/subscription_status")
 # def subscription_status(request: Request, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
 #     try:
@@ -1843,6 +1952,7 @@ if __name__ == "__main__":
 #         "usage": usage,
 #         "limits": tier_limits,
 #         "account": canonical_account(current_user),
+#         "tier_concurrency_limit": _tier_limit_for_user(current_user),
 #     }
 
 #     if next_reset:
@@ -1878,5 +1988,4 @@ if __name__ == "__main__":
 # # ----------------------------------------------------------------------------
 # # END of main.py
 # # ----------------------------------------------------------------------------
-
 
