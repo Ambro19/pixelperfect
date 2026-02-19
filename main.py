@@ -5,10 +5,13 @@
 # Author: OneTechly
 # Updated: February 2026 - PRODUCTION READY
 #
-# Key production fixes in this drop-in:
-# ✅ Swagger servers list uses correct public URLs (no stale Render internal hostnames)
-# ✅ CORS origins normalized for custom domain deployment
-# ✅ Keeps your docs-safe security headers, WebP static, tier concurrency, and Playwright readiness
+# Includes:
+# - WebP Content-Type fix (Custom StaticFiles)
+# - CORS credentials support
+# - Swagger base URL correctness (FastAPI servers)
+# - Docs-safe security headers middleware
+# - Per-user tier concurrency limiter (asyncio Semaphore)
+# - Playwright screenshot service initialization on startup
 # ========================================
 
 # =====================================================================
@@ -29,7 +32,7 @@ import threading
 import asyncio
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, AsyncGenerator, List
+from typing import Optional, Dict, Any, AsyncGenerator
 
 from dotenv import load_dotenv, find_dotenv
 load_dotenv()
@@ -54,10 +57,7 @@ from passlib.context import CryptContext
 # Local imports
 from email_utils import send_password_reset_email
 from auth_utils import get_password_hash, verify_password
-from subscription_sync import (
-    sync_user_subscription_from_stripe,
-    _apply_local_overdue_downgrade_if_possible,
-)
+from subscription_sync import sync_user_subscription_from_stripe, _apply_local_overdue_downgrade_if_possible
 
 from models import (
     User,
@@ -148,8 +148,8 @@ IS_PROD = ENVIRONMENT == "production"
 FRONTEND_URL = (os.getenv("FRONTEND_URL", "http://localhost:3000") or "").rstrip("/")
 BACKEND_URL = (os.getenv("BACKEND_URL", "http://localhost:8000") or "").rstrip("/")
 
-# Your canonical production API domain (custom domain you just verified)
-PROD_API_DOMAIN = "https://api.pixelperfectapi.net"
+# Your public API domain (for docs + sanity checks)
+CUSTOM_API_DOMAIN = (os.getenv("CUSTOM_API_DOMAIN", "https://api.pixelperfectapi.net") or "").rstrip("/")
 
 # =====================================================================
 # Stripe init (non-fatal)
@@ -165,7 +165,7 @@ except Exception as e:
     stripe = None
 
 # =====================================================================
-# ✅ Option 2 - Tier concurrency (NO env var duplicates)
+# ✅ Tier concurrency limits
 # =====================================================================
 TIER_CONCURRENCY: Dict[str, int] = {
     "starter": 2,
@@ -173,9 +173,7 @@ TIER_CONCURRENCY: Dict[str, int] = {
     "business": 5,
 }
 
-CONCURRENCY_ACQUIRE_TIMEOUT_SECONDS = float(
-    os.getenv("CONCURRENCY_ACQUIRE_TIMEOUT_SECONDS", "5")
-)
+CONCURRENCY_ACQUIRE_TIMEOUT_SECONDS = float(os.getenv("CONCURRENCY_ACQUIRE_TIMEOUT_SECONDS", "5"))
 
 def _normalize_tier(raw: Optional[str]) -> str:
     t = (raw or "").strip().lower()
@@ -195,9 +193,8 @@ def _tier_limit_for_user(user: User) -> int:
 
 class _UserLimiter:
     __slots__ = ("sem", "limit", "active", "pending_limit")
-
     def __init__(self, limit: int):
-        self.sem = asyncio.Semaphore(limit)
+        self.sem = asyncio.Semaphore(int(limit))
         self.limit = int(limit)
         self.active = 0
         self.pending_limit: Optional[int] = None
@@ -233,10 +230,7 @@ async def enforce_tier_concurrency(
     limiter = await _get_user_limiter(user_id, desired)
 
     try:
-        await asyncio.wait_for(
-            limiter.sem.acquire(),
-            timeout=CONCURRENCY_ACQUIRE_TIMEOUT_SECONDS
-        )
+        await asyncio.wait_for(limiter.sem.acquire(), timeout=CONCURRENCY_ACQUIRE_TIMEOUT_SECONDS)
     except asyncio.TimeoutError:
         tier = _normalize_tier(getattr(current_user, "subscription_tier", None))
         raise HTTPException(
@@ -262,43 +256,24 @@ async def enforce_tier_concurrency(
                 _USER_LIMITERS[user_id] = _UserLimiter(pending)
 
 # =====================================================================
-# FastAPI app — servers list (Swagger base URL fix)
+# FastAPI app
 # =====================================================================
-def _build_servers() -> List[Dict[str, str]]:
-    """
-    Swagger UI 'servers' should match real reachable public endpoints.
-    Avoid hardcoding internal Render hostnames that change.
-    """
-    servers: List[Dict[str, str]] = []
-
-    if BACKEND_URL:
-        servers.append({"url": BACKEND_URL, "description": "Current environment"})
-
-    # Always include your canonical custom production domain
-    servers.append({"url": PROD_API_DOMAIN, "description": "Production (Custom Domain)"})
-
-    # Local dev helper
-    servers.append({"url": "http://localhost:8000", "description": "Local development"})
-
-    # De-dupe by url, preserve order
-    seen = set()
-    unique = []
-    for s in servers:
-        u = (s.get("url") or "").rstrip("/")
-        if u and u not in seen:
-            seen.add(u)
-            unique.append({"url": u, "description": s.get("description", "")})
-    return unique
+# Keep servers clean: prefer configured BACKEND_URL + public custom domain + local.
+servers = []
+if BACKEND_URL:
+    servers.append({"url": BACKEND_URL, "description": "Current environment"})
+if CUSTOM_API_DOMAIN and CUSTOM_API_DOMAIN not in {BACKEND_URL}:
+    servers.append({"url": CUSTOM_API_DOMAIN, "description": "Production (Custom Domain)"})
+servers.append({"url": "http://localhost:8000", "description": "Local development"})
 
 app = FastAPI(
     title="PixelPerfect Screenshot API",
     version="1.0.0",
     description="Professional Website Screenshot API with Playwright",
     default_response_class=ORJSONResponse,
-    servers=_build_servers(),
+    servers=servers,
 )
 
-# Include History Router
 app.include_router(history_router)
 
 # =====================================================================
@@ -425,11 +400,9 @@ DEV_ORIGINS = [
 
 extra = (os.getenv("CORS_ORIGINS") or "").strip()
 extra_list = [x.strip() for x in extra.split(",") if x.strip()]
-
-# Also include FRONTEND_URL automatically (if set)
-auto_frontend = [FRONTEND_URL] if FRONTEND_URL else []
-
-allow_origins = list(dict.fromkeys(PUBLIC_ORIGINS + DEV_ORIGINS + extra_list + auto_frontend))
+allow_origins = list(dict.fromkeys(
+    PUBLIC_ORIGINS + DEV_ORIGINS + extra_list + ([FRONTEND_URL] if FRONTEND_URL else [])
+))
 
 app.add_middleware(
     CORSMiddleware,
@@ -459,7 +432,10 @@ def favicon():
 # =====================================================================
 ALGORITHM = os.getenv("ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "1440"))
+
+# IMPORTANT: tokenUrl should match your route "/token"
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
@@ -539,16 +515,15 @@ async def on_startup():
         _set_screenshot_ready(True)
     except Exception as e:
         _set_screenshot_ready(False, err=e)
-        # In production, do NOT crash the whole API if Playwright fails.
         if not IS_PROD:
             raise
         logger.exception("⚠️ Screenshot service init failed (non-fatal in production).")
 
     logger.info("============================================================")
     logger.info("PixelPerfect starting - ENV=%s DB=%s", ENVIRONMENT, DATABASE_URL)
-    logger.info("Frontend URL: %s", FRONTEND_URL or "(unset)")
-    logger.info("Backend URL: %s", BACKEND_URL or "(unset)")
-    logger.info("Custom API Domain: %s", PROD_API_DOMAIN)
+    logger.info("Frontend URL: %s", FRONTEND_URL)
+    logger.info("Backend URL: %s", BACKEND_URL)
+    logger.info("Custom API Domain: %s", CUSTOM_API_DOMAIN)
     logger.info("Stripe configured: %s", bool(stripe and os.getenv("STRIPE_SECRET_KEY")))
     logger.info("✅ API key system initialized")
     logger.info("📸 Screenshot service ready: %s", SCREENSHOT_READY)
@@ -570,13 +545,12 @@ async def on_shutdown():
 # =====================================================================
 @app.get("/")
 def root():
-    return {
-        "message": "PixelPerfect Screenshot API",
-        "status": "running",
-        "version": "1.0.0",
-        "docs": "/docs",
-        "ready": SCREENSHOT_READY,
-    }
+    return {"message": "PixelPerfect Screenshot API", "status": "running", "version": "1.0.0"}
+
+# ✅ Stop Render/health check HEAD noise (prevents 405 spam)
+@app.head("/")
+def root_head():
+    return Response(status_code=200)
 
 @app.get("/health")
 def health():
@@ -602,7 +576,7 @@ async def options_handler(path: str):
     return Response(status_code=200)
 
 # =====================================================================
-# Auth routes (UNCHANGED)
+# Auth routes
 # =====================================================================
 @app.post("/register")
 def register(user: UserCreate, db: Session = Depends(get_db)):
@@ -788,8 +762,7 @@ async def regenerate_api_key(
     return await regenerate_api_key_endpoint(current_user, db)
 
 # =====================================================================
-# Screenshot API Endpoints
-# ✅ NOW ENFORCED BY TIER CONCURRENCY
+# Screenshot API Endpoints (tier concurrency enforced)
 # =====================================================================
 @app.post("/api/v1/screenshot")
 async def capture_screenshot(
@@ -810,7 +783,7 @@ async def batch_screenshot(
     return await batch_screenshot_endpoint(request, current_user, db)
 
 # =====================================================================
-# Stripe webhook + billing + subscription_status (UNCHANGED)
+# Stripe webhook + billing + subscription_status
 # =====================================================================
 _IDEMP_STORE: Dict[str, float] = {}
 _IDEMP_TTL_SEC = 24 * 3600
@@ -893,21 +866,15 @@ def create_checkout_session(
         logger.error("Missing Stripe lookup key for %s (%s)", plan, billing_cycle)
         raise HTTPException(
             status_code=500,
-            detail=f"Missing Stripe configuration for {plan} ({billing_cycle}). "
-                   f"Please set STRIPE_{plan.upper()}_LOOKUP_KEY_MONTHLY and optionally _YEARLY in environment.",
+            detail=f"Missing Stripe configuration for {plan} ({billing_cycle}).",
         )
 
     try:
         prices = stripe.Price.list(lookup_keys=[lookup_key], limit=1)
         if not prices.data:
-            logger.error("No Stripe Price found for lookup_key=%s", lookup_key)
-            raise HTTPException(
-                status_code=500,
-                detail=f"No Stripe Price found for lookup_key={lookup_key}. Please check Stripe Dashboard."
-            )
+            raise HTTPException(status_code=500, detail=f"No Stripe Price found for lookup_key={lookup_key}")
 
         price_id = prices.data[0].id
-        logger.info("✅ Found Stripe Price: %s for %s (%s)", price_id, plan, billing_cycle)
 
         success_url = f"{FRONTEND_URL}/dashboard?checkout=success"
         cancel_url = f"{FRONTEND_URL}/pricing?checkout=cancel"
@@ -927,7 +894,6 @@ def create_checkout_session(
             },
         )
 
-        logger.info("✅ Stripe Checkout Session created: %s for user %s", session.id, current_user.id)
         return {"url": session.url, "id": session.id}
 
     except HTTPException:
@@ -937,7 +903,11 @@ def create_checkout_session(
         raise HTTPException(status_code=500, detail=f"Stripe error: {str(e)}")
 
 @app.get("/subscription_status")
-def subscription_status(request: Request, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def subscription_status(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     try:
         _apply_local_overdue_downgrade_if_possible(current_user, db)
     except Exception as e:
@@ -999,7 +969,7 @@ if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
 
 
-# # ===============================================
+# # =============================================================== 
 # # backend/main.py
 # # ========================================
 # # PIXELPERFECT SCREENSHOT API - BACKEND
@@ -1007,18 +977,10 @@ if __name__ == "__main__":
 # # Author: OneTechly
 # # Updated: February 2026 - PRODUCTION READY
 # #
-# # ✅ FIXES APPLIED (existing):
-# # - WebP Content-Type header fix (custom StaticFiles)
-# # - CORS credentials for Firefox
-# # - Better login error messages
-# # - Added `servers` to FastAPI → Swagger UI uses correct public base URL
-# # - Docs paths forcibly strip CSP/XFO/COOP/COEP (Swagger always renders)
-# # - Starlette MutableHeaders safe header delete helper
-# #
-# # ✅ NEW (Option 2 Tier Concurrency):
-# # - Per-user concurrency limiter using asyncio semaphores
-# # - Starter=2, Pro=3, Business=5 (no env var duplicates needed)
-# # - Implemented as a yield dependency on screenshot routes
+# # Key production fixes in this drop-in:
+# # ✅ Swagger servers list uses correct public URLs (no stale Render internal hostnames)
+# # ✅ CORS origins normalized for custom domain deployment
+# # ✅ Keeps your docs-safe security headers, WebP static, tier concurrency, and Playwright readiness
 # # ========================================
 
 # # =====================================================================
@@ -1039,7 +1001,7 @@ if __name__ == "__main__":
 # import asyncio
 # from pathlib import Path
 # from datetime import datetime, timedelta
-# from typing import Optional, Dict, Any, AsyncGenerator
+# from typing import Optional, Dict, Any, AsyncGenerator, List
 
 # from dotenv import load_dotenv, find_dotenv
 # load_dotenv()
@@ -1064,7 +1026,10 @@ if __name__ == "__main__":
 # # Local imports
 # from email_utils import send_password_reset_email
 # from auth_utils import get_password_hash, verify_password
-# from subscription_sync import sync_user_subscription_from_stripe, _apply_local_overdue_downgrade_if_possible
+# from subscription_sync import (
+#     sync_user_subscription_from_stripe,
+#     _apply_local_overdue_downgrade_if_possible,
+# )
 
 # from models import (
 #     User,
@@ -1107,7 +1072,6 @@ if __name__ == "__main__":
 
 # if ".webp" not in mimetypes.types_map:
 #     mimetypes.add_type("image/webp", ".webp")
-#     logging.info("✅ Registered .webp MIME type: image/webp")
 
 # class CustomStaticFiles(StaticFiles):
 #     async def get_response(self, path: str, scope):
@@ -1152,8 +1116,12 @@ if __name__ == "__main__":
 
 # ENVIRONMENT = os.getenv("ENVIRONMENT", "development").lower()
 # IS_PROD = ENVIRONMENT == "production"
-# FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000").rstrip("/")
-# BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000").rstrip("/")
+
+# FRONTEND_URL = (os.getenv("FRONTEND_URL", "http://localhost:3000") or "").rstrip("/")
+# BACKEND_URL = (os.getenv("BACKEND_URL", "http://localhost:8000") or "").rstrip("/")
+
+# # Your canonical production API domain (custom domain you just verified)
+# PROD_API_DOMAIN = "https://api.pixelperfectapi.net"
 
 # # =====================================================================
 # # Stripe init (non-fatal)
@@ -1171,27 +1139,24 @@ if __name__ == "__main__":
 # # =====================================================================
 # # ✅ Option 2 - Tier concurrency (NO env var duplicates)
 # # =====================================================================
-# # You can tweak these numbers safely anytime.
 # TIER_CONCURRENCY: Dict[str, int] = {
 #     "starter": 2,
 #     "pro": 3,
 #     "business": 5,
 # }
 
-# # How long a request will wait to acquire a slot before returning 429.
-# # (This is a global behavior knob; NOT a tier setting.)
-# CONCURRENCY_ACQUIRE_TIMEOUT_SECONDS = float(os.getenv("CONCURRENCY_ACQUIRE_TIMEOUT_SECONDS", "5"))
+# CONCURRENCY_ACQUIRE_TIMEOUT_SECONDS = float(
+#     os.getenv("CONCURRENCY_ACQUIRE_TIMEOUT_SECONDS", "5")
+# )
 
 # def _normalize_tier(raw: Optional[str]) -> str:
 #     t = (raw or "").strip().lower()
-#     # Common aliases
 #     if t in {"starter", "basic"}:
 #         return "starter"
 #     if t in {"pro", "premium"}:
 #         return "pro"
 #     if t in {"business", "enterprise"}:
 #         return "business"
-#     # Many systems use "free" in DB — treat as starter unless you want free=1
 #     if t in {"free", ""}:
 #         return "starter"
 #     return t
@@ -1201,9 +1166,6 @@ if __name__ == "__main__":
 #     return int(TIER_CONCURRENCY.get(tier, TIER_CONCURRENCY["starter"]))
 
 # class _UserLimiter:
-#     """
-#     Per-user semaphore with safe resizing when tier changes.
-#     """
 #     __slots__ = ("sem", "limit", "active", "pending_limit")
 
 #     def __init__(self, limit: int):
@@ -1212,7 +1174,6 @@ if __name__ == "__main__":
 #         self.active = 0
 #         self.pending_limit: Optional[int] = None
 
-# # Global in-process store (works best with a single Uvicorn worker)
 # _USER_LIMITERS: Dict[int, _UserLimiter] = {}
 # _USER_LIMITERS_LOCK = asyncio.Lock()
 
@@ -1224,7 +1185,6 @@ if __name__ == "__main__":
 #             _USER_LIMITERS[user_id] = lim
 #             return lim
 
-#         # If tier changed, only resize safely when no active jobs
 #         if int(desired_limit) != int(lim.limit):
 #             if lim.active == 0:
 #                 lim = _UserLimiter(desired_limit)
@@ -1237,23 +1197,18 @@ if __name__ == "__main__":
 #     request: Request,
 #     current_user: User = Depends(get_current_user),
 # ) -> AsyncGenerator[None, None]:
-#     """
-#     Yield dependency:
-#     - Acquire user's tier semaphore
-#     - Proceed
-#     - Always release (even on error)
-#     """
 #     user_id = int(getattr(current_user, "id", 0) or 0)
 #     if user_id <= 0:
-#         # Should never happen if auth is correct
 #         raise HTTPException(status_code=401, detail="Unauthorized")
 
 #     desired = _tier_limit_for_user(current_user)
 #     limiter = await _get_user_limiter(user_id, desired)
 
-#     # Acquire a slot with timeout
 #     try:
-#         await asyncio.wait_for(limiter.sem.acquire(), timeout=CONCURRENCY_ACQUIRE_TIMEOUT_SECONDS)
+#         await asyncio.wait_for(
+#             limiter.sem.acquire(),
+#             timeout=CONCURRENCY_ACQUIRE_TIMEOUT_SECONDS
+#         )
 #     except asyncio.TimeoutError:
 #         tier = _normalize_tier(getattr(current_user, "subscription_tier", None))
 #         raise HTTPException(
@@ -1269,32 +1224,50 @@ if __name__ == "__main__":
 #     try:
 #         yield
 #     finally:
-#         # Always release
 #         limiter.active -= 1
 #         limiter.sem.release()
 
-#         # Apply pending tier resize only when user becomes idle
 #         if limiter.active == 0 and limiter.pending_limit is not None:
 #             pending = limiter.pending_limit
 #             limiter.pending_limit = None
 #             async with _USER_LIMITERS_LOCK:
-#                 # Replace limiter with new size
 #                 _USER_LIMITERS[user_id] = _UserLimiter(pending)
 
 # # =====================================================================
 # # FastAPI app — servers list (Swagger base URL fix)
 # # =====================================================================
+# def _build_servers() -> List[Dict[str, str]]:
+#     """
+#     Swagger UI 'servers' should match real reachable public endpoints.
+#     Avoid hardcoding internal Render hostnames that change.
+#     """
+#     servers: List[Dict[str, str]] = []
+
+#     if BACKEND_URL:
+#         servers.append({"url": BACKEND_URL, "description": "Current environment"})
+
+#     # Always include your canonical custom production domain
+#     servers.append({"url": PROD_API_DOMAIN, "description": "Production (Custom Domain)"})
+
+#     # Local dev helper
+#     servers.append({"url": "http://localhost:8000", "description": "Local development"})
+
+#     # De-dupe by url, preserve order
+#     seen = set()
+#     unique = []
+#     for s in servers:
+#         u = (s.get("url") or "").rstrip("/")
+#         if u and u not in seen:
+#             seen.add(u)
+#             unique.append({"url": u, "description": s.get("description", "")})
+#     return unique
+
 # app = FastAPI(
 #     title="PixelPerfect Screenshot API",
 #     version="1.0.0",
 #     description="Professional Website Screenshot API with Playwright",
 #     default_response_class=ORJSONResponse,
-#     servers=[
-#         {"url": BACKEND_URL, "description": "Current environment"},
-#         {"url": "https://pixelperfect-api-mi7t.onrender.com", "description": "Production (Render)"},
-#         {"url": "https://api.pixelperfectapi.net", "description": "Production (Custom Domain)"},
-#         {"url": "http://localhost:8000", "description": "Local development"},
-#     ],
+#     servers=_build_servers(),
 # )
 
 # # Include History Router
@@ -1424,9 +1397,11 @@ if __name__ == "__main__":
 
 # extra = (os.getenv("CORS_ORIGINS") or "").strip()
 # extra_list = [x.strip() for x in extra.split(",") if x.strip()]
-# allow_origins = list(dict.fromkeys(
-#     PUBLIC_ORIGINS + DEV_ORIGINS + extra_list + ([FRONTEND_URL] if FRONTEND_URL else [])
-# ))
+
+# # Also include FRONTEND_URL automatically (if set)
+# auto_frontend = [FRONTEND_URL] if FRONTEND_URL else []
+
+# allow_origins = list(dict.fromkeys(PUBLIC_ORIGINS + DEV_ORIGINS + extra_list + auto_frontend))
 
 # app.add_middleware(
 #     CORSMiddleware,
@@ -1536,12 +1511,16 @@ if __name__ == "__main__":
 #         _set_screenshot_ready(True)
 #     except Exception as e:
 #         _set_screenshot_ready(False, err=e)
+#         # In production, do NOT crash the whole API if Playwright fails.
 #         if not IS_PROD:
 #             raise
 #         logger.exception("⚠️ Screenshot service init failed (non-fatal in production).")
 
 #     logger.info("============================================================")
 #     logger.info("PixelPerfect starting - ENV=%s DB=%s", ENVIRONMENT, DATABASE_URL)
+#     logger.info("Frontend URL: %s", FRONTEND_URL or "(unset)")
+#     logger.info("Backend URL: %s", BACKEND_URL or "(unset)")
+#     logger.info("Custom API Domain: %s", PROD_API_DOMAIN)
 #     logger.info("Stripe configured: %s", bool(stripe and os.getenv("STRIPE_SECRET_KEY")))
 #     logger.info("✅ API key system initialized")
 #     logger.info("📸 Screenshot service ready: %s", SCREENSHOT_READY)
@@ -1563,7 +1542,13 @@ if __name__ == "__main__":
 # # =====================================================================
 # @app.get("/")
 # def root():
-#     return {"message": "PixelPerfect Screenshot API", "status": "running", "version": "1.0.0"}
+#     return {
+#         "message": "PixelPerfect Screenshot API",
+#         "status": "running",
+#         "version": "1.0.0",
+#         "docs": "/docs",
+#         "ready": SCREENSHOT_READY,
+#     }
 
 # @app.get("/health")
 # def health():
@@ -1781,7 +1766,7 @@ if __name__ == "__main__":
 # @app.post("/api/v1/screenshot")
 # async def capture_screenshot(
 #     request: ScreenshotRequest,
-#     _guard: None = Depends(enforce_tier_concurrency),  # ✅ concurrency guard
+#     _guard: None = Depends(enforce_tier_concurrency),
 #     current_user: User = Depends(get_current_user),
 #     db: Session = Depends(get_db),
 # ):
@@ -1790,7 +1775,7 @@ if __name__ == "__main__":
 # @app.post("/api/v1/batch/submit")
 # async def batch_screenshot(
 #     request: BatchScreenshotRequest,
-#     _guard: None = Depends(enforce_tier_concurrency),  # ✅ concurrency guard
+#     _guard: None = Depends(enforce_tier_concurrency),
 #     current_user: User = Depends(get_current_user),
 #     db: Session = Depends(get_db),
 # ):
@@ -1984,8 +1969,4 @@ if __name__ == "__main__":
 # if __name__ == "__main__":
 #     import uvicorn
 #     uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
-
-# # ----------------------------------------------------------------------------
-# # END of main.py
-# # ----------------------------------------------------------------------------
 
