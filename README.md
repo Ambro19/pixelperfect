@@ -326,7 +326,7 @@ pixelperfect/
 
 ## License
 
-Copyright © 2026 [OneTechly](https://pixelperfectapi.net/privacy)  
+Copyright © 2026 [OneTechly](https://pixelperfectapi.net)  
 All rights reserved.
 
 This project is proprietary software unless otherwise stated. Unauthorized copying, modification, or distribution of this software, in whole or in part, is strictly prohibited.
