@@ -391,7 +391,9 @@ app.add_middleware(
 PUBLIC_ORIGINS = [
     "https://pixelperfectapi.net",
     "https://www.pixelperfectapi.net",
+    "https://pixelperfect-frontend-l5dn.onrender.com",  # ← ADD THIS LINE
 ]
+
 DEV_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
