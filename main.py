@@ -764,6 +764,62 @@ async def regenerate_api_key(
     return await regenerate_api_key_endpoint(current_user, db)
 
 # =====================================================================
+# ✅ ADD THIS BLOCK TO main.py
+# Place it directly after the /api/keys/regenerate route
+# (around line 380, before the Screenshot API Endpoints section)
+# =====================================================================
+
+@app.delete("/api/v1/screenshots/{screenshot_id}")
+async def delete_screenshot(
+    screenshot_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Permanently delete a screenshot by ID.
+    Users can only delete their own screenshots.
+    Also deletes the file from disk.
+    """
+    # Find the record, enforce ownership
+    record = (
+        db.query(Screenshot)
+        .filter(
+            Screenshot.id == screenshot_id,
+            Screenshot.user_id == current_user.id,
+        )
+        .first()
+    )
+
+    if not record:
+        raise HTTPException(
+            status_code=404,
+            detail="Screenshot not found or you do not have permission to delete it.",
+        )
+
+    # Delete the file from disk (non-fatal if already missing)
+    filepath_to_delete = getattr(record, "screenshot_path", None) or getattr(record, "storage_url", None)
+    if filepath_to_delete:
+        try:
+            # screenshot_path is the full file path on disk
+            path = Path(filepath_to_delete)
+            if path.exists():
+                path.unlink()
+                logger.info("🗑️ Deleted screenshot file: %s", filepath_to_delete)
+            else:
+                logger.warning("⚠️ Screenshot file not found on disk (already deleted?): %s", filepath_to_delete)
+        except Exception as e:
+            logger.warning("⚠️ Could not delete screenshot file (non-fatal): %s — %s", filepath_to_delete, e)
+
+    # Delete the DB record
+    db.delete(record)
+    db.commit()
+
+    logger.info("✅ Deleted screenshot id=%s for user=%s", screenshot_id, current_user.id)
+
+    return {"ok": True, "deleted_id": screenshot_id, "message": "Screenshot deleted successfully."}
+
+
+# =====================================================================
 # Screenshot API Endpoints (tier concurrency enforced)
 # =====================================================================
 @app.post("/api/v1/screenshot")
