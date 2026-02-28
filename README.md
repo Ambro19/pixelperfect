@@ -1,4 +1,4 @@
-# PixelPerfect Screenshot API
+# PixelPerfect Screenshot API — Backend
 
 Professional website screenshot API built with **FastAPI** + **Playwright**, with authentication, API keys, Stripe subscriptions, usage limits, and optional Cloudflare R2 storage.
 
