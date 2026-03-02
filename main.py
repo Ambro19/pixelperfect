@@ -763,32 +763,50 @@ async def regenerate_api_key(
 ):
     return await regenerate_api_key_endpoint(current_user, db)
 
-# =====================================================================
-# ✅ ADD THIS BLOCK TO main.py
-# Place it directly after the /api/keys/regenerate route
-# (around line 380, before the Screenshot API Endpoints section)
-# =====================================================================
+# ============================================================================
+# BACKEND FIX — backend/main.py
+# ============================================================================
+# Replace your existing @app.delete("/api/v1/screenshots/{screenshot_id}")
+# route with this version.
+#
+# ROOT CAUSE: The original route had `screenshot_id: int` which FastAPI
+# validates strictly. PostgreSQL production uses UUID primary keys
+# (e.g. "c86e1436-bd80-49ad-ae1c-000a43d70738") — FastAPI rejects these
+# with a 422 Unprocessable Entity error before your code even runs.
+#
+# FIX: Change the type annotation to `str` and handle both integer and UUID.
+# ============================================================================
 
 @app.delete("/api/v1/screenshots/{screenshot_id}")
 async def delete_screenshot(
-    screenshot_id: int,
+    screenshot_id: str,            # ✅ FIX: was `int` — now accepts UUID strings too
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """
-    Permanently delete a screenshot by ID.
-    Users can only delete their own screenshots.
-    Also deletes the file from disk.
+    Delete a screenshot by ID.
+    Accepts both integer IDs (SQLite dev) and UUID strings (PostgreSQL prod).
+    Ownership enforced via user_id filter — users can only delete their own.
     """
-    # Find the record, enforce ownership
-    record = (
-        db.query(Screenshot)
-        .filter(
+    # Try to look up by integer first (SQLite / integer PK databases)
+    record = None
+    try:
+        int_id = int(screenshot_id)
+        record = db.query(Screenshot).filter(
+            Screenshot.id == int_id,
+            Screenshot.user_id == current_user.id,
+        ).first()
+    except (ValueError, TypeError):
+        # Not an integer — fall through to string/UUID lookup below
+        pass
+
+    # If integer lookup found nothing, try as string/UUID
+    # (works when Screenshot.id is a UUID column type in PostgreSQL)
+    if record is None:
+        record = db.query(Screenshot).filter(
             Screenshot.id == screenshot_id,
             Screenshot.user_id == current_user.id,
-        )
-        .first()
-    )
+        ).first()
 
     if not record:
         raise HTTPException(
@@ -796,28 +814,27 @@ async def delete_screenshot(
             detail="Screenshot not found or you do not have permission to delete it.",
         )
 
-    # Delete the file from disk (non-fatal if already missing)
-    filepath_to_delete = getattr(record, "screenshot_path", None) or getattr(record, "storage_url", None)
+    # Delete file from disk (non-fatal if already missing)
+    filepath_to_delete = getattr(record, "screenshot_path", None)
     if filepath_to_delete:
+        path = Path(filepath_to_delete)
         try:
-            # screenshot_path is the full file path on disk
-            path = Path(filepath_to_delete)
             if path.exists():
                 path.unlink()
-                logger.info("🗑️ Deleted screenshot file: %s", filepath_to_delete)
-            else:
-                logger.warning("⚠️ Screenshot file not found on disk (already deleted?): %s", filepath_to_delete)
+                logger.info(f"🗑️ Deleted file: {filepath_to_delete}")
         except Exception as e:
-            logger.warning("⚠️ Could not delete screenshot file (non-fatal): %s — %s", filepath_to_delete, e)
+            logger.warning(f"⚠️ Could not delete file {filepath_to_delete}: {e}")
 
-    # Delete the DB record
+    # Delete DB record and commit
     db.delete(record)
     db.commit()
 
-    logger.info("✅ Deleted screenshot id=%s for user=%s", screenshot_id, current_user.id)
-
-    return {"ok": True, "deleted_id": screenshot_id, "message": "Screenshot deleted successfully."}
-
+    logger.info(f"✅ Deleted screenshot id={screenshot_id} for user {current_user.id}")
+    return {
+        "ok": True,
+        "deleted_id": screenshot_id,
+        "message": "Screenshot deleted successfully.",
+    }
 
 # =====================================================================
 # Screenshot API Endpoints (tier concurrency enforced)
