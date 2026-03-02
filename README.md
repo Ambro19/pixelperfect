@@ -159,7 +159,7 @@ The API is deployed on **Render** using Docker with Playwright (Chromium headles
 
 ## License
 
-Copyright © 2026 [OneTechly](https://onetechly.com)  
+Copyright © 2026 [OneTechly](https://onetechlyambr19.blogspot.com/2024/11/peer-to-peer-peer-to-peer-p2p.html)  
 All rights reserved.
 
 This is proprietary software. Unauthorized copying, modification, or distribution is strictly prohibited.
