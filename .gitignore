@@ -56,6 +56,9 @@ uploads/
 screenshots/
 EOF
 
+# README-Internal file
+INTERNAL.md
+
 # Commit and push
 git add .
 git commit -m "Initial commit - PixelPerfect API"
