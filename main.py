@@ -95,12 +95,14 @@ from screenshot_endpoints import (
     BatchScreenshotRequest,
 )
 
-# History router
-from history import router as history_router
+# # History router
+# from history import router as history_router
 
-# Batch router
-from BatchJobs import router as batch_router
-#from routers.batch import router as batch_router
+# # Batch router
+# from batch import router as batch_router
+
+from history import router as history_router
+from batch import router as batch_router
 
 # =====================================================================
 # CRITICAL FIX: Custom StaticFiles with WebP Content-Type Support
@@ -274,8 +276,12 @@ app = FastAPI(
     servers=servers,
 )
 
-#app.include_router(history_router)
+# History/Activity router
+app.include_router(history_router)
+
+# Batch router
 app.include_router(batch_router, prefix="/api/v1")
+
 
 # =====================================================================
 # Screenshot Service Readiness
