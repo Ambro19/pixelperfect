@@ -1,573 +1,15 @@
-# # =================================================================================================
-# # backend/batch.py
-# # PixelPerfect Batch Screenshot Router - PRODUCTION READY
-# # Updated: March 2026
-# #
-# # Fixes:
-# # - Stable FastAPI router prefix: /batch  (main.py should include with prefix="/api/v1")
-# # - Safe DB session handling in background jobs using SessionLocal()
-# # - Correct Screenshot model field names for history/activity pages
-# # - File upload endpoint restored: POST /api/v1/batch/submit_file
-# # - Better protection against shutdown/reload interruptions
-# # - Cleaner batch job state tracking
-# # =================================================================================================
-
-# from __future__ import annotations
-
-# import asyncio
-# import csv
-# import logging
-# import time
-# import uuid
-# from datetime import datetime
-# from io import StringIO
-# from pathlib import Path
-# from typing import Any, Dict, List, Optional
-
-# from fastapi import (
-#     APIRouter,
-#     BackgroundTasks,
-#     Body,
-#     Depends,
-#     File,
-#     Form,
-#     HTTPException,
-#     UploadFile,
-# )
-# from pydantic import BaseModel, Field, validator
-# from sqlalchemy.orm import Session
-
-# from auth_deps import get_current_user
-# from models import Screenshot, SessionLocal, User, get_db
-# from screenshot_service import screenshot_service
-
-# log = logging.getLogger("batch_screenshots")
-
-# # IMPORTANT:
-# # main.py must include this router as:
-# #   app.include_router(batch_router, prefix="/api/v1")
-# router = APIRouter(prefix="/batch", tags=["batch"])
-
-# SCREENSHOTS_DIR = Path(__file__).resolve().parent / "screenshots"
-# SCREENSHOTS_DIR.mkdir(exist_ok=True)
-
-# TIER_BATCH_LIMITS = {
-#     "free": 0,
-#     "pro": 50,
-#     "business": 200,
-#     "premium": 1000,
-# }
-
-# JOBS: Dict[str, Dict[str, Any]] = {}
-# VALID_FORMATS = {"png", "jpeg", "jpg", "webp", "pdf"}
-
-
-# # =================================================================================================
-# # Request / Response models
-# # =================================================================================================
-
-# class BatchSubmitRequest(BaseModel):
-#     urls: Optional[List[str]] = Field(default=None, description="List of URLs")
-#     csv_text: Optional[str] = Field(default=None, description="CSV/TXT/TSV raw text")
-#     format: str = Field(default="png", description="png, jpeg, jpg, webp, pdf")
-#     width: int = Field(default=1920, ge=320, le=7680)
-#     height: int = Field(default=1080, ge=240, le=4320)
-#     full_page: bool = Field(default=False)
-#     quality: Optional[int] = Field(default=None, ge=1, le=100)
-
-#     @validator("format")
-#     def validate_format(cls, v: str) -> str:
-#         value = (v or "").strip().lower()
-#         if value not in VALID_FORMATS:
-#             raise ValueError(f"format must be one of {sorted(VALID_FORMATS)}")
-#         return value
-
-#     def collect_urls(self) -> List[str]:
-#         raw_urls: List[str] = []
-
-#         if self.urls:
-#             raw_urls.extend(self.urls)
-
-#         if self.csv_text:
-#             text = self.csv_text.strip()
-
-#             if "," in text:
-#                 reader = csv.reader(StringIO(text))
-#                 for row in reader:
-#                     raw_urls.extend([cell.strip() for cell in row if cell.strip()])
-#             elif "\t" in text:
-#                 reader = csv.reader(StringIO(text), delimiter="\t")
-#                 for row in reader:
-#                     raw_urls.extend([cell.strip() for cell in row if cell.strip()])
-#             else:
-#                 raw_urls.extend([line.strip() for line in text.splitlines() if line.strip()])
-
-#         seen = set()
-#         urls: List[str] = []
-#         for url in raw_urls:
-#             u = (url or "").strip()
-#             if u and (u.startswith("http://") or u.startswith("https://")) and u not in seen:
-#                 seen.add(u)
-#                 urls.append(u)
-
-#         return urls
-
-
-# class BatchItemOut(BaseModel):
-#     idx: int
-#     url: str
-#     status: str
-#     message: Optional[str] = None
-#     screenshot_url: Optional[str] = None
-#     file_size: Optional[int] = None
-#     processing_time: Optional[float] = None
-
-
-# class BatchJobOut(BaseModel):
-#     id: str
-#     created_at: str
-#     status: str
-#     format: str
-#     total: int
-#     completed: int
-#     failed: int
-#     queued: int
-#     processing: int
-#     items: List[BatchItemOut]
-
-
-# # =================================================================================================
-# # Helpers
-# # =================================================================================================
-
-# def _get_user_tier(user: User) -> str:
-#     return (getattr(user, "subscription_tier", "free") or "free").lower()
-
-
-# def _get_batch_limit(tier: str) -> int:
-#     return TIER_BATCH_LIMITS.get((tier or "").lower(), 0)
-
-
-# def _create_initial_item(idx: int, url: str) -> Dict[str, Any]:
-#     return {
-#         "idx": idx,
-#         "url": url,
-#         "status": "queued",
-#         "message": "Waiting to process...",
-#         "screenshot_url": None,
-#         "file_size": None,
-#         "processing_time": None,
-#         "created_at": datetime.utcnow().isoformat(),
-#     }
-
-
-# def _calc_counts(items: List[Dict[str, Any]]) -> Dict[str, int]:
-#     completed = sum(1 for it in items if it["status"] == "completed")
-#     failed = sum(1 for it in items if it["status"] == "failed")
-#     queued = sum(1 for it in items if it["status"] == "queued")
-#     processing = sum(1 for it in items if it["status"] == "processing")
-#     return {
-#         "completed": completed,
-#         "failed": failed,
-#         "queued": queued,
-#         "processing": processing,
-#         "total": len(items),
-#     }
-
-
-# def _update_job_counts(job: Dict[str, Any]) -> None:
-#     job.update(_calc_counts(job["items"]))
-
-
-# def _own_job_or_404(job_id: str, user_id: int) -> Dict[str, Any]:
-#     job = JOBS.get(job_id)
-#     if not job or job["user_id"] != user_id:
-#         raise HTTPException(status_code=404, detail="Job not found")
-#     return job
-
-
-# # =================================================================================================
-# # Processing
-# # =================================================================================================
-
-# async def _process_item(
-#     item: Dict[str, Any],
-#     fmt: str,
-#     width: int,
-#     height: int,
-#     full_page: bool,
-#     quality: Optional[int],  # kept for future use
-#     user: User,
-#     db: Session,
-# ) -> Dict[str, Any]:
-#     url = item["url"]
-#     started = time.time()
-
-#     try:
-#         item["status"] = "processing"
-#         item["message"] = "Capturing screenshot..."
-
-#         # NOTE:
-#         # Your screenshot_service.capture_screenshot() currently appears not to accept quality=
-#         result = await screenshot_service.capture_screenshot(
-#             url=url,
-#             width=width,
-#             height=height,
-#             format=fmt,
-#             full_page=full_page,
-#         )
-
-#         screenshot_path = result.get("screenshot_path") if result else None
-#         if not screenshot_path:
-#             raise Exception("Screenshot capture failed")
-
-#         path_obj = Path(screenshot_path)
-#         if not path_obj.exists():
-#             raise Exception("Screenshot file not found")
-
-#         file_size = path_obj.stat().st_size
-#         processing_time_s = round(time.time() - started, 2)
-#         processing_time_ms = round(processing_time_s * 1000, 2)
-#         screenshot_url = f"/screenshots/{path_obj.name}"
-
-#         item["status"] = "completed"
-#         item["message"] = "Screenshot captured successfully"
-#         item["screenshot_url"] = screenshot_url
-#         item["file_size"] = file_size
-#         item["processing_time"] = processing_time_s
-#         item["completed_at"] = datetime.utcnow().isoformat()
-
-#         try:
-#             db.add(
-#                 Screenshot(
-#                     user_id=user.id,
-#                     url=url,
-#                     storage_url=screenshot_url,
-#                     format=fmt,
-#                     width=width,
-#                     height=height,
-#                     full_page=full_page,
-#                     size_bytes=file_size,
-#                     processing_time_ms=processing_time_ms,
-#                     status="completed",
-#                     created_at=datetime.utcnow(),
-#                 )
-#             )
-#             db.commit()
-#             log.info("💾 Saved batch screenshot to DB: user=%s url=%s", user.id, url)
-#         except Exception as save_err:
-#             db.rollback()
-#             log.warning("Failed to save screenshot record: %s", save_err)
-
-#         log.info("✅ Batch item %s completed: %s", item["idx"], url)
-
-#     except Exception as exc:
-#         processing_time_s = round(time.time() - started, 2)
-#         item["status"] = "failed"
-#         item["message"] = str(exc)
-#         item["screenshot_url"] = None
-#         item["processing_time"] = processing_time_s
-#         item["failed_at"] = datetime.utcnow().isoformat()
-#         log.error("❌ Batch item %s failed: %s - %s", item["idx"], url, exc)
-
-#     return item
-
-
-# async def _process_job_async(
-#     job_id: str,
-#     user_id: int,
-#     fmt: str,
-#     width: int,
-#     height: int,
-#     full_page: bool,
-#     quality: Optional[int],
-# ) -> None:
-#     job = JOBS.get(job_id)
-#     if not job:
-#         log.warning("Job %s not found for processing", job_id)
-#         return
-
-#     db = SessionLocal()
-#     try:
-#         user = db.query(User).filter(User.id == user_id).first()
-#         if not user:
-#             log.error("User %s not found for job %s", user_id, job_id)
-#             return
-
-#         job["status"] = "processing"
-#         _update_job_counts(job)
-#         log.info("🔵 Starting batch job %s with %s URLs", job_id, job["total"])
-
-#         for item in job["items"]:
-#             if item["status"] == "queued":
-#                 await _process_item(item, fmt, width, height, full_page, quality, user, db)
-#                 _update_job_counts(job)
-#                 await asyncio.sleep(0.2)
-
-#         counts = _calc_counts(job["items"])
-#         job.update(counts)
-
-#         if counts["failed"] == 0 and counts["completed"] == counts["total"]:
-#             job["status"] = "completed"
-#         elif counts["completed"] > 0:
-#             job["status"] = "partial"
-#         else:
-#             job["status"] = "failed"
-
-#         job["completed_at"] = datetime.utcnow().isoformat()
-#         log.info(
-#             "✅ Batch job %s finished: %s/%s successful",
-#             job_id,
-#             counts["completed"],
-#             counts["total"],
-#         )
-
-#     except Exception as exc:
-#         log.exception("❌ Batch job %s crashed: %s", job_id, exc)
-#         job["status"] = "failed"
-#         job["completed_at"] = datetime.utcnow().isoformat()
-#     finally:
-#         db.close()
-
-
-# # =================================================================================================
-# # Endpoints
-# # =================================================================================================
-
-# @router.post("/submit", response_model=BatchJobOut)
-# async def submit_batch(
-#     bg: BackgroundTasks,
-#     request: BatchSubmitRequest = Body(...),
-#     current_user: User = Depends(get_current_user),
-#     db: Session = Depends(get_db),
-# ):
-#     urls = request.collect_urls()
-#     if not urls:
-#         raise HTTPException(status_code=400, detail="No valid URLs found in request")
-
-#     tier = _get_user_tier(current_user)
-#     limit = _get_batch_limit(tier)
-
-#     if limit == 0:
-#         raise HTTPException(
-#             status_code=403,
-#             detail="Batch processing is not available on the free tier. Please upgrade to Pro or higher.",
-#         )
-
-#     if len(urls) > limit:
-#         raise HTTPException(
-#             status_code=403,
-#             detail=f"Batch size ({len(urls)}) exceeds your tier limit ({limit}). Please upgrade your plan or reduce the number of URLs.",
-#         )
-
-#     job_id = uuid.uuid4().hex[:16]
-#     now = datetime.utcnow().isoformat()
-#     items = [_create_initial_item(i, url) for i, url in enumerate(urls)]
-#     counts = _calc_counts(items)
-
-#     job = {
-#         "id": job_id,
-#         "user_id": current_user.id,
-#         "created_at": now,
-#         "status": "queued",
-#         "format": request.format,
-#         "width": request.width,
-#         "height": request.height,
-#         "full_page": request.full_page,
-#         **counts,
-#         "items": items,
-#     }
-
-#     JOBS[job_id] = job
-#     log.info(
-#         "📸 Created batch job %s with %s URLs for user %s",
-#         job_id,
-#         len(urls),
-#         current_user.username,
-#     )
-
-#     bg.add_task(
-#         _process_job_async,
-#         job_id,
-#         current_user.id,
-#         request.format,
-#         request.width,
-#         request.height,
-#         request.full_page,
-#         request.quality,
-#     )
-
-#     return BatchJobOut(**{k: v for k, v in job.items() if k != "user_id"})
-
-
-# @router.post("/submit_file", response_model=BatchJobOut)
-# async def submit_batch_file(
-#     bg: BackgroundTasks,
-#     file: UploadFile = File(...),
-#     format: str = Form(default="png"),
-#     width: int = Form(default=1920),
-#     height: int = Form(default=1080),
-#     full_page: bool = Form(default=False),
-#     quality: Optional[int] = Form(default=None),
-#     current_user: User = Depends(get_current_user),
-#     db: Session = Depends(get_db),
-# ):
-#     filename = (file.filename or "").lower()
-#     if not (filename.endswith(".csv") or filename.endswith(".txt") or filename.endswith(".tsv")):
-#         raise HTTPException(
-#             status_code=400,
-#             detail="Invalid file format. Please upload a .csv, .txt, or .tsv file",
-#         )
-
-#     try:
-#         text = (await file.read()).decode("utf-8")
-#     except Exception as exc:
-#         raise HTTPException(status_code=400, detail=f"Failed to read file: {exc}")
-
-#     req = BatchSubmitRequest(
-#         csv_text=text,
-#         format=format,
-#         width=width,
-#         height=height,
-#         full_page=full_page,
-#         quality=quality,
-#     )
-
-#     urls = req.collect_urls()
-#     if not urls:
-#         raise HTTPException(status_code=400, detail="No valid URLs found in uploaded file")
-
-#     tier = _get_user_tier(current_user)
-#     limit = _get_batch_limit(tier)
-
-#     if limit == 0:
-#         raise HTTPException(
-#             status_code=403,
-#             detail="Batch processing is not available on the free tier. Please upgrade to Pro or higher.",
-#         )
-
-#     if len(urls) > limit:
-#         raise HTTPException(
-#             status_code=403,
-#             detail=f"Batch size ({len(urls)}) exceeds your tier limit ({limit}). Please upgrade your plan or reduce the number of URLs.",
-#         )
-
-#     job_id = uuid.uuid4().hex[:16]
-#     now = datetime.utcnow().isoformat()
-#     items = [_create_initial_item(i, url) for i, url in enumerate(urls)]
-#     counts = _calc_counts(items)
-
-#     job = {
-#         "id": job_id,
-#         "user_id": current_user.id,
-#         "created_at": now,
-#         "status": "queued",
-#         "format": format,
-#         "width": width,
-#         "height": height,
-#         "full_page": full_page,
-#         **counts,
-#         "items": items,
-#     }
-
-#     JOBS[job_id] = job
-#     log.info(
-#         "📸 Created batch job %s from file upload with %s URLs for user %s",
-#         job_id,
-#         len(urls),
-#         current_user.username,
-#     )
-
-#     bg.add_task(
-#         _process_job_async,
-#         job_id,
-#         current_user.id,
-#         format,
-#         width,
-#         height,
-#         full_page,
-#         quality,
-#     )
-
-#     return BatchJobOut(**{k: v for k, v in job.items() if k != "user_id"})
-
-
-# @router.get("/jobs", response_model=List[BatchJobOut])
-# async def list_jobs(current_user: User = Depends(get_current_user)):
-#     user_jobs = [job for job in JOBS.values() if job["user_id"] == current_user.id]
-#     user_jobs.sort(key=lambda j: j["created_at"], reverse=True)
-#     return [BatchJobOut(**{k: v for k, v in job.items() if k != "user_id"}) for job in user_jobs]
-
-
-# @router.get("/jobs/{job_id}", response_model=BatchJobOut)
-# async def get_job(job_id: str, current_user: User = Depends(get_current_user)):
-#     job = _own_job_or_404(job_id, current_user.id)
-#     return BatchJobOut(**{k: v for k, v in job.items() if k != "user_id"})
-
-
-# @router.post("/jobs/{job_id}/retry_failed", response_model=BatchJobOut)
-# async def retry_failed(
-#     bg: BackgroundTasks,
-#     job_id: str,
-#     current_user: User = Depends(get_current_user),
-#     db: Session = Depends(get_db),
-# ):
-#     job = _own_job_or_404(job_id, current_user.id)
-
-#     changed = False
-#     for item in job["items"]:
-#         if item["status"] == "failed":
-#             item["status"] = "queued"
-#             item["message"] = "Retrying..."
-#             item["screenshot_url"] = None
-#             changed = True
-
-#     if changed:
-#         job.update(_calc_counts(job["items"]))
-#         job["status"] = "queued"
-
-#         bg.add_task(
-#             _process_job_async,
-#             job_id,
-#             current_user.id,
-#             job["format"],
-#             job["width"],
-#             job["height"],
-#             job["full_page"],
-#             None,
-#         )
-
-#     return BatchJobOut(**{k: v for k, v in job.items() if k != "user_id"})
-
-
-# @router.delete("/jobs/{job_id}")
-# async def delete_job(job_id: str, current_user: User = Depends(get_current_user)):
-#     _own_job_or_404(job_id, current_user.id)
-#     JOBS.pop(job_id, None)
-#     log.info("🗑️ Deleted batch job %s", job_id)
-#     return {"ok": True, "deleted": job_id}
-
-# # ======================================================================
-
-# =================================================================================================
-# backend/batch.py
-# PixelPerfect Batch Screenshot Router - PRODUCTION READY
-# =================================================================================================
-# File location: C:\Users\xiggy\PIXEL-PERFECT-API\PixelPerfectAPI\backend\batch.py
-# Batch screenshot processing with full format support: PNG, JPEG, WebP, PDF
-# CSV/TXT/TSV file upload support for bulk URL processing
-# Author: OneTechly
-# Updated: March 2026
-#
-# ✅ FIX 1 (BackgroundTasks): bg: BackgroundTasks must be first param, no = Depends()
-# ✅ FIX 2 (quality kwarg): Removed quality= from capture_screenshot() — not supported
-# ✅ FIX 3 (DB field names): Screenshot record now uses correct field names so that
-#    history.py and activity.py actually display batch results:
-#      file_size      → size_bytes
-#      processing_time → processing_time_ms  (stored as milliseconds)
-#      screenshot_path → storage_url         (the /screenshots/<name> URL)
-#      + status='completed' now explicitly set
-# =================================================================================================
+# backend/routers/batch.py — PixelPerfect Screenshot API
+# UPDATED: March 2026
+#   ✅ FIX: Removed unsupported 'quality' kwarg from capture_screenshot() call
+#      — was causing TypeError on every batch item → 0/N failures
+#   ✅ FIX: Screenshot URL now resolved via get_screenshot_url(result["filename"])
+#      — old code used result["url"] which is the TARGET website URL, not the screenshot
+#   ✅ FIX: filepath key corrected to result.get("filepath") (was "screenshot_path")
+#   ✅ Per-item DB persistence with correct storage_url (R2/CDN or local /screenshots/...)
+#   ✅ Tier-based batch limits (free=0, pro=50, business=200, premium=1000)
+#   ✅ File upload support via /submit_file (CSV, TXT, TSV)
+#   ✅ Retry failed items + delete job endpoints
+#   ✅ In-memory JOBS store with async background processing
 
 from __future__ import annotations
 
@@ -581,60 +23,50 @@ from io import StringIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import (
-    APIRouter,
-    BackgroundTasks,
-    Body,
-    Depends,
-    File,
-    Form,
-    HTTPException,
-    UploadFile,
-)
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field, validator
 from sqlalchemy.orm import Session
 
 from auth_deps import get_current_user
-from models import Screenshot, User, get_db
-from screenshot_service import screenshot_service
+from models import Screenshot, SessionLocal, User, get_db
+from screenshot_service import screenshot_service, get_screenshot_url
 
 log = logging.getLogger("batch_screenshots")
+
+# IMPORTANT:
+# This router should be included in main.py with:
+# app.include_router(batch_router, prefix="/api/v1")
 router = APIRouter(prefix="/batch", tags=["batch"])
 
-# ---- Configuration ----
-SCREENSHOTS_DIR = Path(__file__).resolve().parent / "screenshots"
+SCREENSHOTS_DIR = Path(__file__).resolve().parents[1] / "screenshots"
 SCREENSHOTS_DIR.mkdir(exist_ok=True)
 
-# Tier limits for batch processing
 TIER_BATCH_LIMITS = {
-    "free": 0,        # No batch processing on free tier
-    "pro": 50,        # Up to 50 URLs per batch
-    "business": 200,  # Up to 200 URLs per batch
-    "premium": 1000,  # Up to 1000 URLs per batch
+    "free": 0,
+    "pro": 50,
+    "business": 200,
+    "premium": 1000,
 }
 
-# ---- In-memory job store ----
 JOBS: Dict[str, Dict[str, Any]] = {}
-
-# ---- Pydantic models ----
 VALID_FORMATS = {"png", "jpeg", "jpg", "webp", "pdf"}
 
 
 class BatchSubmitRequest(BaseModel):
-    urls: Optional[List[str]] = Field(default=None, description="List of URLs to screenshot")
-    csv_text: Optional[str] = Field(default=None, description="CSV/TXT/TSV format URLs")
-    format: str = Field(default="png", description="Output format: png, jpeg, webp, pdf")
-    width: int = Field(default=1920, ge=320, le=7680, description="Viewport width")
-    height: int = Field(default=1080, ge=240, le=4320, description="Viewport height")
-    full_page: bool = Field(default=False, description="Capture full page (scrolling)")
-    quality: Optional[int] = Field(default=None, ge=1, le=100, description="Quality for JPEG/WebP (1-100)")
+    urls: Optional[List[str]] = Field(default=None)
+    csv_text: Optional[str] = Field(default=None)
+    format: str = Field(default="png")
+    width: int = Field(default=1920, ge=320, le=7680)
+    height: int = Field(default=1080, ge=240, le=4320)
+    full_page: bool = Field(default=False)
+    quality: Optional[int] = Field(default=None, ge=1, le=100)
 
     @validator("format")
     def validate_format(cls, v: str) -> str:
-        vv = (v or "").strip().lower()
-        if vv not in VALID_FORMATS:
+        value = (v or "").strip().lower()
+        if value not in VALID_FORMATS:
             raise ValueError(f"format must be one of {sorted(VALID_FORMATS)}")
-        return vv
+        return value
 
     def collect_urls(self) -> List[str]:
         raw_urls: List[str] = []
@@ -653,17 +85,15 @@ class BatchSubmitRequest(BaseModel):
                 for row in reader:
                     raw_urls.extend([cell.strip() for cell in row if cell.strip()])
             else:
-                lines = text.split("\n")
-                raw_urls.extend([line.strip() for line in lines if line.strip()])
+                raw_urls.extend([line.strip() for line in text.splitlines() if line.strip()])
 
         seen = set()
         urls: List[str] = []
         for url in raw_urls:
             u = (url or "").strip()
-            if u and (u.startswith("http://") or u.startswith("https://")):
-                if u not in seen:
-                    seen.add(u)
-                    urls.append(u)
+            if u and (u.startswith("http://") or u.startswith("https://")) and u not in seen:
+                seen.add(u)
+                urls.append(u)
 
         return urls
 
@@ -691,10 +121,8 @@ class BatchJobOut(BaseModel):
     items: List[BatchItemOut]
 
 
-# ---- Helper functions ----
-
 def _get_user_tier(user: User) -> str:
-    return getattr(user, "subscription_tier", "free") or "free"
+    return (getattr(user, "subscription_tier", "free") or "free").lower()
 
 
 def _get_batch_limit(tier: str) -> int:
@@ -714,97 +142,10 @@ def _create_initial_item(idx: int, url: str) -> Dict[str, Any]:
     }
 
 
-async def _process_item(
-    item: Dict[str, Any],
-    format: str,
-    width: int,
-    height: int,
-    full_page: bool,
-    quality: Optional[int],   # kept in signature for future use
-    user: User,
-    db: Session,
-) -> Dict[str, Any]:
-    """Process a single screenshot in the batch."""
-    url = item["url"]
-    start_time = time.time()
-
-    try:
-        item["status"] = "processing"
-        item["message"] = "Capturing screenshot..."
-
-        # ✅ FIX 2: quality is NOT passed — ScreenshotService.capture_screenshot()
-        #    does not accept that keyword. Passing it caused every item to fail with
-        #    "got an unexpected keyword argument 'quality'".
-        result = await screenshot_service.capture_screenshot(
-            url=url,
-            width=width,
-            height=height,
-            format=format,
-            full_page=full_page,
-        )
-
-        if not result or not result.get("screenshot_path"):
-            raise Exception("Screenshot capture failed")
-
-        screenshot_path = Path(result["screenshot_path"])
-        if not screenshot_path.exists():
-            raise Exception("Screenshot file not found")
-
-        file_size = screenshot_path.stat().st_size
-        processing_time_s = time.time() - start_time
-        processing_time_ms = round(processing_time_s * 1000, 2)
-        screenshot_url = f"/screenshots/{screenshot_path.name}"
-
-        item["status"] = "completed"
-        item["message"] = "Screenshot captured successfully"
-        item["screenshot_url"] = screenshot_url
-        item["file_size"] = file_size
-        item["processing_time"] = round(processing_time_s, 2)
-        item["completed_at"] = datetime.utcnow().isoformat()
-
-        # ✅ FIX 3: Use correct field names that history.py / activity.py read.
-        #    Old (broken):  file_size=, processing_time=, screenshot_path=, no status
-        #    New (correct): size_bytes=, processing_time_ms=, storage_url=, status=
-        try:
-            screenshot_record = Screenshot(
-                user_id=user.id,
-                url=url,
-                storage_url=screenshot_url,          # history.py reads s.storage_url
-                format=format,
-                width=width,
-                height=height,
-                full_page=full_page,
-                size_bytes=file_size,                 # history.py reads s.size_bytes
-                processing_time_ms=processing_time_ms,# history.py reads s.processing_time_ms
-                status="completed",                   # history.py reads s.status
-                created_at=datetime.utcnow(),
-            )
-            db.add(screenshot_record)
-            db.commit()
-            log.info(f"💾 Saved batch screenshot to DB: user={user.id} url={url}")
-        except Exception as e:
-            log.warning(f"Failed to save screenshot record to DB: {e}")
-            db.rollback()
-
-        log.info(f"✅ Batch item {item['idx']} completed: {url} in {processing_time_s:.2f}s")
-
-    except Exception as e:
-        processing_time_s = time.time() - start_time
-        log.error(f"❌ Batch item {item['idx']} failed: {url} - {e}")
-
-        item["status"] = "failed"
-        item["message"] = str(e)
-        item["screenshot_url"] = None
-        item["processing_time"] = round(processing_time_s, 2)
-        item["failed_at"] = datetime.utcnow().isoformat()
-
-    return item
-
-
 def _calc_counts(items: List[Dict[str, Any]]) -> Dict[str, int]:
-    completed  = sum(1 for it in items if it["status"] == "completed")
-    failed     = sum(1 for it in items if it["status"] == "failed")
-    queued     = sum(1 for it in items if it["status"] == "queued")
+    completed = sum(1 for it in items if it["status"] == "completed")
+    failed = sum(1 for it in items if it["status"] == "failed")
+    queued = sum(1 for it in items if it["status"] == "queued")
     processing = sum(1 for it in items if it["status"] == "processing")
     return {
         "completed": completed,
@@ -819,36 +160,149 @@ def _update_job_counts(job: Dict[str, Any]) -> None:
     job.update(_calc_counts(job["items"]))
 
 
+def _resolve_screenshot_url(result: Dict[str, Any], path_obj: Path) -> str:
+    """
+    ✅ FIX: Resolve the best available URL from the screenshot_service result.
+    Priority: R2/CDN storage URL > explicit screenshot_url > fallback local path.
+    This ensures batch screenshots are accessible externally (not just localhost).
+    """
+    if not result:
+        return f"/screenshots/{path_obj.name}"
+
+    # Try every field name screenshot_service might return for the public URL
+    for key in ("storage_url", "screenshot_url", "file_url", "public_url", "url"):
+        candidate = result.get(key)
+        if candidate and isinstance(candidate, str) and candidate.startswith("http"):
+            return candidate
+
+    # ✅ If the service returned a relative path, use it (History.js will prefix API base)
+    for key in ("storage_url", "screenshot_url", "file_url"):
+        candidate = result.get(key)
+        if candidate and isinstance(candidate, str):
+            return candidate
+
+    # Final fallback: construct a relative path from the local file
+    return f"/screenshots/{path_obj.name}"
+
+
+async def _process_item(
+    item: Dict[str, Any],
+    fmt: str,
+    width: int,
+    height: int,
+    full_page: bool,
+    quality: Optional[int],
+    user: User,
+    db: Session,
+) -> Dict[str, Any]:
+    url = item["url"]
+    started = time.time()
+
+    try:
+        item["status"] = "processing"
+        item["message"] = "Capturing screenshot..."
+
+        # ✅ FIX: capture_screenshot() does NOT accept 'quality' — causes TypeError
+        result = await screenshot_service.capture_screenshot(
+            url=url,
+            width=width,
+            height=height,
+            format=fmt,
+            full_page=full_page,
+        )
+
+        if not result:
+            raise Exception("Screenshot capture failed — no result returned")
+
+        # ✅ FIX: get_screenshot_url(filename) — result["url"] is the TARGET website
+        #    URL (e.g. https://example.com), not the screenshot path.
+        screenshot_url = get_screenshot_url(result["filename"])
+
+        # ✅ FIX: correct key is "file_size" and "filepath" (not screenshot_path/size_bytes)
+        file_size: Optional[int] = result.get("file_size")
+        screenshot_path = result.get("filepath")
+
+        if not file_size and screenshot_path:
+            path_obj = Path(screenshot_path)
+            if path_obj.exists():
+                file_size = path_obj.stat().st_size
+
+        processing_time = round(time.time() - started, 2)
+
+        item["status"] = "completed"
+        item["message"] = "Screenshot captured successfully"
+        item["screenshot_url"] = screenshot_url
+        item["file_size"] = file_size
+        item["processing_time"] = processing_time
+        item["completed_at"] = datetime.utcnow().isoformat()
+
+        # ✅ FIX: Persist to DB with the correct storage_url (R2/CDN URL)
+        try:
+            db_record = Screenshot(
+                user_id=user.id,
+                url=url,
+                screenshot_path=str(screenshot_path or ""),
+                # ✅ storage_url = the public-accessible URL (R2 or relative)
+                storage_url=screenshot_url,
+                format=fmt,
+                width=width,
+                height=height,
+                full_page=full_page,
+                size_bytes=file_size,
+                processing_time_ms=processing_time * 1000,
+                status="completed",
+                created_at=datetime.utcnow(),
+            )
+            db.add(db_record)
+            db.commit()
+            log.info("💾 Saved batch screenshot record: id=%s url=%s", db_record.id, screenshot_url)
+        except Exception as save_err:
+            db.rollback()
+            log.warning("⚠️ Failed to save batch screenshot record: %s", save_err)
+
+        log.info("✅ Batch item %s completed: %s → %s", item["idx"], url, screenshot_url)
+
+    except Exception as exc:
+        processing_time = round(time.time() - started, 2)
+        item["status"] = "failed"
+        item["message"] = str(exc)
+        item["screenshot_url"] = None
+        item["processing_time"] = processing_time
+        item["failed_at"] = datetime.utcnow().isoformat()
+        log.error("❌ Batch item %s failed: %s — %s", item["idx"], url, exc)
+
+    return item
+
+
 async def _process_job_async(
     job_id: str,
     user_id: int,
-    format: str,
+    fmt: str,
     width: int,
     height: int,
     full_page: bool,
     quality: Optional[int],
 ) -> None:
-    if job_id not in JOBS:
-        log.warning(f"Job {job_id} not found for processing")
+    job = JOBS.get(job_id)
+    if not job:
+        log.warning("Job %s not found for processing", job_id)
         return
 
-    job = JOBS[job_id]
-
-    from models import get_db as _get_db
-    with next(_get_db()) as db:
+    db = SessionLocal()
+    try:
         user = db.query(User).filter(User.id == user_id).first()
         if not user:
-            log.error(f"User {user_id} not found for job {job_id}")
+            log.error("User %s not found for job %s", user_id, job_id)
             return
 
         job["status"] = "processing"
-        log.info(f"🔵 Starting batch job {job_id} with {job['total']} URLs")
+        log.info("🔵 Starting batch job %s with %s URLs", job_id, job["total"])
 
         for item in job["items"]:
             if item["status"] == "queued":
-                await _process_item(item, format, width, height, full_page, quality, user, db)
+                await _process_item(item, fmt, width, height, full_page, quality, user, db)
                 _update_job_counts(job)
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.2)
 
         counts = _calc_counts(job["items"])
         job.update(counts)
@@ -861,37 +315,48 @@ async def _process_job_async(
             job["status"] = "failed"
 
         job["completed_at"] = datetime.utcnow().isoformat()
-        log.info(f"✅ Batch job {job_id} finished: {counts['completed']}/{counts['total']} successful")
+        log.info(
+            "✅ Batch job %s finished: %s/%s successful",
+            job_id,
+            counts["completed"],
+            counts["total"],
+        )
+    finally:
+        db.close()
 
 
 def _own_job_or_404(job_id: str, user_id: int) -> Dict[str, Any]:
     job = JOBS.get(job_id)
     if not job or job["user_id"] != user_id:
-        raise HTTPException(404, "Job not found")
+        raise HTTPException(status_code=404, detail="Job not found")
     return job
 
 
-# ---- Endpoints ----
-
 @router.post("/submit", response_model=BatchJobOut)
 async def submit_batch(
-    bg: BackgroundTasks,
     request: BatchSubmitRequest = Body(...),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
+    bg: BackgroundTasks = None,
 ):
     urls = request.collect_urls()
     if not urls:
-        raise HTTPException(400, "No valid URLs found in request")
+        raise HTTPException(status_code=400, detail="No valid URLs found in request")
 
     tier = _get_user_tier(current_user)
     limit = _get_batch_limit(tier)
 
     if limit == 0:
-        raise HTTPException(403, "Batch processing is not available on the free tier. Please upgrade to Pro or higher.")
+        raise HTTPException(
+            status_code=403,
+            detail="Batch processing is not available on the free tier. Please upgrade to Pro or higher.",
+        )
 
     if len(urls) > limit:
-        raise HTTPException(403, f"Batch size ({len(urls)}) exceeds your tier limit ({limit}). Please upgrade your plan or reduce the number of URLs.")
+        raise HTTPException(
+            status_code=403,
+            detail=f"Batch size ({len(urls)}) exceeds your tier limit ({limit}). Please upgrade your plan or reduce the number of URLs.",
+        )
 
     job_id = uuid.uuid4().hex[:16]
     now = datetime.utcnow().isoformat()
@@ -912,7 +377,7 @@ async def submit_batch(
     }
 
     JOBS[job_id] = job
-    log.info(f"📸 Created batch job {job_id} with {len(urls)} URLs for user {current_user.username}")
+    log.info("📸 Created batch job %s with %s URLs for user %s", job_id, len(urls), current_user.username)
 
     bg.add_task(
         _process_job_async,
@@ -925,13 +390,11 @@ async def submit_batch(
         request.quality,
     )
 
-    public_job = {k: v for k, v in job.items() if k != "user_id"}
-    return BatchJobOut(**public_job)
+    return BatchJobOut(**{k: v for k, v in job.items() if k != "user_id"})
 
 
 @router.post("/submit_file", response_model=BatchJobOut)
 async def submit_batch_file(
-    bg: BackgroundTasks,
     file: UploadFile = File(...),
     format: str = Form(default="png"),
     width: int = Form(default=1920),
@@ -940,30 +403,47 @@ async def submit_batch_file(
     quality: Optional[int] = Form(default=None),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
+    bg: BackgroundTasks = None,
 ):
     filename = (file.filename or "").lower()
     if not (filename.endswith(".csv") or filename.endswith(".txt") or filename.endswith(".tsv")):
-        raise HTTPException(400, "Invalid file format. Please upload a .csv, .txt, or .tsv file")
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid file format. Please upload a .csv, .txt, or .tsv file",
+        )
 
     try:
-        content = await file.read()
-        text = content.decode("utf-8")
-    except Exception as e:
-        raise HTTPException(400, f"Failed to read file: {str(e)}")
+        text = (await file.read()).decode("utf-8")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Failed to read file: {exc}")
 
-    req = BatchSubmitRequest(csv_text=text, format=format, width=width, height=height, full_page=full_page, quality=quality)
+    req = BatchSubmitRequest(
+        csv_text=text,
+        format=format,
+        width=width,
+        height=height,
+        full_page=full_page,
+        quality=quality,
+    )
+
     urls = req.collect_urls()
     if not urls:
-        raise HTTPException(400, "No valid URLs found in uploaded file")
+        raise HTTPException(status_code=400, detail="No valid URLs found in uploaded file")
 
     tier = _get_user_tier(current_user)
     limit = _get_batch_limit(tier)
 
     if limit == 0:
-        raise HTTPException(403, "Batch processing is not available on the free tier. Please upgrade to Pro or higher.")
+        raise HTTPException(
+            status_code=403,
+            detail="Batch processing is not available on the free tier. Please upgrade to Pro or higher.",
+        )
 
     if len(urls) > limit:
-        raise HTTPException(403, f"Batch size ({len(urls)}) exceeds your tier limit ({limit}). Please upgrade your plan or reduce the number of URLs.")
+        raise HTTPException(
+            status_code=403,
+            detail=f"Batch size ({len(urls)}) exceeds your tier limit ({limit}). Please upgrade your plan or reduce the number of URLs.",
+        )
 
     job_id = uuid.uuid4().hex[:16]
     now = datetime.utcnow().isoformat()
@@ -984,7 +464,10 @@ async def submit_batch_file(
     }
 
     JOBS[job_id] = job
-    log.info(f"📸 Created batch job {job_id} from file upload with {len(urls)} URLs for user {current_user.username}")
+    log.info(
+        "📸 Created batch job %s from file upload with %s URLs for user %s",
+        job_id, len(urls), current_user.username,
+    )
 
     bg.add_task(
         _process_job_async,
@@ -997,31 +480,28 @@ async def submit_batch_file(
         quality,
     )
 
-    public_job = {k: v for k, v in job.items() if k != "user_id"}
-    return BatchJobOut(**public_job)
+    return BatchJobOut(**{k: v for k, v in job.items() if k != "user_id"})
 
 
 @router.get("/jobs", response_model=List[BatchJobOut])
 async def list_jobs(current_user: User = Depends(get_current_user)):
     user_jobs = [job for job in JOBS.values() if job["user_id"] == current_user.id]
     user_jobs.sort(key=lambda j: j["created_at"], reverse=True)
-    public_jobs = [{k: v for k, v in job.items() if k != "user_id"} for job in user_jobs]
-    return [BatchJobOut(**job) for job in public_jobs]
+    return [BatchJobOut(**{k: v for k, v in job.items() if k != "user_id"}) for job in user_jobs]
 
 
 @router.get("/jobs/{job_id}", response_model=BatchJobOut)
 async def get_job(job_id: str, current_user: User = Depends(get_current_user)):
     job = _own_job_or_404(job_id, current_user.id)
-    public_job = {k: v for k, v in job.items() if k != "user_id"}
-    return BatchJobOut(**public_job)
+    return BatchJobOut(**{k: v for k, v in job.items() if k != "user_id"})
 
 
 @router.post("/jobs/{job_id}/retry_failed", response_model=BatchJobOut)
 async def retry_failed(
-    bg: BackgroundTasks,
     job_id: str,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
+    bg: BackgroundTasks = None,
 ):
     job = _own_job_or_404(job_id, current_user.id)
 
@@ -1036,7 +516,7 @@ async def retry_failed(
     if changed:
         job.update(_calc_counts(job["items"]))
         job["status"] = "queued"
-        log.info(f"🔄 Retrying failed items in batch job {job_id}")
+
         bg.add_task(
             _process_job_async,
             job_id,
@@ -1048,592 +528,16 @@ async def retry_failed(
             None,
         )
 
-    public_job = {k: v for k, v in job.items() if k != "user_id"}
-    return BatchJobOut(**public_job)
+    return BatchJobOut(**{k: v for k, v in job.items() if k != "user_id"})
 
 
 @router.delete("/jobs/{job_id}")
 async def delete_job(job_id: str, current_user: User = Depends(get_current_user)):
     _own_job_or_404(job_id, current_user.id)
     JOBS.pop(job_id, None)
-    log.info(f"🗑️ Deleted batch job {job_id}")
     return {"ok": True, "deleted": job_id}
 
-
-# ============= End Batch Screenshot Router =============
-
-# # ====================================================================================
-
-# # =================================================================================================
-# # backend/routers/batch.py
-# # PixelPerfect Batch Screenshot Router - PRODUCTION READY
-# # =================================================================================================
-# # Batch screenshot processing with full format support: PNG, JPEG, WebP, PDF
-# # CSV/TXT/TSV file upload support for bulk URL processing
-# # Author: OneTechly
-# # Updated: March 2026
-# #
-# # ✅ FIX APPLIED (March 2026):
-# # - bg: BackgroundTasks must be declared WITHOUT a default (no = Depends()).
-# #   FastAPI injects it automatically when it sees the type.
-# # - It must also come BEFORE any defaulted parameters in the signature.
-# #   Python syntax rule: non-default params cannot follow defaulted params.
-# #   The correct pattern is: bg: BackgroundTasks as the FIRST parameter.
-# # =================================================================================================
-
-# from __future__ import annotations
-
-# import asyncio
-# import csv
-# import logging
-# import time
-# import uuid
-# from datetime import datetime
-# from io import StringIO
-# from pathlib import Path
-# from typing import Any, Dict, List, Optional
-
-# from fastapi import (
-#     APIRouter,
-#     BackgroundTasks,
-#     Body,
-#     Depends,
-#     File,
-#     Form,
-#     HTTPException,
-#     UploadFile,
-# )
-# from pydantic import BaseModel, Field, validator
-# from sqlalchemy.orm import Session
-
-# from auth_deps import get_current_user
-# from models import Screenshot, User, get_db
-# from screenshot_service import screenshot_service
-
-# log = logging.getLogger("batch_screenshots")
-# #router = APIRouter(prefix="/api/v1/batch", tags=["batch"])
-# router = APIRouter(prefix="/batch", tags=["batch"])
-
-# # ---- Configuration ----
-# SCREENSHOTS_DIR = Path(__file__).resolve().parents[1] / "screenshots"
-# SCREENSHOTS_DIR.mkdir(exist_ok=True)
-
-# # Tier limits for batch processing
-# TIER_BATCH_LIMITS = {
-#     "free": 0,        # No batch processing on free tier
-#     "pro": 50,        # Up to 50 URLs per batch
-#     "business": 200,  # Up to 200 URLs per batch
-#     "premium": 1000,  # Up to 1000 URLs per batch
-# }
-
-# # ---- In-memory job store ----
-# JOBS: Dict[str, Dict[str, Any]] = {}
-
-# # ---- Pydantic models ----
-# VALID_FORMATS = {"png", "jpeg", "jpg", "webp", "pdf"}
-
-
-# class BatchSubmitRequest(BaseModel):
-#     """
-#     Batch screenshot submission request.
-#     Supports either direct URL list or CSV text.
-#     """
-#     urls: Optional[List[str]] = Field(default=None, description="List of URLs to screenshot")
-#     csv_text: Optional[str] = Field(default=None, description="CSV/TXT/TSV format URLs")
-#     format: str = Field(default="png", description="Output format: png, jpeg, webp, pdf")
-#     width: int = Field(default=1920, ge=320, le=7680, description="Viewport width")
-#     height: int = Field(default=1080, ge=240, le=4320, description="Viewport height")
-#     full_page: bool = Field(default=False, description="Capture full page (scrolling)")
-#     quality: Optional[int] = Field(default=None, ge=1, le=100, description="Quality for JPEG/WebP (1-100)")
-
-#     @validator("format")
-#     def validate_format(cls, v: str) -> str:
-#         vv = (v or "").strip().lower()
-#         if vv not in VALID_FORMATS:
-#             raise ValueError(f"format must be one of {sorted(VALID_FORMATS)}")
-#         return vv
-
-#     def collect_urls(self) -> List[str]:
-#         """Extract and deduplicate URLs from urls list or csv_text."""
-#         raw_urls: List[str] = []
-
-#         # Collect from direct URL list
-#         if self.urls:
-#             raw_urls.extend(self.urls)
-
-#         # Collect from CSV text (supports CSV, TSV, or newline-separated)
-#         if self.csv_text:
-#             text = self.csv_text.strip()
-
-#             if "," in text:
-#                 reader = csv.reader(StringIO(text))
-#                 for row in reader:
-#                     raw_urls.extend([cell.strip() for cell in row if cell.strip()])
-#             elif "\t" in text:
-#                 reader = csv.reader(StringIO(text), delimiter="\t")
-#                 for row in reader:
-#                     raw_urls.extend([cell.strip() for cell in row if cell.strip()])
-#             else:
-#                 lines = text.split("\n")
-#                 raw_urls.extend([line.strip() for line in lines if line.strip()])
-
-#         # Deduplicate while preserving order
-#         seen = set()
-#         urls: List[str] = []
-#         for url in raw_urls:
-#             u = (url or "").strip()
-#             if u and (u.startswith("http://") or u.startswith("https://")):
-#                 if u not in seen:
-#                     seen.add(u)
-#                     urls.append(u)
-
-#         return urls
-
-
-# class BatchItemOut(BaseModel):
-#     """Individual item in a batch job."""
-#     idx: int
-#     url: str
-#     status: str  # queued, processing, completed, failed
-#     message: Optional[str] = None
-#     screenshot_url: Optional[str] = None
-#     file_size: Optional[int] = None
-#     processing_time: Optional[float] = None
-
-
-# class BatchJobOut(BaseModel):
-#     """Batch job response."""
-#     id: str
-#     created_at: str
-#     status: str  # queued, processing, completed, partial, failed
-#     format: str
-#     total: int
-#     completed: int
-#     failed: int
-#     queued: int
-#     processing: int
-#     items: List[BatchItemOut]
-
-
-# # ---- Helper functions ----
-
-# def _get_user_tier(user: User) -> str:
-#     """Get user's subscription tier."""
-#     return getattr(user, "subscription_tier", "free") or "free"
-
-
-# def _get_batch_limit(tier: str) -> int:
-#     """Get batch processing limit for tier."""
-#     return TIER_BATCH_LIMITS.get((tier or "").lower(), 0)
-
-
-# def _create_initial_item(idx: int, url: str) -> Dict[str, Any]:
-#     """Create initial batch item with queued status."""
-#     return {
-#         "idx": idx,
-#         "url": url,
-#         "status": "queued",
-#         "message": "Waiting to process...",
-#         "screenshot_url": None,
-#         "file_size": None,
-#         "processing_time": None,
-#         "created_at": datetime.utcnow().isoformat(),
-#     }
-
-
-# async def _process_item(
-#     item: Dict[str, Any],
-#     format: str,
-#     width: int,
-#     height: int,
-#     full_page: bool,
-#     quality: Optional[int],
-#     user: User,
-#     db: Session,
-# ) -> Dict[str, Any]:
-#     """Process a single screenshot in the batch."""
-#     url = item["url"]
-#     start_time = time.time()
-
-#     try:
-#         item["status"] = "processing"
-#         item["message"] = "Capturing screenshot..."
-
-#         result = await screenshot_service.capture_screenshot(
-#             url=url,
-#             width=width,
-#             height=height,
-#             format=format,
-#             full_page=full_page,
-#             quality=quality,
-#         )
-
-#         if not result or not result.get("screenshot_path"):
-#             raise Exception("Screenshot capture failed")
-
-#         screenshot_path = Path(result["screenshot_path"])
-#         if not screenshot_path.exists():
-#             raise Exception("Screenshot file not found")
-
-#         file_size = screenshot_path.stat().st_size
-#         processing_time = time.time() - start_time
-#         screenshot_url = f"/screenshots/{screenshot_path.name}"
-
-#         item["status"] = "completed"
-#         item["message"] = "Screenshot captured successfully"
-#         item["screenshot_url"] = screenshot_url
-#         item["file_size"] = file_size
-#         item["processing_time"] = round(processing_time, 2)
-#         item["completed_at"] = datetime.utcnow().isoformat()
-
-#         # Save to DB (best-effort)
-#         try:
-#             screenshot_record = Screenshot(
-#                 user_id=user.id,
-#                 url=url,
-#                 screenshot_path=str(screenshot_path),
-#                 format=format,
-#                 width=width,
-#                 height=height,
-#                 full_page=full_page,
-#                 file_size=file_size,
-#                 processing_time=processing_time,
-#                 created_at=datetime.utcnow(),
-#             )
-#             db.add(screenshot_record)
-#             db.commit()
-#         except Exception as e:
-#             log.warning(f"Failed to save screenshot record: {e}")
-
-#         log.info(f"✅ Batch item {item['idx']} completed: {url} in {processing_time:.2f}s")
-
-#     except Exception as e:
-#         processing_time = time.time() - start_time
-#         log.error(f"❌ Batch item {item['idx']} failed: {url} - {e}")
-
-#         item["status"] = "failed"
-#         item["message"] = str(e)
-#         item["screenshot_url"] = None
-#         item["processing_time"] = round(processing_time, 2)
-#         item["failed_at"] = datetime.utcnow().isoformat()
-
-#     return item
-
-
-# def _calc_counts(items: List[Dict[str, Any]]) -> Dict[str, int]:
-#     """Calculate job status counts."""
-#     completed = sum(1 for it in items if it["status"] == "completed")
-#     failed = sum(1 for it in items if it["status"] == "failed")
-#     queued = sum(1 for it in items if it["status"] == "queued")
-#     processing = sum(1 for it in items if it["status"] == "processing")
-
-#     return {
-#         "completed": completed,
-#         "failed": failed,
-#         "queued": queued,
-#         "processing": processing,
-#         "total": len(items),
-#     }
-
-
-# def _update_job_counts(job: Dict[str, Any]) -> None:
-#     """Update job counts based on current item statuses."""
-#     job.update(_calc_counts(job["items"]))
-
-
-# async def _process_job_async(
-#     job_id: str,
-#     user_id: int,
-#     format: str,
-#     width: int,
-#     height: int,
-#     full_page: bool,
-#     quality: Optional[int],
-# ) -> None:
-#     """Process all items in a batch job asynchronously."""
-#     if job_id not in JOBS:
-#         log.warning(f"Job {job_id} not found for processing")
-#         return
-
-#     job = JOBS[job_id]
-
-#     # NOTE: This keeps your existing pattern intact.
-#     # If you ever refactor: prefer `db = next(get_db())` + try/finally close.
-#     from models import get_db as _get_db
-#     with next(_get_db()) as db:
-#         user = db.query(User).filter(User.id == user_id).first()
-#         if not user:
-#             log.error(f"User {user_id} not found for job {job_id}")
-#             return
-
-#         job["status"] = "processing"
-#         log.info(f"🔵 Starting batch job {job_id} with {job['total']} URLs")
-
-#         for item in job["items"]:
-#             if item["status"] == "queued":
-#                 await _process_item(item, format, width, height, full_page, quality, user, db)
-#                 _update_job_counts(job)
-#                 await asyncio.sleep(0.5)
-
-#         counts = _calc_counts(job["items"])
-#         job.update(counts)
-
-#         if counts["failed"] == 0:
-#             job["status"] = "completed"
-#         elif counts["completed"] > 0:
-#             job["status"] = "partial"
-#         else:
-#             job["status"] = "failed"
-
-#         job["completed_at"] = datetime.utcnow().isoformat()
-#         log.info(f"✅ Batch job {job_id} finished: {counts['completed']}/{counts['total']} successful")
-
-
-# def _own_job_or_404(job_id: str, user_id: int) -> Dict[str, Any]:
-#     """Get job or raise 404 if not found or not owned by user."""
-#     job = JOBS.get(job_id)
-#     if not job or job["user_id"] != user_id:
-#         raise HTTPException(404, "Job not found")
-#     return job
-
-
-# # ---- Endpoints ----
-
-# @router.post("/submit", response_model=BatchJobOut)
-# async def submit_batch(
-#     bg: BackgroundTasks,          # ✅ FIRST: must precede all defaulted params
-#     request: BatchSubmitRequest = Body(...),
-#     current_user: User = Depends(get_current_user),
-#     db: Session = Depends(get_db),
-# ):
-#     """
-#     Submit a batch screenshot job.
-
-#     Supports:
-#     - Direct URL list via `urls` parameter
-#     - CSV/TXT/TSV text via `csv_text` parameter
-#     - File upload via the /submit_file endpoint
-#     """
-#     urls = request.collect_urls()
-#     if not urls:
-#         raise HTTPException(400, "No valid URLs found in request")
-
-#     tier = _get_user_tier(current_user)
-#     limit = _get_batch_limit(tier)
-
-#     if limit == 0:
-#         raise HTTPException(
-#             403,
-#             "Batch processing is not available on the free tier. Please upgrade to Pro or higher.",
-#         )
-
-#     if len(urls) > limit:
-#         raise HTTPException(
-#             403,
-#             f"Batch size ({len(urls)}) exceeds your tier limit ({limit}). "
-#             f"Please upgrade your plan or reduce the number of URLs.",
-#         )
-
-#     job_id = uuid.uuid4().hex[:16]
-#     now = datetime.utcnow().isoformat()
-
-#     items = [_create_initial_item(i, url) for i, url in enumerate(urls)]
-#     counts = _calc_counts(items)
-
-#     job = {
-#         "id": job_id,
-#         "user_id": current_user.id,
-#         "created_at": now,
-#         "status": "queued",
-#         "format": request.format,
-#         "width": request.width,
-#         "height": request.height,
-#         "full_page": request.full_page,
-#         **counts,
-#         "items": items,
-#     }
-
-#     JOBS[job_id] = job
-#     log.info(f"📸 Created batch job {job_id} with {len(urls)} URLs for user {current_user.username}")
-
-#     bg.add_task(
-#         _process_job_async,
-#         job_id,
-#         current_user.id,
-#         request.format,
-#         request.width,
-#         request.height,
-#         request.full_page,
-#         request.quality,
-#     )
-
-#     public_job = {k: v for k, v in job.items() if k != "user_id"}
-#     return BatchJobOut(**public_job)
-
-
-# @router.post("/submit_file", response_model=BatchJobOut)
-# async def submit_batch_file(
-#     bg: BackgroundTasks,          # ✅ FIRST: must precede all defaulted params
-#     file: UploadFile = File(...),
-#     format: str = Form(default="png"),
-#     width: int = Form(default=1920),
-#     height: int = Form(default=1080),
-#     full_page: bool = Form(default=False),
-#     quality: Optional[int] = Form(default=None),
-#     current_user: User = Depends(get_current_user),
-#     db: Session = Depends(get_db),
-# ):
-#     """
-#     Submit a batch screenshot job via file upload.
-
-#     Accepts CSV, TXT, or TSV files containing URLs.
-#     The file will be automatically parsed to detect the format.
-#     """
-#     filename = (file.filename or "").lower()
-#     if not (filename.endswith(".csv") or filename.endswith(".txt") or filename.endswith(".tsv")):
-#         raise HTTPException(400, "Invalid file format. Please upload a .csv, .txt, or .tsv file")
-
-#     try:
-#         content = await file.read()
-#         text = content.decode("utf-8")
-#     except Exception as e:
-#         raise HTTPException(400, f"Failed to read file: {str(e)}")
-
-#     req = BatchSubmitRequest(
-#         csv_text=text,
-#         format=format,
-#         width=width,
-#         height=height,
-#         full_page=full_page,
-#         quality=quality,
-#     )
-
-#     urls = req.collect_urls()
-#     if not urls:
-#         raise HTTPException(400, "No valid URLs found in uploaded file")
-
-#     tier = _get_user_tier(current_user)
-#     limit = _get_batch_limit(tier)
-
-#     if limit == 0:
-#         raise HTTPException(
-#             403,
-#             "Batch processing is not available on the free tier. Please upgrade to Pro or higher.",
-#         )
-
-#     if len(urls) > limit:
-#         raise HTTPException(
-#             403,
-#             f"Batch size ({len(urls)}) exceeds your tier limit ({limit}). "
-#             f"Please upgrade your plan or reduce the number of URLs.",
-#         )
-
-#     job_id = uuid.uuid4().hex[:16]
-#     now = datetime.utcnow().isoformat()
-
-#     items = [_create_initial_item(i, url) for i, url in enumerate(urls)]
-#     counts = _calc_counts(items)
-
-#     job = {
-#         "id": job_id,
-#         "user_id": current_user.id,
-#         "created_at": now,
-#         "status": "queued",
-#         "format": format,
-#         "width": width,
-#         "height": height,
-#         "full_page": full_page,
-#         **counts,
-#         "items": items,
-#     }
-
-#     JOBS[job_id] = job
-#     log.info(f"📸 Created batch job {job_id} from file upload with {len(urls)} URLs for user {current_user.username}")
-
-#     bg.add_task(
-#         _process_job_async,
-#         job_id,
-#         current_user.id,
-#         format,
-#         width,
-#         height,
-#         full_page,
-#         quality,
-#     )
-
-#     public_job = {k: v for k, v in job.items() if k != "user_id"}
-#     return BatchJobOut(**public_job)
-
-
-# @router.get("/jobs", response_model=List[BatchJobOut])
-# async def list_jobs(current_user: User = Depends(get_current_user)):
-#     """List all batch jobs for the current user."""
-#     user_jobs = [job for job in JOBS.values() if job["user_id"] == current_user.id]
-#     user_jobs.sort(key=lambda j: j["created_at"], reverse=True)
-
-#     public_jobs = [{k: v for k, v in job.items() if k != "user_id"} for job in user_jobs]
-#     return [BatchJobOut(**job) for job in public_jobs]
-
-
-# @router.get("/jobs/{job_id}", response_model=BatchJobOut)
-# async def get_job(job_id: str, current_user: User = Depends(get_current_user)):
-#     """Get details for a specific batch job."""
-#     job = _own_job_or_404(job_id, current_user.id)
-#     public_job = {k: v for k, v in job.items() if k != "user_id"}
-#     return BatchJobOut(**public_job)
-
-
-# @router.post("/jobs/{job_id}/retry_failed", response_model=BatchJobOut)
-# async def retry_failed(
-#     bg: BackgroundTasks,          # ✅ FIRST: must precede all defaulted params
-#     job_id: str,
-#     current_user: User = Depends(get_current_user),
-#     db: Session = Depends(get_db),
-# ):
-#     """Retry all failed screenshots in a batch job."""
-#     job = _own_job_or_404(job_id, current_user.id)
-
-#     changed = False
-#     for item in job["items"]:
-#         if item["status"] == "failed":
-#             item["status"] = "queued"
-#             item["message"] = "Retrying..."
-#             item["screenshot_url"] = None
-#             changed = True
-
-#     if changed:
-#         job.update(_calc_counts(job["items"]))
-#         job["status"] = "queued"
-
-#         log.info(f"🔄 Retrying failed items in batch job {job_id}")
-
-#         bg.add_task(
-#             _process_job_async,
-#             job_id,
-#             current_user.id,
-#             job["format"],
-#             job["width"],
-#             job["height"],
-#             job["full_page"],
-#             None,  # quality
-#         )
-
-#     public_job = {k: v for k, v in job.items() if k != "user_id"}
-#     return BatchJobOut(**public_job)
-
-
-# @router.delete("/jobs/{job_id}")
-# async def delete_job(job_id: str, current_user: User = Depends(get_current_user)):
-#     """Delete a batch job."""
-#     _own_job_or_404(job_id, current_user.id)
-#     JOBS.pop(job_id, None)
-#     log.info(f"🗑️ Deleted batch job {job_id}")
-#     return {"ok": True, "deleted": job_id}
-
-
-# # ============= End Batch Screenshot Router =============
-
-## ////////////////////////////////////////////////////////////////////////////////////////
+########## ========================================================
 
 # from __future__ import annotations
 
@@ -1653,7 +557,7 @@ async def delete_job(job_id: str, current_user: User = Depends(get_current_user)
 
 # from auth_deps import get_current_user
 # from models import Screenshot, SessionLocal, User, get_db
-# from screenshot_service import screenshot_service
+# from screenshot_service import screenshot_service, get_screenshot_url
 
 # log = logging.getLogger("batch_screenshots")
 
@@ -1784,6 +688,31 @@ async def delete_job(job_id: str, current_user: User = Depends(get_current_user)
 #     job.update(_calc_counts(job["items"]))
 
 
+# def _resolve_screenshot_url(result: Dict[str, Any], path_obj: Path) -> str:
+#     """
+#     ✅ FIX: Resolve the best available URL from the screenshot_service result.
+#     Priority: R2/CDN storage URL > explicit screenshot_url > fallback local path.
+#     This ensures batch screenshots are accessible externally (not just localhost).
+#     """
+#     if not result:
+#         return f"/screenshots/{path_obj.name}"
+
+#     # Try every field name screenshot_service might return for the public URL
+#     for key in ("storage_url", "screenshot_url", "file_url", "public_url", "url"):
+#         candidate = result.get(key)
+#         if candidate and isinstance(candidate, str) and candidate.startswith("http"):
+#             return candidate
+
+#     # ✅ If the service returned a relative path, use it (History.js will prefix API base)
+#     for key in ("storage_url", "screenshot_url", "file_url"):
+#         candidate = result.get(key)
+#         if candidate and isinstance(candidate, str):
+#             return candidate
+
+#     # Final fallback: construct a relative path from the local file
+#     return f"/screenshots/{path_obj.name}"
+
+
 # async def _process_item(
 #     item: Dict[str, Any],
 #     fmt: str,
@@ -1801,26 +730,32 @@ async def delete_job(job_id: str, current_user: User = Depends(get_current_user)
 #         item["status"] = "processing"
 #         item["message"] = "Capturing screenshot..."
 
+#         # ✅ FIX: capture_screenshot() does NOT accept 'quality' — causes TypeError
 #         result = await screenshot_service.capture_screenshot(
 #             url=url,
 #             width=width,
 #             height=height,
 #             format=fmt,
 #             full_page=full_page,
-#             quality=quality,
 #         )
 
-#         screenshot_path = result.get("screenshot_path") if result else None
-#         if not screenshot_path:
-#             raise Exception("Screenshot capture failed")
+#         if not result:
+#             raise Exception("Screenshot capture failed — no result returned")
 
-#         path_obj = Path(screenshot_path)
-#         if not path_obj.exists():
-#             raise Exception("Screenshot file not found")
+#         # ✅ FIX: get_screenshot_url(filename) — result["url"] is the TARGET website
+#         #    URL (e.g. https://example.com), not the screenshot path.
+#         screenshot_url = get_screenshot_url(result["filename"])
 
-#         file_size = path_obj.stat().st_size
+#         # ✅ FIX: correct key is "file_size" and "filepath" (not screenshot_path/size_bytes)
+#         file_size: Optional[int] = result.get("file_size")
+#         screenshot_path = result.get("filepath")
+
+#         if not file_size and screenshot_path:
+#             path_obj = Path(screenshot_path)
+#             if path_obj.exists():
+#                 file_size = path_obj.stat().st_size
+
 #         processing_time = round(time.time() - started, 2)
-#         screenshot_url = f"/screenshots/{path_obj.name}"
 
 #         item["status"] = "completed"
 #         item["message"] = "Screenshot captured successfully"
@@ -1829,29 +764,31 @@ async def delete_job(job_id: str, current_user: User = Depends(get_current_user)
 #         item["processing_time"] = processing_time
 #         item["completed_at"] = datetime.utcnow().isoformat()
 
+#         # ✅ FIX: Persist to DB with the correct storage_url (R2/CDN URL)
 #         try:
-#             db.add(
-#                 Screenshot(
-#                     user_id=user.id,
-#                     url=url,
-#                     screenshot_path=str(path_obj),
-#                     storage_url=screenshot_url,
-#                     format=fmt,
-#                     width=width,
-#                     height=height,
-#                     full_page=full_page,
-#                     size_bytes=file_size,
-#                     processing_time_ms=processing_time * 1000,
-#                     status="completed",
-#                     created_at=datetime.utcnow(),
-#                 )
+#             db_record = Screenshot(
+#                 user_id=user.id,
+#                 url=url,
+#                 screenshot_path=str(screenshot_path or ""),
+#                 # ✅ storage_url = the public-accessible URL (R2 or relative)
+#                 storage_url=screenshot_url,
+#                 format=fmt,
+#                 width=width,
+#                 height=height,
+#                 full_page=full_page,
+#                 size_bytes=file_size,
+#                 processing_time_ms=processing_time * 1000,
+#                 status="completed",
+#                 created_at=datetime.utcnow(),
 #             )
+#             db.add(db_record)
 #             db.commit()
+#             log.info("💾 Saved batch screenshot record: id=%s url=%s", db_record.id, screenshot_url)
 #         except Exception as save_err:
 #             db.rollback()
-#             log.warning("Failed to save screenshot record: %s", save_err)
+#             log.warning("⚠️ Failed to save batch screenshot record: %s", save_err)
 
-#         log.info("✅ Batch item %s completed: %s", item["idx"], url)
+#         log.info("✅ Batch item %s completed: %s → %s", item["idx"], url, screenshot_url)
 
 #     except Exception as exc:
 #         processing_time = round(time.time() - started, 2)
@@ -1860,7 +797,7 @@ async def delete_job(job_id: str, current_user: User = Depends(get_current_user)
 #         item["screenshot_url"] = None
 #         item["processing_time"] = processing_time
 #         item["failed_at"] = datetime.utcnow().isoformat()
-#         log.error("❌ Batch item %s failed: %s - %s", item["idx"], url, exc)
+#         log.error("❌ Batch item %s failed: %s — %s", item["idx"], url, exc)
 
 #     return item
 
@@ -1890,10 +827,10 @@ async def delete_job(job_id: str, current_user: User = Depends(get_current_user)
 #         log.info("🔵 Starting batch job %s with %s URLs", job_id, job["total"])
 
 #         for item in job["items"]:
-#           if item["status"] == "queued":
-#               await _process_item(item, fmt, width, height, full_page, quality, user, db)
-#               _update_job_counts(job)
-#               await asyncio.sleep(0.2)
+#             if item["status"] == "queued":
+#                 await _process_item(item, fmt, width, height, full_page, quality, user, db)
+#                 _update_job_counts(job)
+#                 await asyncio.sleep(0.2)
 
 #         counts = _calc_counts(job["items"])
 #         job.update(counts)
@@ -2055,7 +992,10 @@ async def delete_job(job_id: str, current_user: User = Depends(get_current_user)
 #     }
 
 #     JOBS[job_id] = job
-#     log.info("📸 Created batch job %s from file upload with %s URLs for user %s", job_id, len(urls), current_user.username)
+#     log.info(
+#         "📸 Created batch job %s from file upload with %s URLs for user %s",
+#         job_id, len(urls), current_user.username,
+#     )
 
 #     bg.add_task(
 #         _process_job_async,
@@ -2125,23 +1065,7 @@ async def delete_job(job_id: str, current_user: User = Depends(get_current_user)
 #     JOBS.pop(job_id, None)
 #     return {"ok": True, "deleted": job_id}
 
-
-# # # ==============================================================================
-
-# # =================================================================================================
-# # backend/routers/batch.py
-# # PixelPerfect Batch Screenshot Router - PRODUCTION READY
-# # =================================================================================================
-# # Batch screenshot processing with full format support: PNG, JPEG, WebP, PDF
-# # CSV/TXT/TSV file upload support for bulk URL processing
-# # Author: OneTechly
-# # Updated: February 2026
-# #
-# # ✅ FIX APPLIED (Backend-side improvement):
-# # - BackgroundTasks is now an injected dependency (no more bg=None pattern)
-# # - Ensures bg.add_task(...) ALWAYS exists and batch jobs always kick off reliably
-# # =================================================================================================
-
+# # ======================================================================
 # from __future__ import annotations
 
 # import asyncio
@@ -2154,78 +1078,59 @@ async def delete_job(job_id: str, current_user: User = Depends(get_current_user)
 # from pathlib import Path
 # from typing import Any, Dict, List, Optional
 
-# from fastapi import (
-#     APIRouter,
-#     BackgroundTasks,
-#     Body,
-#     Depends,
-#     File,
-#     Form,
-#     HTTPException,
-#     UploadFile,
-# )
+# from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, Form, HTTPException, UploadFile
 # from pydantic import BaseModel, Field, validator
 # from sqlalchemy.orm import Session
 
 # from auth_deps import get_current_user
-# from models import Screenshot, User, get_db
+# from models import Screenshot, SessionLocal, User, get_db
 # from screenshot_service import screenshot_service
 
 # log = logging.getLogger("batch_screenshots")
-# #router = APIRouter(prefix="/api/v1/batch", tags=["batch"])
+
+# # IMPORTANT:
+# # This router should be included in main.py with:
+# # app.include_router(batch_router, prefix="/api/v1")
 # router = APIRouter(prefix="/batch", tags=["batch"])
 
-# # ---- Configuration ----
 # SCREENSHOTS_DIR = Path(__file__).resolve().parents[1] / "screenshots"
 # SCREENSHOTS_DIR.mkdir(exist_ok=True)
 
-# # Tier limits for batch processing
 # TIER_BATCH_LIMITS = {
-#     "free": 0,        # No batch processing on free tier
-#     "pro": 50,        # Up to 50 URLs per batch
-#     "business": 200,  # Up to 200 URLs per batch
-#     "premium": 1000,  # Up to 1000 URLs per batch
+#     "free": 0,
+#     "pro": 50,
+#     "business": 200,
+#     "premium": 1000,
 # }
 
-# # ---- In-memory job store ----
 # JOBS: Dict[str, Dict[str, Any]] = {}
-
-# # ---- Pydantic models ----
 # VALID_FORMATS = {"png", "jpeg", "jpg", "webp", "pdf"}
 
 
 # class BatchSubmitRequest(BaseModel):
-#     """
-#     Batch screenshot submission request.
-#     Supports either direct URL list or CSV text.
-#     """
-#     urls: Optional[List[str]] = Field(default=None, description="List of URLs to screenshot")
-#     csv_text: Optional[str] = Field(default=None, description="CSV/TXT/TSV format URLs")
-#     format: str = Field(default="png", description="Output format: png, jpeg, webp, pdf")
-#     width: int = Field(default=1920, ge=320, le=7680, description="Viewport width")
-#     height: int = Field(default=1080, ge=240, le=4320, description="Viewport height")
-#     full_page: bool = Field(default=False, description="Capture full page (scrolling)")
-#     quality: Optional[int] = Field(default=None, ge=1, le=100, description="Quality for JPEG/WebP (1-100)")
+#     urls: Optional[List[str]] = Field(default=None)
+#     csv_text: Optional[str] = Field(default=None)
+#     format: str = Field(default="png")
+#     width: int = Field(default=1920, ge=320, le=7680)
+#     height: int = Field(default=1080, ge=240, le=4320)
+#     full_page: bool = Field(default=False)
+#     quality: Optional[int] = Field(default=None, ge=1, le=100)
 
 #     @validator("format")
 #     def validate_format(cls, v: str) -> str:
-#         vv = (v or "").strip().lower()
-#         if vv not in VALID_FORMATS:
+#         value = (v or "").strip().lower()
+#         if value not in VALID_FORMATS:
 #             raise ValueError(f"format must be one of {sorted(VALID_FORMATS)}")
-#         return vv
+#         return value
 
 #     def collect_urls(self) -> List[str]:
-#         """Extract and deduplicate URLs from urls list or csv_text."""
 #         raw_urls: List[str] = []
 
-#         # Collect from direct URL list
 #         if self.urls:
 #             raw_urls.extend(self.urls)
 
-#         # Collect from CSV text (supports CSV, TSV, or newline-separated)
 #         if self.csv_text:
 #             text = self.csv_text.strip()
-
 #             if "," in text:
 #                 reader = csv.reader(StringIO(text))
 #                 for row in reader:
@@ -2235,27 +1140,23 @@ async def delete_job(job_id: str, current_user: User = Depends(get_current_user)
 #                 for row in reader:
 #                     raw_urls.extend([cell.strip() for cell in row if cell.strip()])
 #             else:
-#                 lines = text.split("\n")
-#                 raw_urls.extend([line.strip() for line in lines if line.strip()])
+#                 raw_urls.extend([line.strip() for line in text.splitlines() if line.strip()])
 
-#         # Deduplicate while preserving order
 #         seen = set()
 #         urls: List[str] = []
 #         for url in raw_urls:
 #             u = (url or "").strip()
-#             if u and (u.startswith("http://") or u.startswith("https://")):
-#                 if u not in seen:
-#                     seen.add(u)
-#                     urls.append(u)
+#             if u and (u.startswith("http://") or u.startswith("https://")) and u not in seen:
+#                 seen.add(u)
+#                 urls.append(u)
 
 #         return urls
 
 
 # class BatchItemOut(BaseModel):
-#     """Individual item in a batch job."""
 #     idx: int
 #     url: str
-#     status: str  # queued, processing, completed, failed
+#     status: str
 #     message: Optional[str] = None
 #     screenshot_url: Optional[str] = None
 #     file_size: Optional[int] = None
@@ -2263,10 +1164,9 @@ async def delete_job(job_id: str, current_user: User = Depends(get_current_user)
 
 
 # class BatchJobOut(BaseModel):
-#     """Batch job response."""
 #     id: str
 #     created_at: str
-#     status: str  # queued, processing, completed, partial, failed
+#     status: str
 #     format: str
 #     total: int
 #     completed: int
@@ -2276,20 +1176,15 @@ async def delete_job(job_id: str, current_user: User = Depends(get_current_user)
 #     items: List[BatchItemOut]
 
 
-# # ---- Helper functions ----
-
 # def _get_user_tier(user: User) -> str:
-#     """Get user's subscription tier."""
-#     return getattr(user, "subscription_tier", "free") or "free"
+#     return (getattr(user, "subscription_tier", "free") or "free").lower()
 
 
 # def _get_batch_limit(tier: str) -> int:
-#     """Get batch processing limit for tier."""
 #     return TIER_BATCH_LIMITS.get((tier or "").lower(), 0)
 
 
 # def _create_initial_item(idx: int, url: str) -> Dict[str, Any]:
-#     """Create initial batch item with queued status."""
 #     return {
 #         "idx": idx,
 #         "url": url,
@@ -2302,92 +1197,11 @@ async def delete_job(job_id: str, current_user: User = Depends(get_current_user)
 #     }
 
 
-# async def _process_item(
-#     item: Dict[str, Any],
-#     format: str,
-#     width: int,
-#     height: int,
-#     full_page: bool,
-#     quality: Optional[int],
-#     user: User,
-#     db: Session,
-# ) -> Dict[str, Any]:
-#     """Process a single screenshot in the batch."""
-#     url = item["url"]
-#     start_time = time.time()
-
-#     try:
-#         item["status"] = "processing"
-#         item["message"] = "Capturing screenshot..."
-
-#         result = await screenshot_service.capture_screenshot(
-#             url=url,
-#             width=width,
-#             height=height,
-#             format=format,
-#             full_page=full_page,
-#             quality=quality,
-#         )
-
-#         if not result or not result.get("screenshot_path"):
-#             raise Exception("Screenshot capture failed")
-
-#         screenshot_path = Path(result["screenshot_path"])
-#         if not screenshot_path.exists():
-#             raise Exception("Screenshot file not found")
-
-#         file_size = screenshot_path.stat().st_size
-#         processing_time = time.time() - start_time
-#         screenshot_url = f"/screenshots/{screenshot_path.name}"
-
-#         item["status"] = "completed"
-#         item["message"] = "Screenshot captured successfully"
-#         item["screenshot_url"] = screenshot_url
-#         item["file_size"] = file_size
-#         item["processing_time"] = round(processing_time, 2)
-#         item["completed_at"] = datetime.utcnow().isoformat()
-
-#         # Save to DB (best-effort)
-#         try:
-#             screenshot_record = Screenshot(
-#                 user_id=user.id,
-#                 url=url,
-#                 screenshot_path=str(screenshot_path),
-#                 format=format,
-#                 width=width,
-#                 height=height,
-#                 full_page=full_page,
-#                 file_size=file_size,
-#                 processing_time=processing_time,
-#                 created_at=datetime.utcnow(),
-#             )
-#             db.add(screenshot_record)
-#             db.commit()
-#         except Exception as e:
-#             log.warning(f"Failed to save screenshot record: {e}")
-
-#         log.info(f"✅ Batch item {item['idx']} completed: {url} in {processing_time:.2f}s")
-
-#     except Exception as e:
-#         processing_time = time.time() - start_time
-#         log.error(f"❌ Batch item {item['idx']} failed: {url} - {e}")
-
-#         item["status"] = "failed"
-#         item["message"] = str(e)
-#         item["screenshot_url"] = None
-#         item["processing_time"] = round(processing_time, 2)
-#         item["failed_at"] = datetime.utcnow().isoformat()
-
-#     return item
-
-
 # def _calc_counts(items: List[Dict[str, Any]]) -> Dict[str, int]:
-#     """Calculate job status counts."""
 #     completed = sum(1 for it in items if it["status"] == "completed")
 #     failed = sum(1 for it in items if it["status"] == "failed")
 #     queued = sum(1 for it in items if it["status"] == "queued")
 #     processing = sum(1 for it in items if it["status"] == "processing")
-
 #     return {
 #         "completed": completed,
 #         "failed": failed,
@@ -2398,43 +1212,151 @@ async def delete_job(job_id: str, current_user: User = Depends(get_current_user)
 
 
 # def _update_job_counts(job: Dict[str, Any]) -> None:
-#     """Update job counts based on current item statuses."""
 #     job.update(_calc_counts(job["items"]))
+
+
+# def _resolve_screenshot_url(result: Dict[str, Any], path_obj: Path) -> str:
+#     """
+#     ✅ FIX: Resolve the best available URL from the screenshot_service result.
+#     Priority: R2/CDN storage URL > explicit screenshot_url > fallback local path.
+#     This ensures batch screenshots are accessible externally (not just localhost).
+#     """
+#     if not result:
+#         return f"/screenshots/{path_obj.name}"
+
+#     # Try every field name screenshot_service might return for the public URL
+#     for key in ("storage_url", "screenshot_url", "file_url", "public_url", "url"):
+#         candidate = result.get(key)
+#         if candidate and isinstance(candidate, str) and candidate.startswith("http"):
+#             return candidate
+
+#     # ✅ If the service returned a relative path, use it (History.js will prefix API base)
+#     for key in ("storage_url", "screenshot_url", "file_url"):
+#         candidate = result.get(key)
+#         if candidate and isinstance(candidate, str):
+#             return candidate
+
+#     # Final fallback: construct a relative path from the local file
+#     return f"/screenshots/{path_obj.name}"
+
+
+# async def _process_item(
+#     item: Dict[str, Any],
+#     fmt: str,
+#     width: int,
+#     height: int,
+#     full_page: bool,
+#     quality: Optional[int],
+#     user: User,
+#     db: Session,
+# ) -> Dict[str, Any]:
+#     url = item["url"]
+#     started = time.time()
+
+#     try:
+#         item["status"] = "processing"
+#         item["message"] = "Capturing screenshot..."
+
+#         result = await screenshot_service.capture_screenshot(
+#             url=url,
+#             width=width,
+#             height=height,
+#             format=fmt,
+#             full_page=full_page,
+#             quality=quality,
+#         )
+
+#         if not result:
+#             raise Exception("Screenshot capture failed — no result returned")
+
+#         # ✅ FIX: Use R2/CDN URL from result first, fall back to local path
+#         screenshot_url = _resolve_screenshot_url(result, Path(result.get("screenshot_path", "")))
+
+#         # File size: prefer from result metadata, fall back to disk stat
+#         file_size: Optional[int] = result.get("size_bytes") or result.get("file_size")
+#         screenshot_path = result.get("screenshot_path")
+
+#         if not file_size and screenshot_path:
+#             path_obj = Path(screenshot_path)
+#             if path_obj.exists():
+#                 file_size = path_obj.stat().st_size
+
+#         processing_time = round(time.time() - started, 2)
+
+#         item["status"] = "completed"
+#         item["message"] = "Screenshot captured successfully"
+#         item["screenshot_url"] = screenshot_url
+#         item["file_size"] = file_size
+#         item["processing_time"] = processing_time
+#         item["completed_at"] = datetime.utcnow().isoformat()
+
+#         # ✅ FIX: Persist to DB with the correct storage_url (R2/CDN URL)
+#         try:
+#             db_record = Screenshot(
+#                 user_id=user.id,
+#                 url=url,
+#                 screenshot_path=str(screenshot_path or ""),
+#                 # ✅ storage_url = the public-accessible URL (R2 or relative)
+#                 storage_url=screenshot_url,
+#                 format=fmt,
+#                 width=width,
+#                 height=height,
+#                 full_page=full_page,
+#                 size_bytes=file_size,
+#                 processing_time_ms=processing_time * 1000,
+#                 status="completed",
+#                 created_at=datetime.utcnow(),
+#             )
+#             db.add(db_record)
+#             db.commit()
+#             log.info("💾 Saved batch screenshot record: id=%s url=%s", db_record.id, screenshot_url)
+#         except Exception as save_err:
+#             db.rollback()
+#             log.warning("⚠️ Failed to save batch screenshot record: %s", save_err)
+
+#         log.info("✅ Batch item %s completed: %s → %s", item["idx"], url, screenshot_url)
+
+#     except Exception as exc:
+#         processing_time = round(time.time() - started, 2)
+#         item["status"] = "failed"
+#         item["message"] = str(exc)
+#         item["screenshot_url"] = None
+#         item["processing_time"] = processing_time
+#         item["failed_at"] = datetime.utcnow().isoformat()
+#         log.error("❌ Batch item %s failed: %s — %s", item["idx"], url, exc)
+
+#     return item
 
 
 # async def _process_job_async(
 #     job_id: str,
 #     user_id: int,
-#     format: str,
+#     fmt: str,
 #     width: int,
 #     height: int,
 #     full_page: bool,
 #     quality: Optional[int],
 # ) -> None:
-#     """Process all items in a batch job asynchronously."""
-#     if job_id not in JOBS:
-#         log.warning(f"Job {job_id} not found for processing")
+#     job = JOBS.get(job_id)
+#     if not job:
+#         log.warning("Job %s not found for processing", job_id)
 #         return
 
-#     job = JOBS[job_id]
-
-#     # NOTE: This keeps your existing pattern intact.
-#     # If you ever refactor: prefer `db = next(get_db())` + try/finally close.
-#     from models import get_db as _get_db
-#     with next(_get_db()) as db:
+#     db = SessionLocal()
+#     try:
 #         user = db.query(User).filter(User.id == user_id).first()
 #         if not user:
-#             log.error(f"User {user_id} not found for job {job_id}")
+#             log.error("User %s not found for job %s", user_id, job_id)
 #             return
 
 #         job["status"] = "processing"
-#         log.info(f"🔵 Starting batch job {job_id} with {job['total']} URLs")
+#         log.info("🔵 Starting batch job %s with %s URLs", job_id, job["total"])
 
 #         for item in job["items"]:
 #             if item["status"] == "queued":
-#                 await _process_item(item, format, width, height, full_page, quality, user, db)
+#                 await _process_item(item, fmt, width, height, full_page, quality, user, db)
 #                 _update_job_counts(job)
-#                 await asyncio.sleep(0.5)
+#                 await asyncio.sleep(0.2)
 
 #         counts = _calc_counts(job["items"])
 #         job.update(counts)
@@ -2447,57 +1369,51 @@ async def delete_job(job_id: str, current_user: User = Depends(get_current_user)
 #             job["status"] = "failed"
 
 #         job["completed_at"] = datetime.utcnow().isoformat()
-#         log.info(f"✅ Batch job {job_id} finished: {counts['completed']}/{counts['total']} successful")
+#         log.info(
+#             "✅ Batch job %s finished: %s/%s successful",
+#             job_id,
+#             counts["completed"],
+#             counts["total"],
+#         )
+#     finally:
+#         db.close()
 
 
 # def _own_job_or_404(job_id: str, user_id: int) -> Dict[str, Any]:
-#     """Get job or raise 404 if not found or not owned by user."""
 #     job = JOBS.get(job_id)
 #     if not job or job["user_id"] != user_id:
-#         raise HTTPException(404, "Job not found")
+#         raise HTTPException(status_code=404, detail="Job not found")
 #     return job
 
-
-# # ---- Endpoints ----
 
 # @router.post("/submit", response_model=BatchJobOut)
 # async def submit_batch(
 #     request: BatchSubmitRequest = Body(...),
 #     current_user: User = Depends(get_current_user),
 #     db: Session = Depends(get_db),
-#     bg: BackgroundTasks = Depends(),  # ✅ FIX: always injected
+#     bg: BackgroundTasks = None,
 # ):
-#     """
-#     Submit a batch screenshot job.
-
-#     Supports:
-#     - Direct URL list via `urls` parameter
-#     - CSV/TXT/TSV text via `csv_text` parameter
-#     - File upload via the /submit_file endpoint
-#     """
 #     urls = request.collect_urls()
 #     if not urls:
-#         raise HTTPException(400, "No valid URLs found in request")
+#         raise HTTPException(status_code=400, detail="No valid URLs found in request")
 
 #     tier = _get_user_tier(current_user)
 #     limit = _get_batch_limit(tier)
 
 #     if limit == 0:
 #         raise HTTPException(
-#             403,
-#             "Batch processing is not available on the free tier. Please upgrade to Pro or higher.",
+#             status_code=403,
+#             detail="Batch processing is not available on the free tier. Please upgrade to Pro or higher.",
 #         )
 
 #     if len(urls) > limit:
 #         raise HTTPException(
-#             403,
-#             f"Batch size ({len(urls)}) exceeds your tier limit ({limit}). "
-#             f"Please upgrade your plan or reduce the number of URLs.",
+#             status_code=403,
+#             detail=f"Batch size ({len(urls)}) exceeds your tier limit ({limit}). Please upgrade your plan or reduce the number of URLs.",
 #         )
 
 #     job_id = uuid.uuid4().hex[:16]
 #     now = datetime.utcnow().isoformat()
-
 #     items = [_create_initial_item(i, url) for i, url in enumerate(urls)]
 #     counts = _calc_counts(items)
 
@@ -2515,9 +1431,8 @@ async def delete_job(job_id: str, current_user: User = Depends(get_current_user)
 #     }
 
 #     JOBS[job_id] = job
-#     log.info(f"📸 Created batch job {job_id} with {len(urls)} URLs for user {current_user.username}")
+#     log.info("📸 Created batch job %s with %s URLs for user %s", job_id, len(urls), current_user.username)
 
-#     # ✅ Always schedules background processing
 #     bg.add_task(
 #         _process_job_async,
 #         job_id,
@@ -2529,8 +1444,7 @@ async def delete_job(job_id: str, current_user: User = Depends(get_current_user)
 #         request.quality,
 #     )
 
-#     public_job = {k: v for k, v in job.items() if k != "user_id"}
-#     return BatchJobOut(**public_job)
+#     return BatchJobOut(**{k: v for k, v in job.items() if k != "user_id"})
 
 
 # @router.post("/submit_file", response_model=BatchJobOut)
@@ -2543,23 +1457,19 @@ async def delete_job(job_id: str, current_user: User = Depends(get_current_user)
 #     quality: Optional[int] = Form(default=None),
 #     current_user: User = Depends(get_current_user),
 #     db: Session = Depends(get_db),
-#     bg: BackgroundTasks = Depends(),  # ✅ FIX: always injected
+#     bg: BackgroundTasks = None,
 # ):
-#     """
-#     Submit a batch screenshot job via file upload.
-
-#     Accepts CSV, TXT, or TSV files containing URLs.
-#     The file will be automatically parsed to detect the format.
-#     """
 #     filename = (file.filename or "").lower()
 #     if not (filename.endswith(".csv") or filename.endswith(".txt") or filename.endswith(".tsv")):
-#         raise HTTPException(400, "Invalid file format. Please upload a .csv, .txt, or .tsv file")
+#         raise HTTPException(
+#             status_code=400,
+#             detail="Invalid file format. Please upload a .csv, .txt, or .tsv file",
+#         )
 
 #     try:
-#         content = await file.read()
-#         text = content.decode("utf-8")
-#     except Exception as e:
-#         raise HTTPException(400, f"Failed to read file: {str(e)}")
+#         text = (await file.read()).decode("utf-8")
+#     except Exception as exc:
+#         raise HTTPException(status_code=400, detail=f"Failed to read file: {exc}")
 
 #     req = BatchSubmitRequest(
 #         csv_text=text,
@@ -2572,27 +1482,25 @@ async def delete_job(job_id: str, current_user: User = Depends(get_current_user)
 
 #     urls = req.collect_urls()
 #     if not urls:
-#         raise HTTPException(400, "No valid URLs found in uploaded file")
+#         raise HTTPException(status_code=400, detail="No valid URLs found in uploaded file")
 
 #     tier = _get_user_tier(current_user)
 #     limit = _get_batch_limit(tier)
 
 #     if limit == 0:
 #         raise HTTPException(
-#             403,
-#             "Batch processing is not available on the free tier. Please upgrade to Pro or higher.",
+#             status_code=403,
+#             detail="Batch processing is not available on the free tier. Please upgrade to Pro or higher.",
 #         )
 
 #     if len(urls) > limit:
 #         raise HTTPException(
-#             403,
-#             f"Batch size ({len(urls)}) exceeds your tier limit ({limit}). "
-#             f"Please upgrade your plan or reduce the number of URLs.",
+#             status_code=403,
+#             detail=f"Batch size ({len(urls)}) exceeds your tier limit ({limit}). Please upgrade your plan or reduce the number of URLs.",
 #         )
 
 #     job_id = uuid.uuid4().hex[:16]
 #     now = datetime.utcnow().isoformat()
-
 #     items = [_create_initial_item(i, url) for i, url in enumerate(urls)]
 #     counts = _calc_counts(items)
 
@@ -2610,9 +1518,11 @@ async def delete_job(job_id: str, current_user: User = Depends(get_current_user)
 #     }
 
 #     JOBS[job_id] = job
-#     log.info(f"📸 Created batch job {job_id} from file upload with {len(urls)} URLs for user {current_user.username}")
+#     log.info(
+#         "📸 Created batch job %s from file upload with %s URLs for user %s",
+#         job_id, len(urls), current_user.username,
+#     )
 
-#     # ✅ Always schedules background processing
 #     bg.add_task(
 #         _process_job_async,
 #         job_id,
@@ -2624,26 +1534,20 @@ async def delete_job(job_id: str, current_user: User = Depends(get_current_user)
 #         quality,
 #     )
 
-#     public_job = {k: v for k, v in job.items() if k != "user_id"}
-#     return BatchJobOut(**public_job)
+#     return BatchJobOut(**{k: v for k, v in job.items() if k != "user_id"})
 
 
 # @router.get("/jobs", response_model=List[BatchJobOut])
 # async def list_jobs(current_user: User = Depends(get_current_user)):
-#     """List all batch jobs for the current user."""
 #     user_jobs = [job for job in JOBS.values() if job["user_id"] == current_user.id]
 #     user_jobs.sort(key=lambda j: j["created_at"], reverse=True)
-
-#     public_jobs = [{k: v for k, v in job.items() if k != "user_id"} for job in user_jobs]
-#     return [BatchJobOut(**job) for job in public_jobs]
+#     return [BatchJobOut(**{k: v for k, v in job.items() if k != "user_id"}) for job in user_jobs]
 
 
 # @router.get("/jobs/{job_id}", response_model=BatchJobOut)
 # async def get_job(job_id: str, current_user: User = Depends(get_current_user)):
-#     """Get details for a specific batch job."""
 #     job = _own_job_or_404(job_id, current_user.id)
-#     public_job = {k: v for k, v in job.items() if k != "user_id"}
-#     return BatchJobOut(**public_job)
+#     return BatchJobOut(**{k: v for k, v in job.items() if k != "user_id"})
 
 
 # @router.post("/jobs/{job_id}/retry_failed", response_model=BatchJobOut)
@@ -2651,9 +1555,8 @@ async def delete_job(job_id: str, current_user: User = Depends(get_current_user)
 #     job_id: str,
 #     current_user: User = Depends(get_current_user),
 #     db: Session = Depends(get_db),
-#     bg: BackgroundTasks = Depends(),  # ✅ FIX: always injected
+#     bg: BackgroundTasks = None,
 # ):
-#     """Retry all failed screenshots in a batch job."""
 #     job = _own_job_or_404(job_id, current_user.id)
 
 #     changed = False
@@ -2668,8 +1571,6 @@ async def delete_job(job_id: str, current_user: User = Depends(get_current_user)
 #         job.update(_calc_counts(job["items"]))
 #         job["status"] = "queued"
 
-#         log.info(f"🔄 Retrying failed items in batch job {job_id}")
-
 #         bg.add_task(
 #             _process_job_async,
 #             job_id,
@@ -2678,21 +1579,15 @@ async def delete_job(job_id: str, current_user: User = Depends(get_current_user)
 #             job["width"],
 #             job["height"],
 #             job["full_page"],
-#             None,  # quality
+#             None,
 #         )
 
-#     public_job = {k: v for k, v in job.items() if k != "user_id"}
-#     return BatchJobOut(**public_job)
+#     return BatchJobOut(**{k: v for k, v in job.items() if k != "user_id"})
 
 
 # @router.delete("/jobs/{job_id}")
 # async def delete_job(job_id: str, current_user: User = Depends(get_current_user)):
-#     """Delete a batch job."""
 #     _own_job_or_404(job_id, current_user.id)
 #     JOBS.pop(job_id, None)
-#     log.info(f"🗑️ Deleted batch job {job_id}")
 #     return {"ok": True, "deleted": job_id}
-
-
-# # ============= End Batch Screenshot Router =============
 
