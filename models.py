@@ -10,6 +10,13 @@
 # FIX (Mar 2026): SQLite WAL journal mode, FK enforcement, NORMAL sync
 #   Prevents "it works then randomly breaks" SQLite dev behavior,
 #   especially with concurrent FastAPI async requests and WAL files.
+#
+# ✅ FIX (Mar 2026 — Batch counter frozen at wrong value):
+#   Added BatchJob model. Without it, main.py's subscription_status endpoint
+#   silently fell back to user.usage_batch_requests which batch.py never
+#   incremented — so the dashboard Batch Requests counter never updated.
+#   Fix: BatchJob table now records every submitted batch job so
+#   db.query(BatchJob).filter(...).count() returns the correct number.
 # ============================================================================
 
 from __future__ import annotations
@@ -50,32 +57,17 @@ elif DATABASE_URL.startswith("postgresql://") and "+psycopg2" not in DATABASE_UR
 
 _IS_SQLITE = DATABASE_URL.startswith("sqlite")
 
-# SQLite needs check_same_thread=False for FastAPI's async thread model.
-# PostgreSQL needs no extra connect_args here.
 _connect_args = {"check_same_thread": False} if _IS_SQLITE else {}
 
 engine = create_engine(
     DATABASE_URL,
     connect_args=_connect_args,
     pool_pre_ping=True,
-    future=True,  # Use SQLAlchemy 2.x-style engine behaviour
+    future=True,
 )
 
 # ============================================================================
 # SQLite reliability improvements (dev only — no-op on PostgreSQL)
-#
-# Why each pragma matters:
-#   PRAGMA foreign_keys=ON   — SQLite ignores FK constraints by default.
-#                               Without this, CASCADE deletes and FK violations
-#                               are silently ignored, causing data drift in dev.
-#   PRAGMA journal_mode=WAL  — Switches from the default DELETE journal to
-#                               Write-Ahead Logging. WAL allows concurrent
-#                               readers + one writer, which prevents the
-#                               "database is locked" errors you hit with
-#                               FastAPI's async request handling in dev.
-#   PRAGMA synchronous=NORMAL — Balances durability and speed. FULL (default
-#                               with WAL) calls fsync after every commit;
-#                               NORMAL is safe for dev and significantly faster.
 # ============================================================================
 if _IS_SQLITE:
     @event.listens_for(Engine, "connect")
@@ -121,18 +113,18 @@ class User(Base):
     subscription_tier = Column(String(20), default="free", nullable=False)
 
     # Subscription status fields (for webhook_handler.py)
-    stripe_subscription_status = Column(String(20), nullable=True)  # active, canceled, etc.
-    subscription_status = Column(String(20), default="active", nullable=True)  # Legacy compatibility
+    stripe_subscription_status = Column(String(20), nullable=True)
+    subscription_status = Column(String(20), default="active", nullable=True)
 
     # Subscription ID tracking
     subscription_id = Column(String(100), unique=True, nullable=True)
 
     # Subscription expiry tracking (for subscription_sync.py)
-    subscription_expires_at = Column(DateTime, nullable=True)  # Used by sync
-    subscription_ends_at = Column(DateTime, nullable=True)      # Legacy compatibility
+    subscription_expires_at = Column(DateTime, nullable=True)
+    subscription_ends_at = Column(DateTime, nullable=True)
 
     # Subscription update tracking
-    subscription_updated_at = Column(DateTime, nullable=True)  # Last sync timestamp
+    subscription_updated_at = Column(DateTime, nullable=True)
 
     # Usage tracking
     usage_screenshots = Column(Integer, default=0)
@@ -187,14 +179,12 @@ class Screenshot(Base):
     """Screenshot capture record (matches existing SQLite schema)"""
     __tablename__ = "screenshots"
 
-    # DB uses VARCHAR primary key (UUID string)
     id = Column(String, primary_key=True, index=True, default=lambda: str(uuid4()))
 
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
 
     url = Column(Text, nullable=False)
 
-    # width/height NOT NULL in existing schema
     width = Column(Integer, nullable=False, default=1920)
     height = Column(Integer, nullable=False, default=1080)
 
@@ -231,6 +221,57 @@ class Screenshot(Base):
         Index("idx_screenshot_created", "created_at"),
         Index("idx_screenshot_status", "status"),
         Index("idx_screenshot_format", "format"),
+    )
+
+# ============================================================================
+# BATCH JOB MODEL
+# ============================================================================
+# ✅ NEW: This model was missing, which caused the dashboard "Batch Requests"
+#    counter to always read from user.usage_batch_requests (never updated by
+#    batch.py) instead of from this table.
+#
+#    main.py subscription_status endpoint queries:
+#        db.query(BatchJob).filter(
+#            BatchJob.user_id == current_user.id,
+#            BatchJob.created_at >= period_start,
+#        ).count()
+#    That query now works correctly once batch.py writes a record here
+#    on every job submission.
+# ============================================================================
+
+class BatchJob(Base):
+    """Batch screenshot job record — one row per submitted batch job."""
+    __tablename__ = "batch_jobs"
+
+    # Use the same hex job_id that batch.py generates (uuid4().hex[:16])
+    id = Column(String(32), primary_key=True, index=True)
+
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+
+    # Job-level metadata
+    status = Column(String(20), nullable=False, default="queued")
+    # 'queued' | 'processing' | 'completed' | 'partial' | 'failed'
+
+    format = Column(String(10), nullable=False, default="png")
+    width = Column(Integer, nullable=False, default=1920)
+    height = Column(Integer, nullable=False, default=1080)
+    full_page = Column(Boolean, nullable=False, default=False)
+
+    # URL counts — set at submission time
+    total_urls = Column(Integer, nullable=False, default=0)
+
+    # Result counts — updated when job finishes
+    completed_count = Column(Integer, nullable=True, default=0)
+    failed_count = Column(Integer, nullable=True, default=0)
+
+    # Timestamps
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    completed_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        Index("idx_batch_job_user", "user_id"),
+        Index("idx_batch_job_created", "created_at"),
+        Index("idx_batch_job_status", "status"),
     )
 
 # ============================================================================
@@ -316,7 +357,7 @@ def reset_monthly_usage(user: User, db: Session) -> None:
 # ============================================================================
 
 def initialize_database() -> None:
-    """Create all database tables"""
+    """Create all database tables (including batch_jobs if new)"""
     Base.metadata.create_all(bind=engine)
     print("✅ Database tables created successfully")
 
@@ -326,12 +367,10 @@ def initialize_database() -> None:
 
 def add_missing_columns():
     """
-    Add missing subscription columns to existing User table.
+    Add missing columns to existing tables.
     Run this ONCE after deploying the updated models.py to a live DB.
-
-    Usage:
-        from models import add_missing_columns
-        add_missing_columns()
+    The batch_jobs table is created automatically by initialize_database()
+    via Base.metadata.create_all() — no manual migration needed for it.
     """
     from sqlalchemy import inspect, text
 
@@ -353,16 +392,19 @@ def add_missing_columns():
 
     print("✅ Migration complete!")
 
-# # ============================================================================
+# # =========================================================================================================================
 # # ============================================================================
 # # DATABASE MODELS - PixelPerfect Screenshot API (FIXED)
 # # File: backend/models.py
 # # Author: OneTechly
-# # Updated: February 2026 - Fixed subscription field alignment
+# # Updated: March 2026 - SQLite WAL + FK pragma reliability improvements
 # # ============================================================================
-# # ✅ PRODUCTION READY
-# # ✅ Added missing subscription fields for webhook_handler.py
-# # ✅ Aligned with subscription_sync.py requirements
+# # PRODUCTION READY
+# # Added missing subscription fields for webhook_handler.py
+# # Aligned with subscription_sync.py requirements
+# # FIX (Mar 2026): SQLite WAL journal mode, FK enforcement, NORMAL sync
+# #   Prevents "it works then randomly breaks" SQLite dev behavior,
+# #   especially with concurrent FastAPI async requests and WAL files.
 # # ============================================================================
 
 # from __future__ import annotations
@@ -383,7 +425,9 @@ def add_missing_columns():
 #     String,
 #     Text,
 #     create_engine,
+#     event,
 # )
+# from sqlalchemy.engine import Engine
 # from sqlalchemy.ext.declarative import declarative_base
 # from sqlalchemy.orm import Session, sessionmaker
 
@@ -399,11 +443,43 @@ def add_missing_columns():
 # elif DATABASE_URL.startswith("postgresql://") and "+psycopg2" not in DATABASE_URL:
 #     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
 
+# _IS_SQLITE = DATABASE_URL.startswith("sqlite")
+
+# # SQLite needs check_same_thread=False for FastAPI's async thread model.
+# # PostgreSQL needs no extra connect_args here.
+# _connect_args = {"check_same_thread": False} if _IS_SQLITE else {}
+
 # engine = create_engine(
 #     DATABASE_URL,
-#     connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {},
+#     connect_args=_connect_args,
 #     pool_pre_ping=True,
+#     future=True,  # Use SQLAlchemy 2.x-style engine behaviour
 # )
+
+# # ============================================================================
+# # SQLite reliability improvements (dev only — no-op on PostgreSQL)
+# #
+# # Why each pragma matters:
+# #   PRAGMA foreign_keys=ON   — SQLite ignores FK constraints by default.
+# #                               Without this, CASCADE deletes and FK violations
+# #                               are silently ignored, causing data drift in dev.
+# #   PRAGMA journal_mode=WAL  — Switches from the default DELETE journal to
+# #                               Write-Ahead Logging. WAL allows concurrent
+# #                               readers + one writer, which prevents the
+# #                               "database is locked" errors you hit with
+# #                               FastAPI's async request handling in dev.
+# #   PRAGMA synchronous=NORMAL — Balances durability and speed. FULL (default
+# #                               with WAL) calls fsync after every commit;
+# #                               NORMAL is safe for dev and significantly faster.
+# # ============================================================================
+# if _IS_SQLITE:
+#     @event.listens_for(Engine, "connect")
+#     def _set_sqlite_pragmas(dbapi_connection, connection_record):
+#         cursor = dbapi_connection.cursor()
+#         cursor.execute("PRAGMA foreign_keys=ON;")
+#         cursor.execute("PRAGMA journal_mode=WAL;")
+#         cursor.execute("PRAGMA synchronous=NORMAL;")
+#         cursor.close()
 
 # SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 # Base = declarative_base()
@@ -421,7 +497,7 @@ def add_missing_columns():
 #         db.close()
 
 # # ============================================================================
-# # USER MODEL (FIXED)
+# # USER MODEL
 # # ============================================================================
 
 # class User(Base):
@@ -433,25 +509,25 @@ def add_missing_columns():
 #     email = Column(String(100), unique=True, index=True, nullable=False)
 #     hashed_password = Column(String(255), nullable=False)
 
-#     # ✅ Stripe integration
+#     # Stripe integration
 #     stripe_customer_id = Column(String(100), unique=True, nullable=True)
 
-#     # ✅ Subscription tier (primary field used everywhere)
+#     # Subscription tier (primary field used everywhere)
 #     subscription_tier = Column(String(20), default="free", nullable=False)
-    
-#     # ✅ Subscription status fields (for webhook_handler.py)
-#     stripe_subscription_status = Column(String(20), nullable=True)  # NEW: active, canceled, etc.
+
+#     # Subscription status fields (for webhook_handler.py)
+#     stripe_subscription_status = Column(String(20), nullable=True)  # active, canceled, etc.
 #     subscription_status = Column(String(20), default="active", nullable=True)  # Legacy compatibility
-    
-#     # ✅ Subscription ID tracking
+
+#     # Subscription ID tracking
 #     subscription_id = Column(String(100), unique=True, nullable=True)
-    
-#     # ✅ Subscription expiry tracking (for subscription_sync.py)
-#     subscription_expires_at = Column(DateTime, nullable=True)  # NEW: Used by sync
-#     subscription_ends_at = Column(DateTime, nullable=True)  # Legacy compatibility
-    
-#     # ✅ Subscription update tracking
-#     subscription_updated_at = Column(DateTime, nullable=True)  # NEW: Last sync timestamp
+
+#     # Subscription expiry tracking (for subscription_sync.py)
+#     subscription_expires_at = Column(DateTime, nullable=True)  # Used by sync
+#     subscription_ends_at = Column(DateTime, nullable=True)      # Legacy compatibility
+
+#     # Subscription update tracking
+#     subscription_updated_at = Column(DateTime, nullable=True)  # Last sync timestamp
 
 #     # Usage tracking
 #     usage_screenshots = Column(Integer, default=0)
@@ -467,7 +543,7 @@ def add_missing_columns():
 #         Index("idx_user_email", "email"),
 #         Index("idx_user_username", "username"),
 #         Index("idx_user_stripe", "stripe_customer_id"),
-#         Index("idx_user_tier", "subscription_tier"),  # NEW: For tier queries
+#         Index("idx_user_tier", "subscription_tier"),
 #     )
 
 # # ============================================================================
@@ -506,14 +582,14 @@ def add_missing_columns():
 #     """Screenshot capture record (matches existing SQLite schema)"""
 #     __tablename__ = "screenshots"
 
-#     # IMPORTANT: your DB shows "id VARCHAR NOT NULL"
+#     # DB uses VARCHAR primary key (UUID string)
 #     id = Column(String, primary_key=True, index=True, default=lambda: str(uuid4()))
 
 #     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
 
 #     url = Column(Text, nullable=False)
 
-#     # Your DB has width/height NOT NULL
+#     # width/height NOT NULL in existing schema
 #     width = Column(Integer, nullable=False, default=1920)
 #     height = Column(Integer, nullable=False, default=1080)
 
@@ -523,7 +599,6 @@ def add_missing_columns():
 
 #     size_bytes = Column(Integer, nullable=False, default=0)
 
-#     # Your DB includes storage_url/storage_key even if you also store local path
 #     storage_url = Column(Text, nullable=False, default="")
 #     storage_key = Column(String, nullable=True)
 
@@ -544,7 +619,6 @@ def add_missing_columns():
 #     difference_percentage = Column(Float, nullable=True)
 #     has_changes = Column(Boolean, nullable=True)
 
-#     # Your DB also has screenshot_path
 #     screenshot_path = Column(Text, nullable=True)
 
 #     __table_args__ = (
@@ -584,44 +658,40 @@ def add_missing_columns():
 #     )
 
 # # ============================================================================
-# # TIER LIMITS CONFIGURATION (UPDATED)
+# # TIER LIMITS CONFIGURATION
 # # ============================================================================
 
 # def get_tier_limits(tier: str) -> Dict[str, Any]:
-#     """
-#     Get usage limits for subscription tier
-    
-#     ✅ Updated with new Business tier limits
-#     """
+#     """Get usage limits for subscription tier"""
 #     tier = (tier or "free").lower()
-    
+
 #     limits = {
 #         "free": {
 #             "screenshots": 100,
 #             "batch_requests": 0,
 #             "api_calls": 1000,
-#             "features": ["basic_customization", "community_support"]
+#             "features": ["basic_customization", "community_support"],
 #         },
 #         "pro": {
 #             "screenshots": 5000,
 #             "batch_requests": 50,
 #             "api_calls": 10000,
-#             "features": ["full_customization", "batch_processing", "priority_support"]
+#             "features": ["full_customization", "batch_processing", "priority_support"],
 #         },
 #         "business": {
 #             "screenshots": 50000,
 #             "batch_requests": 500,
 #             "api_calls": 100000,
-#             "features": ["webhooks", "change_detection", "dedicated_support", "batch_processing"]
+#             "features": ["webhooks", "change_detection", "dedicated_support", "batch_processing"],
 #         },
 #         "premium": {
 #             "screenshots": "unlimited",
 #             "batch_requests": "unlimited",
 #             "api_calls": "unlimited",
-#             "features": ["white_label", "custom_sla", "account_manager", "webhooks", "change_detection"]
+#             "features": ["white_label", "custom_sla", "account_manager", "webhooks", "change_detection"],
 #         },
 #     }
-    
+
 #     return limits.get(tier, limits["free"])
 
 # # ============================================================================
@@ -651,36 +721,30 @@ def add_missing_columns():
 
 # def add_missing_columns():
 #     """
-#     Add missing subscription columns to existing User table
-#     Run this ONCE after deploying the fixed models.py
-    
+#     Add missing subscription columns to existing User table.
+#     Run this ONCE after deploying the updated models.py to a live DB.
+
 #     Usage:
-#         from models import add_missing_columns, SessionLocal
-#         db = SessionLocal()
+#         from models import add_missing_columns
 #         add_missing_columns()
 #     """
 #     from sqlalchemy import inspect, text
-    
+
 #     inspector = inspect(engine)
-#     columns = [col['name'] for col in inspector.get_columns('users')]
-    
+#     columns = [col["name"] for col in inspector.get_columns("users")]
+
 #     with engine.begin() as conn:
-#         # Add stripe_subscription_status if missing
-#         if 'stripe_subscription_status' not in columns:
-#             conn.execute(text('ALTER TABLE users ADD COLUMN stripe_subscription_status VARCHAR(20)'))
+#         if "stripe_subscription_status" not in columns:
+#             conn.execute(text("ALTER TABLE users ADD COLUMN stripe_subscription_status VARCHAR(20)"))
 #             print("✅ Added stripe_subscription_status")
-        
-#         # Add subscription_expires_at if missing
-#         if 'subscription_expires_at' not in columns:
-#             conn.execute(text('ALTER TABLE users ADD COLUMN subscription_expires_at TIMESTAMP'))
+
+#         if "subscription_expires_at" not in columns:
+#             conn.execute(text("ALTER TABLE users ADD COLUMN subscription_expires_at TIMESTAMP"))
 #             print("✅ Added subscription_expires_at")
-        
-#         # Add subscription_updated_at if missing
-#         if 'subscription_updated_at' not in columns:
-#             conn.execute(text('ALTER TABLE users ADD COLUMN subscription_updated_at TIMESTAMP'))
+
+#         if "subscription_updated_at" not in columns:
+#             conn.execute(text("ALTER TABLE users ADD COLUMN subscription_updated_at TIMESTAMP"))
 #             print("✅ Added subscription_updated_at")
-    
+
 #     print("✅ Migration complete!")
-
-
 
