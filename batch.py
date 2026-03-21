@@ -10,6 +10,8 @@
 #   ✅ File upload support via /submit_file (CSV, TXT, TSV)
 #   ✅ Retry failed items + delete job endpoints
 #   ✅ In-memory JOBS store with async background processing
+#   ✅ NEW: Cancel endpoint (POST /jobs/{id}/cancel) — stops queued/processing
+#      jobs immediately; each queued item is marked cancelled before capture
 #   ✅ FIX: BatchJob DB records now written on submit → dashboard Batch
 #      Requests counter updates correctly (was always frozen because
 #      models.py had no BatchJob model and the fallback counter was
@@ -147,9 +149,10 @@ def _create_initial_item(idx: int, url: str) -> Dict[str, Any]:
 
 
 def _calc_counts(items: List[Dict[str, Any]]) -> Dict[str, int]:
-    completed = sum(1 for it in items if it["status"] == "completed")
-    failed = sum(1 for it in items if it["status"] == "failed")
-    queued = sum(1 for it in items if it["status"] == "queued")
+    completed  = sum(1 for it in items if it["status"] == "completed")
+    # cancelled items count in "failed" so the progress bar shows correctly
+    failed     = sum(1 for it in items if it["status"] in ("failed", "cancelled"))
+    queued     = sum(1 for it in items if it["status"] == "queued")
     processing = sum(1 for it in items if it["status"] == "processing")
     return {
         "completed": completed,
@@ -303,6 +306,10 @@ async def _process_job_async(
         log.info("🔵 Starting batch job %s with %s URLs", job_id, job["total"])
 
         for item in job["items"]:
+            # ✅ NEW: check for cancellation before processing each item
+            if job.get("status") == "cancelled":
+                log.info("🚫 Job %s was cancelled — stopping processing loop", job_id)
+                break
             if item["status"] == "queued":
                 await _process_item(item, fmt, width, height, full_page, quality, user, db)
                 _update_job_counts(job)
@@ -311,12 +318,14 @@ async def _process_job_async(
         counts = _calc_counts(job["items"])
         job.update(counts)
 
-        if counts["failed"] == 0:
-            job["status"] = "completed"
-        elif counts["completed"] > 0:
-            job["status"] = "partial"
-        else:
-            job["status"] = "failed"
+        # Don't overwrite an explicit "cancelled" status set by the cancel endpoint
+        if job.get("status") != "cancelled":
+            if counts["failed"] == 0:
+                job["status"] = "completed"
+            elif counts["completed"] > 0:
+                job["status"] = "partial"
+            else:
+                job["status"] = "failed"
 
         job["completed_at"] = datetime.utcnow().isoformat()
         log.info(
@@ -598,13 +607,57 @@ async def retry_failed(
     return BatchJobOut(**{k: v for k, v in job.items() if k != "user_id"})
 
 
+@router.post("/jobs/{job_id}/cancel", response_model=BatchJobOut)
+async def cancel_job(
+    job_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Cancel a queued or in-progress batch job.
+    All remaining queued items are marked cancelled; any screenshot already
+    being captured at that moment will still finish (one item granularity).
+    """
+    job = _own_job_or_404(job_id, current_user.id)
+
+    if job["status"] not in ("queued", "processing"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Job cannot be cancelled — current status is '{job['status']}'",
+        )
+
+    # Mark all still-queued/processing items as cancelled
+    for item in job["items"]:
+        if item["status"] in ("queued", "processing"):
+            item["status"] = "cancelled"
+            item["message"] = "Cancelled by user"
+
+    job.update(_calc_counts(job["items"]))
+    job["status"] = "cancelled"
+    job["completed_at"] = datetime.utcnow().isoformat()
+
+    # Persist to DB
+    try:
+        db_job = db.query(BatchJob).filter(BatchJob.id == job_id).first()
+        if db_job:
+            db_job.status = "cancelled"
+            db_job.completed_at = datetime.utcnow()
+            db.commit()
+    except Exception as db_err:
+        db.rollback()
+        log.warning("⚠️ Failed to update BatchJob cancel status in DB: %s", db_err)
+
+    log.info("🚫 Batch job %s cancelled by user %s", job_id, current_user.id)
+    return BatchJobOut(**{k: v for k, v in job.items() if k != "user_id"})
+
+
 @router.delete("/jobs/{job_id}")
 async def delete_job(job_id: str, current_user: User = Depends(get_current_user)):
     _own_job_or_404(job_id, current_user.id)
     JOBS.pop(job_id, None)
     return {"ok": True, "deleted": job_id}
 
-# # ========================================================================================================================
+###################################################################################
 # # backend/routers/batch.py — PixelPerfect Screenshot API
 # # UPDATED: March 2026
 # #   ✅ FIX: Removed unsupported 'quality' kwarg from capture_screenshot() call
@@ -617,6 +670,10 @@ async def delete_job(job_id: str, current_user: User = Depends(get_current_user)
 # #   ✅ File upload support via /submit_file (CSV, TXT, TSV)
 # #   ✅ Retry failed items + delete job endpoints
 # #   ✅ In-memory JOBS store with async background processing
+# #   ✅ FIX: BatchJob DB records now written on submit → dashboard Batch
+# #      Requests counter updates correctly (was always frozen because
+# #      models.py had no BatchJob model and the fallback counter was
+# #      never incremented)
 
 # from __future__ import annotations
 
@@ -635,7 +692,7 @@ async def delete_job(job_id: str, current_user: User = Depends(get_current_user)
 # from sqlalchemy.orm import Session
 
 # from auth_deps import get_current_user
-# from models import Screenshot, SessionLocal, User, get_db
+# from models import BatchJob, Screenshot, SessionLocal, User, get_db
 # from screenshot_service import screenshot_service, get_screenshot_url
 
 # log = logging.getLogger("batch_screenshots")
@@ -928,6 +985,21 @@ async def delete_job(job_id: str, current_user: User = Depends(get_current_user)
 #             counts["completed"],
 #             counts["total"],
 #         )
+
+#         # ✅ FIX: Update the BatchJob DB record with final status + counts
+#         try:
+#             db_job = db.query(BatchJob).filter(BatchJob.id == job_id).first()
+#             if db_job:
+#                 db_job.status = job["status"]
+#                 db_job.completed_count = counts["completed"]
+#                 db_job.failed_count = counts["failed"]
+#                 db_job.completed_at = datetime.utcnow()
+#                 db.commit()
+#                 log.info("💾 Updated BatchJob record: id=%s status=%s", job_id, job["status"])
+#         except Exception as db_err:
+#             db.rollback()
+#             log.warning("⚠️ Failed to update BatchJob record (non-fatal): %s", db_err)
+
 #     finally:
 #         db.close()
 
@@ -984,6 +1056,31 @@ async def delete_job(job_id: str, current_user: User = Depends(get_current_user)
 #     }
 
 #     JOBS[job_id] = job
+
+#     # ✅ FIX: Write BatchJob to DB so subscription_status endpoint can count it.
+#     # Without this, main.py's db.query(BatchJob).count() always returned stale
+#     # data because no record was ever inserted.
+#     try:
+#         db_job = BatchJob(
+#             id=job_id,
+#             user_id=current_user.id,
+#             status="queued",
+#             format=request.format,
+#             width=request.width,
+#             height=request.height,
+#             full_page=request.full_page,
+#             total_urls=len(urls),
+#             completed_count=0,
+#             failed_count=0,
+#             created_at=datetime.utcnow(),
+#         )
+#         db.add(db_job)
+#         db.commit()
+#         log.info("💾 Saved BatchJob record: id=%s user=%s urls=%d", job_id, current_user.id, len(urls))
+#     except Exception as db_err:
+#         db.rollback()
+#         log.warning("⚠️ Failed to save BatchJob record (non-fatal): %s", db_err)
+
 #     log.info("📸 Created batch job %s with %s URLs for user %s", job_id, len(urls), current_user.username)
 
 #     bg.add_task(
@@ -1071,6 +1168,29 @@ async def delete_job(job_id: str, current_user: User = Depends(get_current_user)
 #     }
 
 #     JOBS[job_id] = job
+
+#     # ✅ FIX: Write BatchJob to DB (same as submit_batch above)
+#     try:
+#         db_job = BatchJob(
+#             id=job_id,
+#             user_id=current_user.id,
+#             status="queued",
+#             format=format,
+#             width=width,
+#             height=height,
+#             full_page=full_page,
+#             total_urls=len(urls),
+#             completed_count=0,
+#             failed_count=0,
+#             created_at=datetime.utcnow(),
+#         )
+#         db.add(db_job)
+#         db.commit()
+#         log.info("💾 Saved BatchJob record (file upload): id=%s user=%s urls=%d", job_id, current_user.id, len(urls))
+#     except Exception as db_err:
+#         db.rollback()
+#         log.warning("⚠️ Failed to save BatchJob record (non-fatal): %s", db_err)
+
 #     log.info(
 #         "📸 Created batch job %s from file upload with %s URLs for user %s",
 #         job_id, len(urls), current_user.username,
