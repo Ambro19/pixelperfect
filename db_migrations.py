@@ -126,6 +126,26 @@ def run_startup_migrations(engine: Engine) -> None:
                     "TIMESTAMP")
 
         # ----------------------------------------------------------------
+        # screenshots table — missing columns
+        # ----------------------------------------------------------------
+        # ✅ FIX: remove_elements — model uses this name, but old DB has
+        #    "removed_elements". The DB hint confirms the old column name.
+        #    We add the new name; old rows simply have NULL for this field.
+        _add_column(conn, dialect, "screenshots", "remove_elements",    "TEXT")
+        _add_column(conn, dialect, "screenshots", "quality",            "INTEGER")
+        _add_column(conn, dialect, "screenshots", "storage_key",        "TEXT")
+        _add_column(conn, dialect, "screenshots", "processing_time_ms", "FLOAT")
+        _add_column(conn, dialect, "screenshots", "error_message",      "TEXT")
+        _add_column(conn, dialect, "screenshots", "dark_mode",          "BOOLEAN")
+        _add_column(conn, dialect, "screenshots", "delay_seconds",      "INTEGER")
+        _add_column(conn, dialect, "screenshots", "expires_at",         "TIMESTAMP")
+        _add_column(conn, dialect, "screenshots", "is_baseline",        "BOOLEAN")
+        _add_column(conn, dialect, "screenshots", "baseline_screenshot_id", "TEXT")
+        _add_column(conn, dialect, "screenshots", "difference_percentage",  "FLOAT")
+        _add_column(conn, dialect, "screenshots", "has_changes",        "BOOLEAN")
+        _add_column(conn, dialect, "screenshots", "screenshot_path",    "TEXT")
+
+        # ----------------------------------------------------------------
         # subscriptions table — missing columns (pre-existing migrations)
         # ----------------------------------------------------------------
         _add_column(conn, dialect, "subscriptions", "stripe_customer_id",
@@ -190,7 +210,8 @@ def run_api_key_migration(engine: Engine) -> None:
     except Exception as e:
         log.error("❌ API key migration failed: %s", e)
 
-## ===============================
+# # ===========================================================================
+
 # from __future__ import annotations
 # # backend/db_migrations.py
 # # ============================================================================
@@ -382,3 +403,4 @@ def run_api_key_migration(engine: Engine) -> None:
 #         log.warning("⚠️ API key system not available: %s", e)
 #     except Exception as e:
 #         log.error("❌ API key migration failed: %s", e)
+
