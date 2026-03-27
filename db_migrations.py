@@ -126,6 +126,67 @@ def run_startup_migrations(engine: Engine) -> None:
                     "TIMESTAMP")
 
         # ----------------------------------------------------------------
+        # batch_jobs table — create if missing
+        # ✅ NEW: The BatchJob model was added in March 2026. PostgreSQL DBs
+        #    that existed before that don't have this table. create_all()
+        #    creates it on a fresh DB, but NOT on existing ones — so we
+        #    create it here if absent.  All columns match the BatchJob model.
+        # ----------------------------------------------------------------
+        if dialect == "postgresql":
+            _batch_exists_sql = """
+                SELECT 1 FROM information_schema.tables
+                WHERE table_schema = 'public' AND table_name = 'batch_jobs' LIMIT 1
+            """
+        else:
+            _batch_exists_sql = (
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='batch_jobs'"
+            )
+        _batch_exists = conn.exec_driver_sql(_batch_exists_sql).first() is not None
+
+        if not _batch_exists:
+            log.info("Creating batch_jobs table …")
+            if dialect == "postgresql":
+                conn.exec_driver_sql("""
+                    CREATE TABLE IF NOT EXISTS public.batch_jobs (
+                        id          VARCHAR(32)  PRIMARY KEY,
+                        user_id     INTEGER      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        status      VARCHAR(20)  NOT NULL DEFAULT 'queued',
+                        format      VARCHAR(10)  NOT NULL DEFAULT 'png',
+                        width       INTEGER      NOT NULL DEFAULT 1920,
+                        height      INTEGER      NOT NULL DEFAULT 1080,
+                        full_page   BOOLEAN      NOT NULL DEFAULT FALSE,
+                        total_urls  INTEGER      NOT NULL DEFAULT 0,
+                        completed_count INTEGER  DEFAULT 0,
+                        failed_count    INTEGER  DEFAULT 0,
+                        created_at  TIMESTAMP    NOT NULL DEFAULT NOW(),
+                        completed_at TIMESTAMP
+                    )
+                """)
+            else:
+                conn.exec_driver_sql("""
+                    CREATE TABLE IF NOT EXISTS batch_jobs (
+                        id           TEXT PRIMARY KEY,
+                        user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        status       TEXT NOT NULL DEFAULT 'queued',
+                        format       TEXT NOT NULL DEFAULT 'png',
+                        width        INTEGER NOT NULL DEFAULT 1920,
+                        height       INTEGER NOT NULL DEFAULT 1080,
+                        full_page    INTEGER NOT NULL DEFAULT 0,
+                        total_urls   INTEGER NOT NULL DEFAULT 0,
+                        completed_count INTEGER DEFAULT 0,
+                        failed_count    INTEGER DEFAULT 0,
+                        created_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        completed_at TIMESTAMP
+                    )
+                """)
+            log.info("✅ Created batch_jobs table")
+
+            # Idempotent indexes on the new table
+            _create_index(conn, "idx_batch_jobs_user_id",   "batch_jobs", ["user_id"])
+            _create_index(conn, "idx_batch_jobs_created_at","batch_jobs", ["created_at"])
+            _create_index(conn, "idx_batch_jobs_status",    "batch_jobs", ["status"])
+
+        # ----------------------------------------------------------------
         # screenshots table — missing columns
         # ----------------------------------------------------------------
         # ✅ FIX: remove_elements — model uses this name, but old DB has
@@ -208,9 +269,10 @@ def run_api_key_migration(engine: Engine) -> None:
     except ImportError as e:
         log.warning("⚠️ API key system not available: %s", e)
     except Exception as e:
-        log.error("❌ API key migration failed: %s", e)
+        log.error("❌ API key migration failed: %s", e) 
 
-# # ===========================================================================
+
+# # ======= END of db_migration.py 
 
 # from __future__ import annotations
 # # backend/db_migrations.py
@@ -338,6 +400,26 @@ def run_api_key_migration(engine: Engine) -> None:
 #         # ✅ FIX: subscription_updated_at — last Stripe sync timestamp
 #         _add_column(conn, dialect, "users", "subscription_updated_at",
 #                     "TIMESTAMP")
+
+#         # ----------------------------------------------------------------
+#         # screenshots table — missing columns
+#         # ----------------------------------------------------------------
+#         # ✅ FIX: remove_elements — model uses this name, but old DB has
+#         #    "removed_elements". The DB hint confirms the old column name.
+#         #    We add the new name; old rows simply have NULL for this field.
+#         _add_column(conn, dialect, "screenshots", "remove_elements",    "TEXT")
+#         _add_column(conn, dialect, "screenshots", "quality",            "INTEGER")
+#         _add_column(conn, dialect, "screenshots", "storage_key",        "TEXT")
+#         _add_column(conn, dialect, "screenshots", "processing_time_ms", "FLOAT")
+#         _add_column(conn, dialect, "screenshots", "error_message",      "TEXT")
+#         _add_column(conn, dialect, "screenshots", "dark_mode",          "BOOLEAN")
+#         _add_column(conn, dialect, "screenshots", "delay_seconds",      "INTEGER")
+#         _add_column(conn, dialect, "screenshots", "expires_at",         "TIMESTAMP")
+#         _add_column(conn, dialect, "screenshots", "is_baseline",        "BOOLEAN")
+#         _add_column(conn, dialect, "screenshots", "baseline_screenshot_id", "TEXT")
+#         _add_column(conn, dialect, "screenshots", "difference_percentage",  "FLOAT")
+#         _add_column(conn, dialect, "screenshots", "has_changes",        "BOOLEAN")
+#         _add_column(conn, dialect, "screenshots", "screenshot_path",    "TEXT")
 
 #         # ----------------------------------------------------------------
 #         # subscriptions table — missing columns (pre-existing migrations)
