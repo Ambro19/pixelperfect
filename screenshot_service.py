@@ -12,21 +12,28 @@
 # ✅ Keeps your 3-tier timeout fallback strategy
 # ✅ WebP support via Pillow (PNG -> WebP)
 # ✅ Safer cleanup for temp files
-# ✅ FIX (Mar 2026): get_screenshot_url now prefers CUSTOM_API_DOMAIN over
-#    BACKEND_URL so batch job screenshot links always resolve to the correct
-#    public-facing URL (https://api.pixelperfectapi.net/screenshots/...).
+# ✅ FIX (Mar 2026 v1): get_screenshot_url prefers CUSTOM_API_DOMAIN over
+#    BACKEND_URL in production, fixing mobile 404s on batch View links.
+# ✅ FIX (Mar 2026 v2): get_screenshot_url is now ENVIRONMENT-AWARE.
 #
-#    Root cause of the mobile 404:
-#      BACKEND_URL is typically the internal Render deploy URL
-#      (e.g. https://pixelperfect-backend-l5dn.onrender.com).
-#      That URL starts with "https://" so BatchJobs.js → resolveScreenshotUrl
-#      returned it unchanged.  The browser then hit the Render URL directly,
-#      which either routed incorrectly through Cloudflare or the file didn't
-#      exist on that host → {"detail":"Not Found"}.
+#    Bug introduced by v1:
+#      The v1 fix made get_screenshot_url ALWAYS prefer CUSTOM_API_DOMAIN,
+#      even in local development. In local dev the backend saves screenshots
+#      to the local backend/screenshots/ folder, but the stored URL pointed
+#      to api.pixelperfectapi.net — where those files don't exist → 404.
 #
-#    Fix: prioritise CUSTOM_API_DOMAIN (https://api.pixelperfectapi.net) which
-#    is the domain where /screenshots/ is actually mounted and served.
-#    BACKEND_URL is kept as a fallback; localhost:8000 is the last resort.
+#    Correct behaviour:
+#      ENVIRONMENT=production  → use CUSTOM_API_DOMAIN (api.pixelperfectapi.net)
+#                                 Files on Render are served from there. ✓
+#      ENVIRONMENT=development → use BACKEND_URL (http://localhost:8000)
+#                                 Files are local; the frontend's
+#                                 resolveScreenshotUrl() already rewrites
+#                                 localhost → LAN IP for mobile. ✓
+#
+#    Priority per environment:
+#      production:   CUSTOM_API_DOMAIN > BACKEND_URL > localhost fallback
+#      development:  BACKEND_URL > localhost fallback
+#                    (CUSTOM_API_DOMAIN intentionally skipped in dev)
 # ============================================================================
 
 import os
@@ -103,20 +110,14 @@ class ScreenshotService:
         self._init_error: Optional[str] = None
 
     def is_ready(self) -> bool:
-        """
-        True only when Playwright + browser are ready.
-        This is the check endpoints should use.
-        """
+        """True only when Playwright + browser are ready."""
         return bool(self._initialized and self.browser and not self._init_error)
 
     def last_error(self) -> Optional[str]:
         return self._init_error
 
     async def initialize(self) -> None:
-        """
-        Initialize Playwright browser (safe to call multiple times).
-        If it fails, stores error and raises RuntimeError.
-        """
+        """Initialize Playwright browser (safe to call multiple times)."""
         if self.is_ready():
             return
 
@@ -399,27 +400,49 @@ class ScreenshotService:
 screenshot_service = ScreenshotService()
 
 
-# ✅ FIX (Mar 2026): Prefer CUSTOM_API_DOMAIN over BACKEND_URL.
+# ✅ FIX (Mar 2026 v2): Environment-aware screenshot URL resolution.
 #
-# Why this matters:
-#   BACKEND_URL is typically the internal Render deploy URL
-#   (e.g. https://pixelperfect-backend-l5dn.onrender.com).
-#   Since it starts with "https://", the frontend's resolveScreenshotUrl()
-#   passes it through unchanged, so the browser ends up requesting a URL
-#   on the wrong host → {"detail": "Not Found"}.
+# The full call chain that must be correct:
+#   capture (backend) → get_screenshot_url() → stored in DB + JOBS dict
+#       ↓ (polled by BatchJobs.js)
+#   resolveScreenshotUrl(item.screenshot_url) in BatchJobs.js
+#       ↓
+#   Browser opens the URL → the file must exist on THAT host
 #
-#   CUSTOM_API_DOMAIN=https://api.pixelperfectapi.net is the public domain
-#   where /screenshots/ is actually mounted and reachable by all clients,
-#   including mobile browsers — so it must be used here.
+# PRODUCTION  (ENVIRONMENT=production):
+#   Screenshots live on Render's disk, served via CustomStaticFiles at
+#   api.pixelperfectapi.net/screenshots/. Must use CUSTOM_API_DOMAIN.
+#   Priority: CUSTOM_API_DOMAIN > BACKEND_URL > localhost fallback
 #
-# Priority: CUSTOM_API_DOMAIN > BACKEND_URL > localhost fallback
+# DEVELOPMENT (ENVIRONMENT=development, the default):
+#   Screenshots live on the LOCAL backend's disk (backend/screenshots/).
+#   CUSTOM_API_DOMAIN must NOT be used — the production server has no
+#   copy of the locally-captured file → 404.
+#   Use BACKEND_URL (typically http://localhost:8000).
+#   The frontend's resolveScreenshotUrl() already handles the
+#   localhost → LAN-IP rewrite for mobile browsers, so no change needed
+#   in BatchJobs.js for this case.
+#   Priority: BACKEND_URL > localhost fallback
+#             (CUSTOM_API_DOMAIN intentionally skipped in dev)
+#
 def get_screenshot_url(filename: str, base_url: str = "") -> str:
     if not base_url:
-        base_url = (
-            os.getenv("CUSTOM_API_DOMAIN") or
-            os.getenv("BACKEND_URL") or
-            "http://localhost:8000"
-        ).strip().rstrip("/")
+        environment = os.getenv("ENVIRONMENT", "development").lower()
+        is_prod = environment == "production"
+
+        if is_prod:
+            base_url = (
+                os.getenv("CUSTOM_API_DOMAIN") or
+                os.getenv("BACKEND_URL") or
+                "http://localhost:8000"
+            ).strip().rstrip("/")
+        else:
+            # Development: use local server. CUSTOM_API_DOMAIN skipped intentionally.
+            base_url = (
+                os.getenv("BACKEND_URL") or
+                "http://localhost:8000"
+            ).strip().rstrip("/")
+
     return f"{base_url.rstrip('/')}/screenshots/{filename}"
 
 
@@ -437,13 +460,12 @@ def check_usage_limit(user, tier_limits) -> bool:
     return current_usage < limit
 
 
-
-# # =====================================================================
+# # ===============================================
 # # ============================================================================
 # # SCREENSHOT SERVICE - PixelPerfect API (PRODUCTION READY)
 # # File: backend/screenshot_service.py
 # # Author: OneTechly
-# # Updated: Feb 2026
+# # Updated: March 2026
 # # ============================================================================
 # # Fixes in this version:
 # # ✅ Adds "is_ready()" that checks browser availability
@@ -453,6 +475,21 @@ def check_usage_limit(user, tier_limits) -> bool:
 # # ✅ Keeps your 3-tier timeout fallback strategy
 # # ✅ WebP support via Pillow (PNG -> WebP)
 # # ✅ Safer cleanup for temp files
+# # ✅ FIX (Mar 2026): get_screenshot_url now prefers CUSTOM_API_DOMAIN over
+# #    BACKEND_URL so batch job screenshot links always resolve to the correct
+# #    public-facing URL (https://api.pixelperfectapi.net/screenshots/...).
+# #
+# #    Root cause of the mobile 404:
+# #      BACKEND_URL is typically the internal Render deploy URL
+# #      (e.g. https://pixelperfect-backend-l5dn.onrender.com).
+# #      That URL starts with "https://" so BatchJobs.js → resolveScreenshotUrl
+# #      returned it unchanged.  The browser then hit the Render URL directly,
+# #      which either routed incorrectly through Cloudflare or the file didn't
+# #      exist on that host → {"detail":"Not Found"}.
+# #
+# #    Fix: prioritise CUSTOM_API_DOMAIN (https://api.pixelperfectapi.net) which
+# #    is the domain where /screenshots/ is actually mounted and served.
+# #    BACKEND_URL is kept as a fallback; localhost:8000 is the last resort.
 # # ============================================================================
 
 # import os
@@ -494,12 +531,10 @@ def check_usage_limit(user, tier_limits) -> bool:
 
 
 # def _playwright_install_hint() -> str:
-#     # Helpful message for BOTH normal Render Python runtime and Docker
-#     # If you set PLAYWRIGHT_BROWSERS_PATH=0 in Dockerfile, browsers are baked in.
 #     return (
 #         "Playwright browsers may be missing.\n"
 #         "If using Render (non-Docker): add a Build Command:\n"
-#         "  python -m playwright install --with-deps chromium\n"
+#         "  python -m playwright install chromium\n"
 #         "If using Docker: ensure your Dockerfile runs:\n"
 #         "  python -m playwright install --with-deps chromium\n"
 #         "Then redeploy."
@@ -549,7 +584,6 @@ def check_usage_limit(user, tier_limits) -> bool:
 #             return
 
 #         if self._init_error:
-#             # Fail fast with the same message
 #             raise RuntimeError(self._init_error)
 
 #         import asyncio
@@ -746,7 +780,7 @@ def check_usage_limit(user, tier_limits) -> bool:
 #                 page.pdf(path=str(filepath), format="A4", print_background=True)
 
 #             elif fmt == "webp":
-#                 # Capture PNG then convert
+#                 # Capture PNG then convert to WebP via Pillow
 #                 page.screenshot(path=str(temp_filepath), full_page=bool(full_page), type="png")
 #                 img = Image.open(str(temp_filepath))
 #                 img.save(str(filepath), "WEBP", quality=90, method=6)
@@ -760,7 +794,7 @@ def check_usage_limit(user, tier_limits) -> bool:
 #                     options["type"] = "png"
 #                 page.screenshot(**options)
 
-#             # cleanup temp png (webp case)
+#             # Cleanup temp PNG used during WebP conversion
 #             if temp_filepath:
 #                 try:
 #                     temp_filepath.unlink(missing_ok=True)
@@ -828,13 +862,31 @@ def check_usage_limit(user, tier_limits) -> bool:
 # screenshot_service = ScreenshotService()
 
 
+# # ✅ FIX (Mar 2026): Prefer CUSTOM_API_DOMAIN over BACKEND_URL.
+# #
+# # Why this matters:
+# #   BACKEND_URL is typically the internal Render deploy URL
+# #   (e.g. https://pixelperfect-backend-l5dn.onrender.com).
+# #   Since it starts with "https://", the frontend's resolveScreenshotUrl()
+# #   passes it through unchanged, so the browser ends up requesting a URL
+# #   on the wrong host → {"detail": "Not Found"}.
+# #
+# #   CUSTOM_API_DOMAIN=https://api.pixelperfectapi.net is the public domain
+# #   where /screenshots/ is actually mounted and reachable by all clients,
+# #   including mobile browsers — so it must be used here.
+# #
+# # Priority: CUSTOM_API_DOMAIN > BACKEND_URL > localhost fallback
 # def get_screenshot_url(filename: str, base_url: str = "") -> str:
 #     if not base_url:
-#         base_url = os.getenv("BACKEND_URL", "http://localhost:8000")
+#         base_url = (
+#             os.getenv("CUSTOM_API_DOMAIN") or
+#             os.getenv("BACKEND_URL") or
+#             "http://localhost:8000"
+#         ).strip().rstrip("/")
 #     return f"{base_url.rstrip('/')}/screenshots/{filename}"
 
 
-# # IMPORTANT: NO db.commit() here. Caller controls transaction.
+# # IMPORTANT: NO db.commit() here. Caller controls the transaction.
 # def increment_user_usage(user) -> None:
 #     user.usage_screenshots = (user.usage_screenshots or 0) + 1
 #     user.usage_api_calls = (user.usage_api_calls or 0) + 1
