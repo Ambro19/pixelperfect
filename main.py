@@ -12,17 +12,17 @@
 # - Docs-safe security headers middleware
 # - Per-user tier concurrency limiter (asyncio Semaphore)
 # - Playwright screenshot service initialization on startup
-# - FIX (Mar 2026): subscription_status counts directly from DB
+# - FIX (Mar 2026, v1): subscription_status counts directly from DB
 #   Fixes Pro users showing 0 usage (old code read stale counter columns)
-# - FIX (Mar 2026): delete endpoint accepts UUID string IDs (PostgreSQL)
-# - FIX (Mar 2026): restored DB init/migrations in startup; added
+# - FIX (Mar 2026, v2): delete endpoint accepts UUID string IDs (PostgreSQL)
+# - FIX (Mar 2026, v3): restored DB init/migrations in startup; added
 #   _verify_required_routes() to catch 405 root-cause at boot time
-# - FIX (Mar 2026): DEV_ORIGINS uses env var CORS_DEV_ORIGINS so LAN IP
+# - FIX (Mar 2026, v4): DEV_ORIGINS uses env var CORS_DEV_ORIGINS so LAN IP
 #   changes never require a code edit + redeploy
-# - FIX (Mar 2026): PROD_CSP connect-src now includes api.pixelperfectapi.net
-#   — without this the browser blocks all fetch() calls from the frontend
+# - FIX (Mar 2026, v5): PROD_CSP connect-src now includes api.pixelperfectapi.net
+#   — without this the browser blocks all fetch() calls from the frontend ./
 #   to the API subdomain in production (was silently missing)
-# - FIX (Mar 2026): /screenshots static mount now uses the EXACT SAME
+# - FIX (Mar 2026, v6): /screenshots static mount now uses the EXACT SAME
 #   directory object from screenshot_service.py to eliminate production
 #   404s caused by directory drift.
 # ========================================
