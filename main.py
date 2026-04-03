@@ -1040,7 +1040,8 @@ def subscription_status(
     tier = (getattr(current_user, "subscription_tier", "free") or "free").lower()
     tier_limits = get_tier_limits(tier)
 
-    now = datetime.now(timezone.utc)
+    #now = datetime.now(timezone.utc)
+    now = datetime.utcnow()
     period_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
     screenshots_used = (
