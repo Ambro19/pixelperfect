@@ -789,8 +789,6 @@ def reset_password(payload: ResetPasswordIn, db: Session = Depends(get_db)):
     db.commit()
     return {"ok": True}
 
-# This file contains ONLY the NEW endpoints to add to your main.py
-# ========================================
 # Updated April 2026: ADD THESE ENDPOINTS TO YOUR main.py FILE
 # ========================================
 # Location: Add these AFTER your existing auth routes (around line 700)
