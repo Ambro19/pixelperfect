@@ -629,6 +629,7 @@ Sent via pixelperfectapi.net/contact
 
     # Any exception here propagates to run_in_executor → caught by the
     # endpoint → returns HTTP 503 with actionable message to the user.
+    # ✅ CORRECT — raises on failure so endpoint returns 503
     with smtplib.SMTP(smtp_host, smtp_port) as server:
         server.ehlo()
         server.starttls()
