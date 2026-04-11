@@ -1,22 +1,30 @@
 from __future__ import annotations
 # backend/db_migrations.py
 # ============================================================================
-# Updated: March 2026
+# Updated: April 2026
 #
-# ✅ FIX: Added migrations for all missing users table columns:
-#    - subscription_id          ← was causing 500 on /register in production
-#    - stripe_subscription_status
-#    - subscription_ends_at
-#    - subscription_expires_at
-#    - subscription_updated_at
+# ✅ All March 2026 fixes retained (users table columns, batch_jobs table
+#    creation, screenshots columns, subscriptions columns, indexes)
 #
-# Root cause: models.py User defines these columns, but PostgreSQL's
-# create_all() only creates missing TABLES — it never adds missing COLUMNS
-# to existing tables. Without these ALTER TABLE statements the production
-# DB schema drifts from the ORM model on every deploy that adds new fields.
+# ✅ FIX (Apr 2026 — Persistent batch job storage):
+#    Added two new columns required by batch.py's _reconstruct_job_from_db():
 #
-# All migrations here are idempotent (check-before-alter), so they are
-# safe to run on every startup.
+#    batch_jobs.urls_json (TEXT, nullable)
+#      — JSON array of submitted URLs, written at submit time.
+#        Enables full job reconstruction after a server restart.
+#        Without it, all job item state is permanently lost on restart.
+#
+#    screenshots.batch_job_id (VARCHAR(32), nullable)
+#      — Links each screenshot captured inside a batch back to its
+#        parent BatchJob row. batch.py queries this to recover completed
+#        screenshot URLs when reconstructing jobs from DB.
+#        NULL for single (non-batch) screenshot captures.
+#
+#    Index idx_screenshots_batch_job_id added for query performance
+#    (batch.py queries WHERE batch_job_id = ? on every job reconstruction).
+#
+# All migrations here are idempotent (check-before-alter), safe to run
+# on every startup on both SQLite (dev) and PostgreSQL (production).
 # ============================================================================
 
 import logging
@@ -57,7 +65,9 @@ def _has_column(conn, dialect: str, table: str, column: str) -> bool:
     return conn.exec_driver_sql(sql).first() is not None
 
 
-def _add_column(conn, dialect: str, table: str, column: str, col_type: str) -> None:
+def _add_column(
+    conn, dialect: str, table: str, column: str, col_type: str
+) -> None:
     """
     Add a column if it doesn't already exist.
     Uses ADD COLUMN IF NOT EXISTS on PostgreSQL (9.6+) and a check-first
@@ -69,7 +79,8 @@ def _add_column(conn, dialect: str, table: str, column: str, col_type: str) -> N
     log.info("Adding %s.%s (%s) …", table, column, col_type)
     if dialect == "postgresql":
         conn.exec_driver_sql(
-            f"ALTER TABLE public.{table} ADD COLUMN IF NOT EXISTS {column} {col_type}"
+            f"ALTER TABLE public.{table} "
+            f"ADD COLUMN IF NOT EXISTS {column} {col_type}"
         )
     else:
         conn.exec_driver_sql(
@@ -78,7 +89,9 @@ def _add_column(conn, dialect: str, table: str, column: str, col_type: str) -> N
     log.info("✅ Added %s.%s", table, column)
 
 
-def _create_index(conn, name: str, table: str, cols: list[str]) -> None:
+def _create_index(
+    conn, name: str, table: str, cols: list[str]
+) -> None:
     cols_sql = ", ".join(cols)
     conn.exec_driver_sql(
         f"CREATE INDEX IF NOT EXISTS {name} ON {table} ({cols_sql})"
@@ -93,6 +106,7 @@ def run_startup_migrations(engine: Engine) -> None:
     dialect = _dialect_name(engine)
 
     with engine.begin() as conn:
+
         # ----------------------------------------------------------------
         # Engine-specific settings
         # ----------------------------------------------------------------
@@ -103,111 +117,148 @@ def run_startup_migrations(engine: Engine) -> None:
         # ----------------------------------------------------------------
         # users table — missing columns
         # ----------------------------------------------------------------
-        # ✅ FIX: subscription_id — was causing:
-        #    psycopg2.errors.UndefinedColumn: column users.subscription_id
-        #    → HTTP 500 on every POST /register in production
         _add_column(conn, dialect, "users", "subscription_id",
                     "VARCHAR(100) UNIQUE")
-
-        # ✅ FIX: stripe_subscription_status — needed by webhook_handler.py
         _add_column(conn, dialect, "users", "stripe_subscription_status",
                     "VARCHAR(20)")
-
-        # ✅ FIX: subscription_ends_at — legacy compatibility field
         _add_column(conn, dialect, "users", "subscription_ends_at",
                     "TIMESTAMP")
-
-        # ✅ FIX: subscription_expires_at — used by subscription_sync.py
         _add_column(conn, dialect, "users", "subscription_expires_at",
                     "TIMESTAMP")
-
-        # ✅ FIX: subscription_updated_at — last Stripe sync timestamp
         _add_column(conn, dialect, "users", "subscription_updated_at",
                     "TIMESTAMP")
 
         # ----------------------------------------------------------------
-        # batch_jobs table — create if missing
-        # ✅ NEW: The BatchJob model was added in March 2026. PostgreSQL DBs
-        #    that existed before that don't have this table. create_all()
-        #    creates it on a fresh DB, but NOT on existing ones — so we
-        #    create it here if absent.  All columns match the BatchJob model.
+        # batch_jobs table — create if missing, then add new columns
         # ----------------------------------------------------------------
         if dialect == "postgresql":
             _batch_exists_sql = """
                 SELECT 1 FROM information_schema.tables
-                WHERE table_schema = 'public' AND table_name = 'batch_jobs' LIMIT 1
+                WHERE table_schema = 'public'
+                  AND table_name   = 'batch_jobs'
+                LIMIT 1
             """
         else:
             _batch_exists_sql = (
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='batch_jobs'"
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type='table' AND name='batch_jobs'"
             )
-        _batch_exists = conn.exec_driver_sql(_batch_exists_sql).first() is not None
+        _batch_exists = (
+            conn.exec_driver_sql(_batch_exists_sql).first() is not None
+        )
 
         if not _batch_exists:
             log.info("Creating batch_jobs table …")
             if dialect == "postgresql":
                 conn.exec_driver_sql("""
                     CREATE TABLE IF NOT EXISTS public.batch_jobs (
-                        id          VARCHAR(32)  PRIMARY KEY,
-                        user_id     INTEGER      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                        status      VARCHAR(20)  NOT NULL DEFAULT 'queued',
-                        format      VARCHAR(10)  NOT NULL DEFAULT 'png',
-                        width       INTEGER      NOT NULL DEFAULT 1920,
-                        height      INTEGER      NOT NULL DEFAULT 1080,
-                        full_page   BOOLEAN      NOT NULL DEFAULT FALSE,
-                        total_urls  INTEGER      NOT NULL DEFAULT 0,
-                        completed_count INTEGER  DEFAULT 0,
-                        failed_count    INTEGER  DEFAULT 0,
-                        created_at  TIMESTAMP    NOT NULL DEFAULT NOW(),
-                        completed_at TIMESTAMP
+                        id              VARCHAR(32)  PRIMARY KEY,
+                        user_id         INTEGER      NOT NULL
+                                            REFERENCES users(id) ON DELETE CASCADE,
+                        status          VARCHAR(20)  NOT NULL DEFAULT 'queued',
+                        format          VARCHAR(10)  NOT NULL DEFAULT 'png',
+                        width           INTEGER      NOT NULL DEFAULT 1920,
+                        height          INTEGER      NOT NULL DEFAULT 1080,
+                        full_page       BOOLEAN      NOT NULL DEFAULT FALSE,
+                        total_urls      INTEGER      NOT NULL DEFAULT 0,
+                        completed_count INTEGER               DEFAULT 0,
+                        failed_count    INTEGER               DEFAULT 0,
+                        urls_json       TEXT,
+                        created_at      TIMESTAMP    NOT NULL DEFAULT NOW(),
+                        completed_at    TIMESTAMP
                     )
                 """)
             else:
                 conn.exec_driver_sql("""
                     CREATE TABLE IF NOT EXISTS batch_jobs (
-                        id           TEXT PRIMARY KEY,
-                        user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                        status       TEXT NOT NULL DEFAULT 'queued',
-                        format       TEXT NOT NULL DEFAULT 'png',
-                        width        INTEGER NOT NULL DEFAULT 1920,
-                        height       INTEGER NOT NULL DEFAULT 1080,
-                        full_page    INTEGER NOT NULL DEFAULT 0,
-                        total_urls   INTEGER NOT NULL DEFAULT 0,
-                        completed_count INTEGER DEFAULT 0,
-                        failed_count    INTEGER DEFAULT 0,
-                        created_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                        completed_at TIMESTAMP
+                        id              TEXT     PRIMARY KEY,
+                        user_id         INTEGER  NOT NULL
+                                            REFERENCES users(id) ON DELETE CASCADE,
+                        status          TEXT     NOT NULL DEFAULT 'queued',
+                        format          TEXT     NOT NULL DEFAULT 'png',
+                        width           INTEGER  NOT NULL DEFAULT 1920,
+                        height          INTEGER  NOT NULL DEFAULT 1080,
+                        full_page       INTEGER  NOT NULL DEFAULT 0,
+                        total_urls      INTEGER  NOT NULL DEFAULT 0,
+                        completed_count INTEGER           DEFAULT 0,
+                        failed_count    INTEGER           DEFAULT 0,
+                        urls_json       TEXT,
+                        created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        completed_at    TIMESTAMP
                     )
                 """)
-            log.info("✅ Created batch_jobs table")
+            log.info("✅ Created batch_jobs table (includes urls_json)")
 
-            # Idempotent indexes on the new table
-            _create_index(conn, "idx_batch_jobs_user_id",   "batch_jobs", ["user_id"])
-            _create_index(conn, "idx_batch_jobs_created_at","batch_jobs", ["created_at"])
-            _create_index(conn, "idx_batch_jobs_status",    "batch_jobs", ["status"])
+            _create_index(conn, "idx_batch_jobs_user_id",
+                          "batch_jobs", ["user_id"])
+            _create_index(conn, "idx_batch_jobs_created_at",
+                          "batch_jobs", ["created_at"])
+            _create_index(conn, "idx_batch_jobs_status",
+                          "batch_jobs", ["status"])
+
+        else:
+            # Table already exists — add urls_json if it wasn't there yet.
+            # ✅ FIX (Apr 2026): batch_jobs.urls_json
+            # Required by _reconstruct_job_from_db() in batch.py.
+            # Existing rows get NULL (no history to reconstruct from old jobs).
+            _add_column(conn, dialect, "batch_jobs", "urls_json", "TEXT")
 
         # ----------------------------------------------------------------
         # screenshots table — missing columns
         # ----------------------------------------------------------------
-        # ✅ FIX: remove_elements — model uses this name, but old DB has
-        #    "removed_elements". The DB hint confirms the old column name.
-        #    We add the new name; old rows simply have NULL for this field.
-        _add_column(conn, dialect, "screenshots", "remove_elements",    "TEXT")
-        _add_column(conn, dialect, "screenshots", "quality",            "INTEGER")
-        _add_column(conn, dialect, "screenshots", "storage_key",        "TEXT")
-        _add_column(conn, dialect, "screenshots", "processing_time_ms", "FLOAT")
-        _add_column(conn, dialect, "screenshots", "error_message",      "TEXT")
-        _add_column(conn, dialect, "screenshots", "dark_mode",          "BOOLEAN")
-        _add_column(conn, dialect, "screenshots", "delay_seconds",      "INTEGER")
-        _add_column(conn, dialect, "screenshots", "expires_at",         "TIMESTAMP")
-        _add_column(conn, dialect, "screenshots", "is_baseline",        "BOOLEAN")
-        _add_column(conn, dialect, "screenshots", "baseline_screenshot_id", "TEXT")
-        _add_column(conn, dialect, "screenshots", "difference_percentage",  "FLOAT")
-        _add_column(conn, dialect, "screenshots", "has_changes",        "BOOLEAN")
-        _add_column(conn, dialect, "screenshots", "screenshot_path",    "TEXT")
+        _add_column(conn, dialect, "screenshots", "remove_elements",
+                    "TEXT")
+        _add_column(conn, dialect, "screenshots", "quality",
+                    "INTEGER")
+        _add_column(conn, dialect, "screenshots", "storage_key",
+                    "TEXT")
+        _add_column(conn, dialect, "screenshots", "processing_time_ms",
+                    "FLOAT")
+        _add_column(conn, dialect, "screenshots", "error_message",
+                    "TEXT")
+        _add_column(conn, dialect, "screenshots", "dark_mode",
+                    "BOOLEAN")
+        _add_column(conn, dialect, "screenshots", "delay_seconds",
+                    "INTEGER")
+        _add_column(conn, dialect, "screenshots", "expires_at",
+                    "TIMESTAMP")
+        _add_column(conn, dialect, "screenshots", "is_baseline",
+                    "BOOLEAN")
+        _add_column(conn, dialect, "screenshots", "baseline_screenshot_id",
+                    "TEXT")
+        _add_column(conn, dialect, "screenshots", "difference_percentage",
+                    "FLOAT")
+        _add_column(conn, dialect, "screenshots", "has_changes",
+                    "BOOLEAN")
+        _add_column(conn, dialect, "screenshots", "screenshot_path",
+                    "TEXT")
+
+        # ✅ FIX (Apr 2026): screenshots.batch_job_id
+        # Links each batch-captured screenshot back to its parent BatchJob.
+        # Queried by _reconstruct_job_from_db() in batch.py:
+        #   SELECT * FROM screenshots WHERE batch_job_id = ?
+        # NULL for screenshots taken outside of batch jobs (single captures).
+        # Note: FK constraint omitted here because:
+        #   - SQLite does not enforce FK constraints on ADD COLUMN
+        #   - PostgreSQL ADD COLUMN IF NOT EXISTS doesn't support inline FK
+        #   The FK is declared on the SQLAlchemy model (models.py) which
+        #   enforces it at the ORM level. Raw DB integrity is acceptable
+        #   without the constraint since batch.py always sets this correctly.
+        _add_column(conn, dialect, "screenshots", "batch_job_id",
+                    "VARCHAR(32)")
+
+        # Index is critical — batch.py queries WHERE batch_job_id = ?
+        # on every job reconstruction after a restart. Without it,
+        # this is a full table scan on potentially large screenshot tables.
+        _create_index(
+            conn,
+            "idx_screenshots_batch_job_id",
+            "screenshots",
+            ["batch_job_id"],
+        )
 
         # ----------------------------------------------------------------
-        # subscriptions table — missing columns (pre-existing migrations)
+        # subscriptions table — missing columns
         # ----------------------------------------------------------------
         _add_column(conn, dialect, "subscriptions", "stripe_customer_id",
                     "TEXT")
@@ -269,11 +320,12 @@ def run_api_key_migration(engine: Engine) -> None:
     except ImportError as e:
         log.warning("⚠️ API key system not available: %s", e)
     except Exception as e:
-        log.error("❌ API key migration failed: %s", e) 
+        log.error("❌ API key migration failed: %s", e)
 
 
-# # ======= END of db_migration.py 
+# ======= END OF db_migrations.py =============================================
 
+#=======================================================================================================================
 # from __future__ import annotations
 # # backend/db_migrations.py
 # # ============================================================================
@@ -402,6 +454,67 @@ def run_api_key_migration(engine: Engine) -> None:
 #                     "TIMESTAMP")
 
 #         # ----------------------------------------------------------------
+#         # batch_jobs table — create if missing
+#         # ✅ NEW: The BatchJob model was added in March 2026. PostgreSQL DBs
+#         #    that existed before that don't have this table. create_all()
+#         #    creates it on a fresh DB, but NOT on existing ones — so we
+#         #    create it here if absent.  All columns match the BatchJob model.
+#         # ----------------------------------------------------------------
+#         if dialect == "postgresql":
+#             _batch_exists_sql = """
+#                 SELECT 1 FROM information_schema.tables
+#                 WHERE table_schema = 'public' AND table_name = 'batch_jobs' LIMIT 1
+#             """
+#         else:
+#             _batch_exists_sql = (
+#                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='batch_jobs'"
+#             )
+#         _batch_exists = conn.exec_driver_sql(_batch_exists_sql).first() is not None
+
+#         if not _batch_exists:
+#             log.info("Creating batch_jobs table …")
+#             if dialect == "postgresql":
+#                 conn.exec_driver_sql("""
+#                     CREATE TABLE IF NOT EXISTS public.batch_jobs (
+#                         id          VARCHAR(32)  PRIMARY KEY,
+#                         user_id     INTEGER      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+#                         status      VARCHAR(20)  NOT NULL DEFAULT 'queued',
+#                         format      VARCHAR(10)  NOT NULL DEFAULT 'png',
+#                         width       INTEGER      NOT NULL DEFAULT 1920,
+#                         height      INTEGER      NOT NULL DEFAULT 1080,
+#                         full_page   BOOLEAN      NOT NULL DEFAULT FALSE,
+#                         total_urls  INTEGER      NOT NULL DEFAULT 0,
+#                         completed_count INTEGER  DEFAULT 0,
+#                         failed_count    INTEGER  DEFAULT 0,
+#                         created_at  TIMESTAMP    NOT NULL DEFAULT NOW(),
+#                         completed_at TIMESTAMP
+#                     )
+#                 """)
+#             else:
+#                 conn.exec_driver_sql("""
+#                     CREATE TABLE IF NOT EXISTS batch_jobs (
+#                         id           TEXT PRIMARY KEY,
+#                         user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+#                         status       TEXT NOT NULL DEFAULT 'queued',
+#                         format       TEXT NOT NULL DEFAULT 'png',
+#                         width        INTEGER NOT NULL DEFAULT 1920,
+#                         height       INTEGER NOT NULL DEFAULT 1080,
+#                         full_page    INTEGER NOT NULL DEFAULT 0,
+#                         total_urls   INTEGER NOT NULL DEFAULT 0,
+#                         completed_count INTEGER DEFAULT 0,
+#                         failed_count    INTEGER DEFAULT 0,
+#                         created_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+#                         completed_at TIMESTAMP
+#                     )
+#                 """)
+#             log.info("✅ Created batch_jobs table")
+
+#             # Idempotent indexes on the new table
+#             _create_index(conn, "idx_batch_jobs_user_id",   "batch_jobs", ["user_id"])
+#             _create_index(conn, "idx_batch_jobs_created_at","batch_jobs", ["created_at"])
+#             _create_index(conn, "idx_batch_jobs_status",    "batch_jobs", ["status"])
+
+#         # ----------------------------------------------------------------
 #         # screenshots table — missing columns
 #         # ----------------------------------------------------------------
 #         # ✅ FIX: remove_elements — model uses this name, but old DB has
@@ -484,5 +597,8 @@ def run_api_key_migration(engine: Engine) -> None:
 #     except ImportError as e:
 #         log.warning("⚠️ API key system not available: %s", e)
 #     except Exception as e:
-#         log.error("❌ API key migration failed: %s", e)
+#         log.error("❌ API key migration failed: %s", e) 
+
+
+# # # ======= END of db_migration.py =========== 
 
