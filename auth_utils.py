@@ -57,6 +57,7 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
     # Verify with bcrypt
     return pwd_context.verify(plain_password, hashed_password)
 
+
 #======================================================================================
 # # ========================================
 # # AUTHENTICATION UTILITIES - FIXED
