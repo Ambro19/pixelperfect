@@ -1009,6 +1009,7 @@ async def delete_job(
 
 # ====== END OF batch.py ========
 
+
 # # backend/routers/batch.py — PixelPerfect Screenshot API
 # # UPDATED: April 2026
 # #
