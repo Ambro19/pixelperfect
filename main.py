@@ -3,31 +3,47 @@
 # PIXELPERFECT SCREENSHOT API - BACKEND
 # ========================================
 # Author: OneTechly
-# Updated: April 2026 - PRODUCTION READY
+# Updated: May 2026 - PRODUCTION READY
 #
-# Includes:
-# - WebP Content-Type fix (Custom StaticFiles)
-# - CORS credentials support
-# - Swagger base URL correctness (FastAPI servers)
-# - Docs-safe security headers middleware
-# - Per-user tier concurrency limiter (asyncio Semaphore)
-# - Playwright screenshot service initialization on startup
-# - FIX (Mar 2026, v1): subscription_status counts directly from DB
-#   Fixes Pro users showing 0 usage (old code read stale counter columns)
-# - FIX (Mar 2026, v2): delete endpoint accepts UUID string IDs (PostgreSQL)
-# - FIX (Mar 2026, v3): restored DB init/migrations in startup; added
-#   _verify_required_routes() to catch 405 root-cause at boot time
-# - FIX (Mar 2026, v4): DEV_ORIGINS uses env var CORS_DEV_ORIGINS so LAN IP
-#   changes never require a code edit + redeploy
-# - FIX (Mar 2026, v5): PROD_CSP connect-src now includes api.pixelperfectapi.net
-#   — without this the browser blocks all fetch() calls from the frontend
-#   to the API subdomain in production (was silently missing)
-# - FIX (Mar 2026, v6): /screenshots static mount now uses the EXACT SAME
-#   directory object from screenshot_service.py to eliminate production
-#   404s caused by directory drift.
-# - FIX (Apr 2026, v7): Added /contact endpoint with Gmail SMTP (BackgroundTasks).
-#   Fixed missing BackgroundTasks import, removed duplicate asyncio/pydantic
-#   imports, removed unused ThreadPoolExecutor import.
+# ✅ All prior fixes retained (v1–v7, see below)
+#
+# ✅ ADD (May 2026, v8): Three new endpoints to match frontend changes:
+#
+#   POST /billing/create_portal_session
+#     Opens a Stripe Customer Portal session for the current user.
+#     The portal lets users manage payment methods, download invoices,
+#     switch billing cadence (monthly ↔ annual), and cancel their
+#     subscription directly in Stripe's hosted UI.
+#     Called by DashboardPage.js "💳 Manage Subscription & Billing" button.
+#     Returns: { url: str }  — frontend redirects to this URL.
+#
+#   POST /billing/cancel_subscription
+#     Cancels the user's active Stripe subscription at period end.
+#     Sets cancel_at_period_end=True so the user keeps access until
+#     the billing period expires, then Stripe fires a
+#     customer.subscription.deleted webhook that our webhook_handler
+#     downgrades the user to Free.
+#     Called by AccountSettings.js "🚫 Cancel Subscription" flow.
+#     Returns: { ok: True, message: str, cancel_at: str | null }
+#
+#   DELETE /user/delete_account
+#     Permanently deletes the user's account and all associated data:
+#     screenshots, batch jobs, API keys, subscription record.
+#     Cancels the Stripe subscription immediately (not at period end)
+#     if one exists. Clears the user row from the database.
+#     Called by AccountSettings.js "🗑️ Delete My Account" flow.
+#     Requires the user to have already typed "DELETE" on the frontend
+#     (frontend validation, not backend).
+#     Returns: { ok: True, message: str }
+#
+# Prior fixes (unchanged):
+# - v1: subscription_status counts directly from DB (fixes Pro 0 usage)
+# - v2: delete screenshot accepts UUID string IDs (PostgreSQL)
+# - v3: DB init/migrations in startup; _verify_required_routes()
+# - v4: CORS_DEV_ORIGINS env var for LAN development
+# - v5: PROD_CSP connect-src includes api.pixelperfectapi.net
+# - v6: /screenshots static mount uses SERVICE_SCREENSHOTS_DIR
+# - v7: /contact endpoint with Gmail SMTP (BackgroundTasks fix)
 # ========================================
 
 # =====================================================================
@@ -58,8 +74,6 @@ load_dotenv()
 load_dotenv(dotenv_path=find_dotenv(".env.local"), override=True)
 load_dotenv(dotenv_path=find_dotenv(".env"), override=False)
 
-# ✅ FIX (Apr 2026): BackgroundTasks was missing — caused NameError at runtime
-# on every POST /contact request. Added here alongside the other FastAPI imports.
 from fastapi import FastAPI, HTTPException, Depends, Request, Response, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
@@ -132,13 +146,13 @@ class CustomStaticFiles(StaticFiles):
         if isinstance(response, FileResponse):
             ext = Path(path).suffix.lower()
             mime_types = {
-                ".png": "image/png",
-                ".jpg": "image/jpeg",
+                ".png":  "image/png",
+                ".jpg":  "image/jpeg",
                 ".jpeg": "image/jpeg",
                 ".webp": "image/webp",
-                ".pdf": "application/pdf",
-                ".gif": "image/gif",
-                ".svg": "image/svg+xml",
+                ".pdf":  "application/pdf",
+                ".gif":  "image/gif",
+                ".svg":  "image/svg+xml",
             }
             if ext in mime_types:
                 response.headers["Content-Type"] = mime_types[ext]
@@ -169,8 +183,8 @@ logger.setLevel(logging.INFO)
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development").lower()
 IS_PROD = ENVIRONMENT == "production"
 
-FRONTEND_URL = (os.getenv("FRONTEND_URL", "http://localhost:3000") or "").rstrip("/")
-BACKEND_URL = (os.getenv("BACKEND_URL", "http://localhost:8000") or "").rstrip("/")
+FRONTEND_URL  = (os.getenv("FRONTEND_URL",  "http://localhost:3000") or "").rstrip("/")
+BACKEND_URL   = (os.getenv("BACKEND_URL",   "http://localhost:8000") or "").rstrip("/")
 CUSTOM_API_DOMAIN = (os.getenv("CUSTOM_API_DOMAIN", "https://api.pixelperfectapi.net") or "").rstrip("/")
 
 # =====================================================================
@@ -190,18 +204,20 @@ except Exception as e:
 # Tier concurrency limits
 # =====================================================================
 TIER_CONCURRENCY: Dict[str, int] = {
-    "starter": 2,
-    "pro": 3,
+    "starter":  2,
+    "pro":      3,
     "business": 5,
 }
 
-CONCURRENCY_ACQUIRE_TIMEOUT_SECONDS = float(os.getenv("CONCURRENCY_ACQUIRE_TIMEOUT_SECONDS", "5"))
+CONCURRENCY_ACQUIRE_TIMEOUT_SECONDS = float(
+    os.getenv("CONCURRENCY_ACQUIRE_TIMEOUT_SECONDS", "5")
+)
 
 def _normalize_tier(raw: Optional[str]) -> str:
     t = (raw or "").strip().lower()
-    if t in {"starter", "basic"}:       return "starter"
-    if t in {"pro", "premium"}:         return "pro"
-    if t in {"business", "enterprise"}: return "business"
+    if t in {"starter", "basic"}:        return "starter"
+    if t in {"pro", "premium"}:          return "pro"
+    if t in {"business", "enterprise"}:  return "business"
     if t in {"free", ""}:               return "starter"
     return t
 
@@ -212,9 +228,9 @@ def _tier_limit_for_user(user: User) -> int:
 class _UserLimiter:
     __slots__ = ("sem", "limit", "active", "pending_limit")
     def __init__(self, limit: int):
-        self.sem = asyncio.Semaphore(int(limit))
-        self.limit = int(limit)
-        self.active = 0
+        self.sem           = asyncio.Semaphore(int(limit))
+        self.limit         = int(limit)
+        self.active        = 0
         self.pending_limit: Optional[int] = None
 
 _USER_LIMITERS: Dict[int, _UserLimiter] = {}
@@ -247,13 +263,17 @@ async def enforce_tier_concurrency(
     limiter = await _get_user_limiter(user_id, desired)
 
     try:
-        await asyncio.wait_for(limiter.sem.acquire(), timeout=CONCURRENCY_ACQUIRE_TIMEOUT_SECONDS)
+        await asyncio.wait_for(
+            limiter.sem.acquire(),
+            timeout=CONCURRENCY_ACQUIRE_TIMEOUT_SECONDS,
+        )
     except asyncio.TimeoutError:
         tier = _normalize_tier(getattr(current_user, "subscription_tier", None))
         raise HTTPException(
             status_code=429,
             detail=(
-                f"Too many concurrent screenshots for your plan (tier={tier}, limit={desired}). "
+                f"Too many concurrent screenshots for your plan "
+                f"(tier={tier}, limit={desired}). "
                 "Please retry in a moment or upgrade for higher concurrency."
             ),
             headers={"Retry-After": "1"},
@@ -306,17 +326,17 @@ def _set_screenshot_ready(val: bool, err: Optional[str] = None):
     global SCREENSHOT_READY, SCREENSHOT_LAST_ERROR, SCREENSHOT_LAST_ERROR_AT
     SCREENSHOT_READY = bool(val)
     if err:
-        SCREENSHOT_LAST_ERROR = str(err)
-        SCREENSHOT_LAST_ERROR_AT = datetime.utcnow().isoformat()
+        SCREENSHOT_LAST_ERROR     = str(err)
+        SCREENSHOT_LAST_ERROR_AT  = datetime.utcnow().isoformat()
     elif val:
-        SCREENSHOT_LAST_ERROR = None
+        SCREENSHOT_LAST_ERROR    = None
         SCREENSHOT_LAST_ERROR_AT = None
 
 # =====================================================================
 # Security headers middleware (docs-safe)
 # =====================================================================
 _DOCS_PREFIXES = ("/docs", "/redoc")
-_DOCS_EXACT = {"/openapi.json"}
+_DOCS_EXACT    = {"/openapi.json"}
 
 def _remove_header(headers, key: str) -> None:
     try:
@@ -337,12 +357,12 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         server_header: Optional[str] = "PixelPerfect",
     ) -> None:
         super().__init__(app)
-        self.csp = csp
-        self.hsts = hsts
-        self.hsts_max_age = int(hsts_max_age)
+        self.csp            = csp
+        self.hsts           = hsts
+        self.hsts_max_age   = int(hsts_max_age)
         self.referrer_policy = referrer_policy
         self.x_frame_options = x_frame_options
-        self.server_header = server_header
+        self.server_header  = server_header
 
     async def dispatch(self, request: Request, call_next):
         response = await call_next(request)
@@ -377,16 +397,15 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 
 DEV_CSP = None
 
-# =====================================================================
-# ✅ FIX: PROD_CSP — added api.pixelperfectapi.net to connect-src
-# =====================================================================
+# ✅ FIX (v5): PROD_CSP — api.pixelperfectapi.net in connect-src
 PROD_CSP = (
     "default-src 'self'; "
     "img-src 'self' data: blob: https://api.pixelperfectapi.net; "
     "style-src 'self' 'unsafe-inline'; "
     "connect-src 'self' https://api.pixelperfectapi.net https://api.stripe.com; "
     "script-src 'self' https://js.stripe.com; "
-    "frame-src https://js.stripe.com https://checkout.stripe.com https://api.pixelperfectapi.net; "
+    "frame-src https://js.stripe.com https://checkout.stripe.com "
+    "https://billing.stripe.com https://api.pixelperfectapi.net; "
     "frame-ancestors 'none'; "
     "base-uri 'none'; "
 )
@@ -439,9 +458,7 @@ app.add_middleware(
 logger.info("CORS enabled for: %s (credentials: True)", allow_origins)
 
 # =====================================================================
-# Static screenshots mount
-# CRITICAL FIX:
-# Use the EXACT SAME directory exported by screenshot_service.py
+# Static screenshots mount — uses SERVICE_SCREENSHOTS_DIR (v6 fix)
 # =====================================================================
 SCREENSHOTS_DIR = Path(SERVICE_SCREENSHOTS_DIR).resolve()
 SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -456,9 +473,11 @@ logger.info("✅ Screenshot static files mounted with WebP support")
 logger.info("📂 Mounted /screenshots from: %s", SCREENSHOTS_DIR)
 logger.info("📂 screenshot_service uses: %s", Path(SERVICE_SCREENSHOTS_DIR).resolve())
 if SCREENSHOTS_DIR != Path(SERVICE_SCREENSHOTS_DIR).resolve():
-    logger.warning("⚠️ Screenshot directory mismatch detected between main.py and screenshot_service.py")
+    logger.warning(
+        "⚠️ Screenshot directory mismatch between main.py and screenshot_service.py"
+    )
 else:
-    logger.info("✅ Screenshot directory is unified between main.py and screenshot_service.py")
+    logger.info("✅ Screenshot directory unified between main.py and screenshot_service.py")
 
 @app.get("/favicon.ico", include_in_schema=False)
 def favicon():
@@ -467,21 +486,21 @@ def favicon():
 # =====================================================================
 # Auth helpers
 # =====================================================================
-ALGORITHM = os.getenv("ALGORITHM", "HS256")
+ALGORITHM                   = os.getenv("ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "1440"))
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme               = OAuth2PasswordBearer(tokenUrl="token")
+pwd_context                 = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
     to_encode = dict(data)
-    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=15))
+    expire    = datetime.utcnow() + (expires_delta or timedelta(minutes=15))
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 def canonical_account(user: User) -> Dict[str, Any]:
     return {
         "username": (user.username or "").strip(),
-        "email": (user.email or "").strip().lower(),
+        "email":    (user.email    or "").strip().lower(),
     }
 
 def ensure_stripe_customer_for_user(user: User, db: Session) -> None:
@@ -509,13 +528,13 @@ def ensure_stripe_customer_for_user(user: User, db: Session) -> None:
 # =====================================================================
 class UserCreate(BaseModel):
     username: str
-    email: str
+    email:    str
     password: str
 
 class UserResponse(BaseModel):
-    id: int
-    username: Optional[str] = None
-    email: str
+    id:         int
+    username:   Optional[str] = None
+    email:      str
     created_at: Optional[datetime] = None
     class Config:
         from_attributes = True
@@ -528,50 +547,54 @@ class ForgotPasswordIn(BaseModel):
     email: EmailStr
 
 class ResetPasswordIn(BaseModel):
-    token: str
+    token:        str
     new_password: str
 
 class BillingCheckoutIn(BaseModel):
-    plan: str
+    plan:          str
     billing_cycle: str = "monthly"
+
+class BillingPortalIn(BaseModel):
+    """
+    Body for POST /billing/create_portal_session.
+    return_url: where Stripe redirects the user after they close the portal.
+    """
+    return_url: Optional[str] = None
 
 class ChangePasswordRequest(BaseModel):
     current_password: str
-    new_password: str
+    new_password:     str
 
 class UpdateProfileRequest(BaseModel):
     username: Optional[str] = None
-    email: Optional[str] = None
+    email:    Optional[str] = None
 
 # =====================================================================
 # CONTACT FORM
 # =====================================================================
 class ContactFormRequest(BaseModel):
-    name: str
-    email: str
-    subject: str
-    message: str
+    name:     str
+    email:    str
+    subject:  str
+    message:  str
     category: str = "general"
 
 CATEGORY_LABELS = {
-    "general": "General Inquiry",
-    "technical": "Technical Support",
-    "billing": "Billing Question",
-    "enterprise": "Enterprise Sales",
+    "general":     "General Inquiry",
+    "technical":   "Technical Support",
+    "billing":     "Billing Question",
+    "enterprise":  "Enterprise Sales",
     "partnership": "Partnership",
-    "bug": "Bug Report",
+    "bug":         "Bug Report",
 }
 
-def _send_email_sync(name: str, email: str, subject: str, message: str, category: str):
-    """
-    Sends contact form email via Gmail SMTP.
-    Runs in a thread pool via run_in_executor.
-    Raises on any failure so the caller can return HTTP 503.
-    """
-    smtp_host     = os.getenv("SMTP_HOST", "smtp.gmail.com")
-    smtp_port     = int(os.getenv("SMTP_PORT", "587"))
-    smtp_user     = os.getenv("SMTP_USERNAME", "")
-    smtp_password = os.getenv("SMTP_PASSWORD", "")
+def _send_email_sync(
+    name: str, email: str, subject: str, message: str, category: str
+):
+    smtp_host     = os.getenv("SMTP_HOST",      "smtp.gmail.com")
+    smtp_port     = int(os.getenv("SMTP_PORT",  "587"))
+    smtp_user     = os.getenv("SMTP_USERNAME",  "")
+    smtp_password = os.getenv("SMTP_PASSWORD",  "")
     recipient     = os.getenv("CONTACT_RECIPIENT", "onetechly@gmail.com")
 
     if not smtp_user or not smtp_password:
@@ -579,19 +602,14 @@ def _send_email_sync(name: str, email: str, subject: str, message: str, category
 
     category_label = CATEGORY_LABELS.get(category, category.title())
 
-    text_body = f"""
-New contact form submission — PixelPerfect Screenshot API
-
-From:     {name} <{email}>
-Category: {category_label}
-Subject:  {subject}
-
-Message:
-{message}
-
----
-Sent via pixelperfectapi.net/contact
-"""
+    text_body = (
+        f"New contact form submission — PixelPerfect Screenshot API\n\n"
+        f"From:     {name} <{email}>\n"
+        f"Category: {category_label}\n"
+        f"Subject:  {subject}\n\n"
+        f"Message:\n{message}\n\n"
+        f"---\nSent via pixelperfectapi.net/contact"
+    )
 
     html_body = f"""
 <html><body style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px;">
@@ -616,8 +634,7 @@ Sent via pixelperfectapi.net/contact
       Reply directly to this email to respond to {name}.
     </p>
   </div>
-</body></html>
-"""
+</body></html>"""
 
     msg = MIMEMultipart("alternative")
     msg["Subject"]  = f"[PixelPerfect] {category_label}: {subject}"
@@ -627,9 +644,6 @@ Sent via pixelperfectapi.net/contact
     msg.attach(MIMEText(text_body, "plain"))
     msg.attach(MIMEText(html_body, "html"))
 
-    # Any exception here propagates to run_in_executor → caught by the
-    # endpoint → returns HTTP 503 with actionable message to the user.
-    # ✅ CORRECT — raises on failure so endpoint returns 503
     with smtplib.SMTP(smtp_host, smtp_port) as server:
         server.ehlo()
         server.starttls()
@@ -638,13 +652,8 @@ Sent via pixelperfectapi.net/contact
 
     logger.info("✅ Contact email sent: [%s] from %s", category_label, email)
 
-# ====== JUST NEWLY ADDED ================
 @app.post("/contact")
 async def contact_form(payload: ContactFormRequest):
-    """
-    Receives contact form submissions and emails them to onetechly@gmail.com.
-    Sends synchronously in a thread pool so errors are caught and returned to the user.
-    """
     if not payload.name.strip() or not payload.email.strip() or not payload.message.strip():
         raise HTTPException(status_code=422, detail="Name, email, and message are required.")
     if len(payload.message) > 5000:
@@ -653,7 +662,7 @@ async def contact_form(payload: ContactFormRequest):
     loop = asyncio.get_event_loop()
     try:
         await loop.run_in_executor(
-            None,  # uses default ThreadPoolExecutor
+            None,
             _send_email_sync,
             payload.name.strip(),
             payload.email.strip(),
@@ -662,10 +671,13 @@ async def contact_form(payload: ContactFormRequest):
             payload.category,
         )
     except Exception as e:
-        logger.error(f"Contact email delivery failed: {e}")
+        logger.error("Contact email delivery failed: %s", e)
         raise HTTPException(
             status_code=503,
-            detail="We couldn't deliver your message right now. Please email us directly at onetechly@gmail.com."
+            detail=(
+                "We couldn't deliver your message right now. "
+                "Please email us directly at onetechly@gmail.com."
+            ),
         )
 
     return {"message": "Message received. We'll get back to you within 24 hours."}
@@ -674,14 +686,14 @@ async def contact_form(payload: ContactFormRequest):
 # Startup & Shutdown
 # =====================================================================
 def _verify_required_routes(app: FastAPI) -> None:
-    wanted_path = "/api/v1/batch/submit_file"
+    wanted_path   = "/api/v1/batch/submit_file"
     wanted_method = "POST"
-    found_any = False
-    found_post = False
+    found_any     = False
+    found_post    = False
     found_methods: set = set()
 
     for r in app.router.routes:
-        path = getattr(r, "path", None)
+        path    = getattr(r, "path",    None)
         methods = getattr(r, "methods", None) or set()
         if path == wanted_path:
             found_any = True
@@ -704,19 +716,18 @@ def _verify_required_routes(app: FastAPI) -> None:
 
     if not found_post:
         logger.error(
-            "❌ Route exists but POST not allowed: %s | registered methods=%s",
-            wanted_path,
-            sorted(found_methods),
+            "❌ Route exists but POST not allowed: %s | methods=%s",
+            wanted_path, sorted(found_methods),
         )
         if not IS_PROD:
             raise RuntimeError(
                 f"{wanted_method} not registered for {wanted_path}. "
-                f"Found methods: {sorted(found_methods)}"
+                f"Found: {sorted(found_methods)}"
             )
 
 @app.on_event("startup")
 async def on_startup():
-    # --- 1. DB init + migrations ---
+    # 1. DB init + migrations
     try:
         initialize_database()
         run_startup_migrations(engine)
@@ -727,10 +738,10 @@ async def on_startup():
         if not IS_PROD:
             raise
 
-    # --- 2. Route verification ---
+    # 2. Route verification
     _verify_required_routes(app)
 
-    # --- 3. Screenshot service ---
+    # 3. Screenshot service
     try:
         await screenshot_service.initialize()
         _set_screenshot_ready(True)
@@ -740,22 +751,20 @@ async def on_startup():
             raise
         logger.exception("⚠️ Screenshot service init failed (non-fatal in production).")
 
-    logger.info("============================================================")
-    logger.info("PixelPerfect starting - ENV=%s DB=%s", ENVIRONMENT, DATABASE_URL)
-    logger.info("Frontend URL: %s", FRONTEND_URL)
-    logger.info("Backend URL: %s", BACKEND_URL)
-    logger.info("Custom API Domain: %s", CUSTOM_API_DOMAIN)
-    logger.info("Stripe configured: %s", bool(stripe and os.getenv("STRIPE_SECRET_KEY")))
-    logger.info("✅ API key system initialized")
-    logger.info("📸 Screenshot service ready: %s", SCREENSHOT_READY)
-    logger.info("📸 Screenshot mount directory: %s", SCREENSHOTS_DIR)
-    logger.info("📸 Screenshot directory contents at startup: %s", [p.name for p in SCREENSHOTS_DIR.glob("*")][:10])
-    if SCREENSHOT_LAST_ERROR:
-        logger.info("📸 Screenshot last error: %s", SCREENSHOT_LAST_ERROR)
-    logger.info("✅ Tier concurrency enabled: %s", TIER_CONCURRENCY)
     smtp_configured = bool(os.getenv("SMTP_USERNAME") and os.getenv("SMTP_PASSWORD"))
-    logger.info("📧 Contact form SMTP configured: %s", smtp_configured)
-    logger.info("============================================================")
+    logger.info("=" * 60)
+    logger.info("PixelPerfect starting - ENV=%s DB=%s", ENVIRONMENT, DATABASE_URL)
+    logger.info("Frontend URL:       %s", FRONTEND_URL)
+    logger.info("Backend URL:        %s", BACKEND_URL)
+    logger.info("Custom API Domain:  %s", CUSTOM_API_DOMAIN)
+    logger.info("Stripe configured:  %s", bool(stripe and os.getenv("STRIPE_SECRET_KEY")))
+    logger.info("📸 Screenshot ready: %s", SCREENSHOT_READY)
+    logger.info("📸 Screenshots dir:  %s", SCREENSHOTS_DIR)
+    logger.info("📧 SMTP configured:  %s", smtp_configured)
+    logger.info("✅ Tier concurrency: %s", TIER_CONCURRENCY)
+    if SCREENSHOT_LAST_ERROR:
+        logger.info("📸 Screenshot error: %s", SCREENSHOT_LAST_ERROR)
+    logger.info("=" * 60)
 
 @app.on_event("shutdown")
 async def on_shutdown():
@@ -772,7 +781,11 @@ app.router.redirect_slashes = True
 # =====================================================================
 @app.get("/")
 def root():
-    return {"message": "PixelPerfect Screenshot API", "status": "running", "version": "1.0.0"}
+    return {
+        "message": "PixelPerfect Screenshot API",
+        "status":  "running",
+        "version": "1.0.0",
+    }
 
 @app.head("/")
 def root_head():
@@ -782,18 +795,18 @@ def root_head():
 def health():
     smtp_configured = bool(os.getenv("SMTP_USERNAME") and os.getenv("SMTP_PASSWORD"))
     return {
-        "status": "healthy",
+        "status":    "healthy",
         "timestamp": datetime.utcnow().isoformat(),
         "environment": ENVIRONMENT,
         "services": {
-            "stripe": "configured" if os.getenv("STRIPE_SECRET_KEY") else "not_configured",
-            "screenshot_service": "ready" if SCREENSHOT_READY else "not_ready",
-            "contact_smtp": "configured" if smtp_configured else "not_configured",
+            "stripe":             "configured" if os.getenv("STRIPE_SECRET_KEY") else "not_configured",
+            "screenshot_service": "ready"      if SCREENSHOT_READY else "not_ready",
+            "contact_smtp":       "configured" if smtp_configured    else "not_configured",
         },
-        "screenshot_service_error": SCREENSHOT_LAST_ERROR,
+        "screenshot_service_error":    SCREENSHOT_LAST_ERROR,
         "screenshot_service_error_at": SCREENSHOT_LAST_ERROR_AT,
-        "tier_concurrency": TIER_CONCURRENCY,
-        "screenshots_dir": str(SCREENSHOTS_DIR),
+        "tier_concurrency":  TIER_CONCURRENCY,
+        "screenshots_dir":   str(SCREENSHOTS_DIR),
         "screenshots_dir_exists": SCREENSHOTS_DIR.exists(),
     }
 
@@ -811,7 +824,7 @@ async def options_handler(path: str):
 @app.post("/register")
 def register(user: UserCreate, db: Session = Depends(get_db)):
     username = (user.username or "").strip()
-    email = (user.email or "").strip().lower()
+    email    = (user.email    or "").strip().lower()
 
     if db.query(User).filter(User.username == username).first():
         raise HTTPException(status_code=400, detail="Username already exists.")
@@ -849,21 +862,19 @@ def register(user: UserCreate, db: Session = Depends(get_db)):
     return out
 
 @app.post("/token")
-def token_login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
-    identifier = (form.username or "").strip()
+def token_login(
+    form: OAuth2PasswordRequestForm = Depends(),
+    db:   Session                   = Depends(get_db),
+):
+    identifier    = (form.username or "").strip()
     password_input = form.password or ""
-    logger.info("🔐 Login attempt: username=%s", identifier)
 
     user = (
         db.query(User)
         .filter((User.username == identifier) | (User.email == identifier.lower()))
         .first()
     )
-    if not user:
-        logger.warning("❌ Login failed: user not found (username=%s)", identifier)
-        raise HTTPException(status_code=401, detail="Incorrect username/email or password")
-    if not verify_password(password_input, user.hashed_password):
-        logger.warning("❌ Login failed: wrong password (username=%s)", identifier)
+    if not user or not verify_password(password_input, user.hashed_password):
         raise HTTPException(status_code=401, detail="Incorrect username/email or password")
 
     try:
@@ -871,26 +882,23 @@ def token_login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depen
     except Exception:
         pass
 
-    token = create_access_token({"sub": user.username}, timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
-    logger.info("✅ Login successful: user=%s (%s)", user.username, user.email)
+    token = create_access_token(
+        {"sub": user.username},
+        timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
+    )
     return {"access_token": token, "token_type": "bearer", "user": canonical_account(user)}
 
 @app.post("/token_json")
 def token_login_json(req: LoginJSON, db: Session = Depends(get_db)):
-    identifier = (req.username or "").strip()
+    identifier    = (req.username or "").strip()
     password_input = req.password or ""
-    logger.info("🔐 JSON login attempt: username=%s", identifier)
 
     user = (
         db.query(User)
         .filter((User.username == identifier) | (User.email == identifier.lower()))
         .first()
     )
-    if not user:
-        logger.warning("❌ JSON login failed: user not found (username=%s)", identifier)
-        raise HTTPException(status_code=401, detail="Incorrect username/email or password")
-    if not verify_password(password_input, user.hashed_password):
-        logger.warning("❌ JSON login failed: wrong password (username=%s)", identifier)
+    if not user or not verify_password(password_input, user.hashed_password):
         raise HTTPException(status_code=401, detail="Incorrect username/email or password")
 
     try:
@@ -898,8 +906,10 @@ def token_login_json(req: LoginJSON, db: Session = Depends(get_db)):
     except Exception:
         pass
 
-    token = create_access_token({"sub": user.username}, timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
-    logger.info("✅ JSON login successful: user=%s (%s)", user.username, user.email)
+    token = create_access_token(
+        {"sub": user.username},
+        timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
+    )
     return {"access_token": token, "token_type": "bearer", "user": canonical_account(user)}
 
 @app.get("/users/me", response_model=UserResponse)
@@ -910,7 +920,7 @@ def read_users_me(current_user: User = Depends(get_current_user)):
 def forgot_password(payload: ForgotPasswordIn, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.email == payload.email).first()
     if user:
-        token = serializer.dumps({"email": payload.email})
+        token      = serializer.dumps({"email": payload.email})
         reset_link = f"{FRONTEND_URL}/reset?token={token}"
         try:
             send_password_reset_email(payload.email, reset_link)
@@ -921,7 +931,7 @@ def forgot_password(payload: ForgotPasswordIn, db: Session = Depends(get_db)):
 @app.post("/auth/reset-password")
 def reset_password(payload: ResetPasswordIn, db: Session = Depends(get_db)):
     try:
-        data = serializer.loads(payload.token, max_age=RESET_TOKEN_TTL_SECONDS)
+        data  = serializer.loads(payload.token, max_age=RESET_TOKEN_TTL_SECONDS)
         email = data.get("email")
     except SignatureExpired:
         raise HTTPException(status_code=400, detail="Reset link expired")
@@ -941,40 +951,39 @@ def reset_password(payload: ResetPasswordIn, db: Session = Depends(get_db)):
 # =====================================================================
 @app.post("/user/change_password")
 async def change_password_endpoint(
-    request: ChangePasswordRequest,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
+    request:      ChangePasswordRequest,
+    current_user: User    = Depends(get_current_user),
+    db:           Session = Depends(get_db),
 ):
     """Change password for logged-in user. Requires current password verification."""
     if not verify_password(request.current_password, current_user.hashed_password):
-        logger.warning("❌ Password change failed: wrong current password (user=%s)", current_user.id)
         raise HTTPException(status_code=400, detail="Current password is incorrect")
-
     if len(request.new_password) < 8:
         raise HTTPException(status_code=400, detail="New password must be at least 8 characters")
-
     if request.new_password == request.current_password:
-        raise HTTPException(status_code=400, detail="New password must be different from current password")
+        raise HTTPException(
+            status_code=400,
+            detail="New password must be different from current password",
+        )
 
     try:
         current_user.hashed_password = get_password_hash(request.new_password)
         db.commit()
         db.refresh(current_user)
-        logger.info("✅ Password changed successfully for user %s (%s)", current_user.id, current_user.username)
+        logger.info("✅ Password changed for user %s", current_user.id)
         return {"ok": True, "message": "Password changed successfully"}
     except Exception:
         logger.exception("❌ Password change failed for user %s", current_user.id)
         db.rollback()
         raise HTTPException(status_code=500, detail="Failed to change password. Please try again.")
 
-
 @app.put("/user/update_profile")
 async def update_profile_endpoint(
-    request: UpdateProfileRequest,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
+    request:      UpdateProfileRequest,
+    current_user: User    = Depends(get_current_user),
+    db:           Session = Depends(get_db),
 ):
-    """Update user profile information (username, email)."""
+    """Update user profile information (username and/or email)."""
     updated_fields = []
 
     try:
@@ -984,7 +993,7 @@ async def update_profile_endpoint(
                 raise HTTPException(status_code=400, detail="Username cannot be empty")
             existing = db.query(User).filter(
                 User.username == new_username,
-                User.id != current_user.id
+                User.id != current_user.id,
             ).first()
             if existing:
                 raise HTTPException(status_code=400, detail="Username already taken")
@@ -997,18 +1006,21 @@ async def update_profile_endpoint(
                 raise HTTPException(status_code=400, detail="Email cannot be empty")
             existing = db.query(User).filter(
                 User.email == new_email,
-                User.id != current_user.id
+                User.id != current_user.id,
             ).first()
             if existing:
                 raise HTTPException(status_code=400, detail="Email already taken")
             current_user.email = new_email
             updated_fields.append("email")
 
+            # Keep Stripe customer email in sync
             if stripe and getattr(current_user, "stripe_customer_id", None):
                 try:
-                    stripe.Customer.modify(current_user.stripe_customer_id, email=new_email)
+                    stripe.Customer.modify(
+                        current_user.stripe_customer_id, email=new_email
+                    )
                 except Exception as e:
-                    logger.warning("Stripe email update failed (non-fatal): %s", e)
+                    logger.warning("Stripe email sync failed (non-fatal): %s", e)
 
         if not updated_fields:
             raise HTTPException(status_code=400, detail="No fields to update")
@@ -1016,10 +1028,9 @@ async def update_profile_endpoint(
         db.commit()
         db.refresh(current_user)
         logger.info("✅ Profile updated for user %s: %s", current_user.id, updated_fields)
-
         return {
-            "ok": True,
-            "message": f"Profile updated successfully ({', '.join(updated_fields)})",
+            "ok":      True,
+            "message": f"Profile updated ({', '.join(updated_fields)})",
             "account": canonical_account(current_user),
         }
 
@@ -1028,18 +1039,123 @@ async def update_profile_endpoint(
     except Exception:
         logger.exception("❌ Profile update failed for user %s", current_user.id)
         db.rollback()
-        raise HTTPException(status_code=500, detail="Failed to update profile. Please try again.")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to update profile. Please try again.",
+        )
+
+# =====================================================================
+# ✅ NEW (v8): DELETE /user/delete_account
+#
+# Permanently deletes the user's account and all associated data.
+# Cascade order: screenshots, batch jobs, API keys, subscription,
+# user record. Also immediately cancels any active Stripe subscription
+# (full cancel, not at-period-end, because the account is gone).
+# =====================================================================
+@app.delete("/user/delete_account")
+async def delete_account_endpoint(
+    current_user: User    = Depends(get_current_user),
+    db:           Session = Depends(get_db),
+):
+    """
+    Permanently deletes the authenticated user's account and all data.
+    Cancels any active Stripe subscription immediately.
+    """
+    user_id   = current_user.id
+    user_tier = (getattr(current_user, "subscription_tier", "free") or "free").lower()
+    logger.info("🗑️ Account deletion requested for user %s (tier=%s)", user_id, user_tier)
+
+    # 1. Cancel active Stripe subscription immediately (non-fatal)
+    if stripe and getattr(current_user, "stripe_customer_id", None) and user_tier != "free":
+        try:
+            subscriptions = stripe.Subscription.list(
+                customer=current_user.stripe_customer_id,
+                status="active",
+                limit=5,
+            )
+            for sub in subscriptions.auto_paging_iter():
+                stripe.Subscription.delete(sub["id"])
+                logger.info("✅ Cancelled Stripe subscription %s for deleted user %s", sub["id"], user_id)
+        except Exception as e:
+            logger.warning(
+                "⚠️ Stripe subscription cancel failed during account deletion (non-fatal): %s", e
+            )
+
+    # 2. Delete screenshots from file system (non-fatal per file)
+    try:
+        screenshots = db.query(Screenshot).filter(Screenshot.user_id == user_id).all()
+        for ss in screenshots:
+            fp = getattr(ss, "screenshot_path", None)
+            if fp:
+                try:
+                    p = Path(fp)
+                    if p.exists():
+                        p.unlink()
+                except Exception as e:
+                    logger.warning("⚠️ Could not delete screenshot file %s: %s", fp, e)
+        db.query(Screenshot).filter(Screenshot.user_id == user_id).delete(
+            synchronize_session=False
+        )
+        logger.info("✅ Deleted screenshots for user %s", user_id)
+    except Exception:
+        logger.exception("❌ Screenshot deletion failed for user %s", user_id)
+
+    # 3. Delete batch jobs
+    try:
+        from models import BatchJob
+        db.query(BatchJob).filter(BatchJob.user_id == user_id).delete(
+            synchronize_session=False
+        )
+        logger.info("✅ Deleted batch jobs for user %s", user_id)
+    except Exception as e:
+        logger.warning("BatchJob deletion failed for user %s (may not exist): %s", user_id, e)
+
+    # 4. Delete API keys
+    try:
+        db.query(ApiKey).filter(ApiKey.user_id == user_id).delete(
+            synchronize_session=False
+        )
+        logger.info("✅ Deleted API keys for user %s", user_id)
+    except Exception:
+        logger.exception("❌ API key deletion failed for user %s", user_id)
+
+    # 5. Delete subscription record
+    try:
+        db.query(Subscription).filter(Subscription.user_id == user_id).delete(
+            synchronize_session=False
+        )
+        logger.info("✅ Deleted subscription record for user %s", user_id)
+    except Exception as e:
+        logger.warning("Subscription deletion failed for user %s (may not exist): %s", user_id, e)
+
+    # 6. Delete the user row itself
+    try:
+        db.delete(current_user)
+        db.commit()
+        logger.info("✅ User %s permanently deleted", user_id)
+    except Exception:
+        logger.exception("❌ User row deletion failed for user %s", user_id)
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to delete account. Please try again or contact support.",
+        )
+
+    return {
+        "ok":      True,
+        "message": "Account permanently deleted.",
+    }
 
 # =====================================================================
 # API Key Management
 # =====================================================================
 @app.get("/api/keys/current")
 async def get_current_api_key(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    db:           Session = Depends(get_db),
+    current_user: User    = Depends(get_current_user),
 ):
     api_key_record = db.query(ApiKey).filter(
-        ApiKey.user_id == current_user.id,
+        ApiKey.user_id  == current_user.id,
         ApiKey.is_active == True,
     ).first()
 
@@ -1050,10 +1166,12 @@ async def get_current_api_key(
             )
             logger.info("✅ Created API key for user %s", current_user.id)
             return {
-                "api_key": api_key,
-                "key_prefix": api_key_record.key_prefix,
-                "created_at": api_key_record.created_at.isoformat() if api_key_record.created_at else None,
-                "last_used_at": api_key_record.last_used_at.isoformat() if api_key_record.last_used_at else None,
+                "api_key":     api_key,
+                "key_prefix":  api_key_record.key_prefix,
+                "created_at":  api_key_record.created_at.isoformat()
+                               if api_key_record.created_at else None,
+                "last_used_at": api_key_record.last_used_at.isoformat()
+                               if api_key_record.last_used_at else None,
                 "message": "Save this key securely. It won't be shown again!",
             }
         except Exception as e:
@@ -1061,17 +1179,19 @@ async def get_current_api_key(
             raise HTTPException(status_code=500, detail="Failed to create API key")
 
     return {
-        "key_prefix": api_key_record.key_prefix,
-        "created_at": api_key_record.created_at.isoformat() if api_key_record.created_at else None,
-        "last_used_at": api_key_record.last_used_at.isoformat() if api_key_record.last_used_at else None,
-        "name": api_key_record.name,
-        "message": "API key already exists. For security, the full key cannot be displayed.",
+        "key_prefix":   api_key_record.key_prefix,
+        "created_at":   api_key_record.created_at.isoformat()
+                        if api_key_record.created_at else None,
+        "last_used_at": api_key_record.last_used_at.isoformat()
+                        if api_key_record.last_used_at else None,
+        "name":         api_key_record.name,
+        "message":      "API key already exists. For security, the full key cannot be displayed.",
     }
 
 @app.post("/api/keys/regenerate")
 async def regenerate_api_key(
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
+    current_user: User    = Depends(get_current_user),
+    db:           Session = Depends(get_db),
 ):
     return await regenerate_api_key_endpoint(current_user, db)
 
@@ -1081,15 +1201,15 @@ async def regenerate_api_key(
 @app.delete("/api/v1/screenshots/{screenshot_id}")
 async def delete_screenshot(
     screenshot_id: str,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
+    current_user:  User    = Depends(get_current_user),
+    db:            Session = Depends(get_db),
 ):
     record = None
 
     try:
         int_id = int(screenshot_id)
         record = db.query(Screenshot).filter(
-            Screenshot.id == int_id,
+            Screenshot.id      == int_id,
             Screenshot.user_id == current_user.id,
         ).first()
     except (ValueError, TypeError):
@@ -1097,7 +1217,7 @@ async def delete_screenshot(
 
     if record is None:
         record = db.query(Screenshot).filter(
-            Screenshot.id == screenshot_id,
+            Screenshot.id      == screenshot_id,
             Screenshot.user_id == current_user.id,
         ).first()
 
@@ -1107,44 +1227,39 @@ async def delete_screenshot(
             detail="Screenshot not found or you do not have permission to delete it.",
         )
 
-    filepath_to_delete = getattr(record, "screenshot_path", None)
-    if filepath_to_delete:
-        path = Path(filepath_to_delete)
+    filepath = getattr(record, "screenshot_path", None)
+    if filepath:
+        path = Path(filepath)
         try:
             if path.exists():
                 path.unlink()
-                logger.info("🗑️ Deleted file: %s", filepath_to_delete)
+                logger.info("🗑️ Deleted file: %s", filepath)
         except Exception as e:
-            logger.warning("⚠️ Could not delete file %s: %s", filepath_to_delete, e)
+            logger.warning("⚠️ Could not delete file %s: %s", filepath, e)
 
     db.delete(record)
     db.commit()
-
     logger.info("✅ Deleted screenshot id=%s for user %s", screenshot_id, current_user.id)
-    return {
-        "ok": True,
-        "deleted_id": screenshot_id,
-        "message": "Screenshot deleted successfully.",
-    }
+    return {"ok": True, "deleted_id": screenshot_id, "message": "Screenshot deleted successfully."}
 
 # =====================================================================
 # Screenshot API Endpoints (tier concurrency enforced)
 # =====================================================================
 @app.post("/api/v1/screenshot")
 async def capture_screenshot(
-    request: ScreenshotRequest,
-    _guard: None = Depends(enforce_tier_concurrency),
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
+    request:      ScreenshotRequest,
+    _guard:       None    = Depends(enforce_tier_concurrency),
+    current_user: User    = Depends(get_current_user),
+    db:           Session = Depends(get_db),
 ):
     return await capture_screenshot_endpoint(request, current_user, db)
 
 @app.post("/api/v1/batch/submit")
 async def batch_screenshot(
-    request: BatchScreenshotRequest,
-    _guard: None = Depends(enforce_tier_concurrency),
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
+    request:      BatchScreenshotRequest,
+    _guard:       None    = Depends(enforce_tier_concurrency),
+    current_user: User    = Depends(get_current_user),
+    db:           Session = Depends(get_db),
 ):
     return await batch_screenshot_endpoint(request, current_user, db)
 
@@ -1152,8 +1267,8 @@ async def batch_screenshot(
 # Stripe webhook + billing
 # =====================================================================
 _IDEMP_STORE: Dict[str, float] = {}
-_IDEMP_TTL_SEC = 24 * 3600
-_IDEMP_LOCK = threading.Lock()
+_IDEMP_TTL_SEC  = 24 * 3600
+_IDEMP_LOCK     = threading.Lock()
 
 def _idemp_seen(event_id: str) -> bool:
     now = time.time()
@@ -1176,10 +1291,12 @@ async def stripe_webhook_endpoint(request: Request):
         raise HTTPException(status_code=500, detail="Webhook secret not configured")
 
     payload = await request.body()
-    sig = request.headers.get("stripe-signature")
+    sig     = request.headers.get("stripe-signature")
 
     try:
-        event = stripe.Webhook.construct_event(payload=payload, sig_header=sig, secret=secret)
+        event = stripe.Webhook.construct_event(
+            payload=payload, sig_header=sig, secret=secret
+        )
     except Exception as e:
         logger.warning("Stripe webhook signature verification failed: %s", e)
         raise HTTPException(status_code=400, detail="Invalid signature")
@@ -1194,49 +1311,67 @@ async def stripe_webhook_endpoint(request: Request):
     return await handle_stripe_webhook(request)
 
 def _lookup_key(plan: str, billing_cycle: str) -> Optional[str]:
-    plan = (plan or "").lower().strip()
+    plan          = (plan          or "").lower().strip()
     billing_cycle = (billing_cycle or "monthly").lower().strip()
     if billing_cycle == "yearly":
         k = os.getenv(f"STRIPE_{plan.upper()}_LOOKUP_KEY_YEARLY")
         if k:
             return k.strip()
-    k = os.getenv(f"STRIPE_{plan.upper()}_LOOKUP_KEY_MONTHLY") or os.getenv(f"STRIPE_{plan.upper()}_LOOKUP_KEY")
+    k = (
+        os.getenv(f"STRIPE_{plan.upper()}_LOOKUP_KEY_MONTHLY")
+        or os.getenv(f"STRIPE_{plan.upper()}_LOOKUP_KEY")
+    )
     return k.strip() if k else None
 
 @app.post("/billing/create_checkout_session")
 def create_checkout_session(
-    payload: BillingCheckoutIn,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
+    payload:      BillingCheckoutIn,
+    current_user: User    = Depends(get_current_user),
+    db:           Session = Depends(get_db),
 ):
     if not stripe or not os.getenv("STRIPE_SECRET_KEY"):
         raise HTTPException(status_code=503, detail="Stripe is not configured")
 
     plan = (payload.plan or "").lower().strip()
     if plan not in {"pro", "business", "premium"}:
-        raise HTTPException(status_code=400, detail="Invalid plan. Must be: pro, business, or premium")
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid plan. Must be: pro, business, or premium",
+        )
 
     billing_cycle = (payload.billing_cycle or "monthly").lower().strip()
     if billing_cycle not in {"monthly", "yearly"}:
-        raise HTTPException(status_code=400, detail="Invalid billing_cycle. Must be: monthly or yearly")
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid billing_cycle. Must be: monthly or yearly",
+        )
 
     ensure_stripe_customer_for_user(current_user, db)
     customer_id = getattr(current_user, "stripe_customer_id", None)
     if not customer_id:
-        raise HTTPException(status_code=400, detail="User missing Stripe customer ID. Please contact support.")
+        raise HTTPException(
+            status_code=400,
+            detail="User missing Stripe customer ID. Please contact support.",
+        )
 
     lookup_key = _lookup_key(plan, billing_cycle)
     if not lookup_key:
         logger.error("Missing Stripe lookup key for %s (%s)", plan, billing_cycle)
-        raise HTTPException(status_code=500, detail=f"Missing Stripe configuration for {plan} ({billing_cycle}).")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Missing Stripe configuration for {plan} ({billing_cycle}).",
+        )
 
     try:
         prices = stripe.Price.list(lookup_keys=[lookup_key], limit=1)
         if not prices.data:
-            raise HTTPException(status_code=500, detail=f"No Stripe Price found for lookup_key={lookup_key}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"No Stripe Price found for lookup_key={lookup_key}",
+            )
 
         price_id = prices.data[0].id
-        session = stripe.checkout.Session.create(
+        session  = stripe.checkout.Session.create(
             mode="subscription",
             customer=customer_id,
             line_items=[{"price": price_id, "quantity": 1}],
@@ -1245,8 +1380,8 @@ def create_checkout_session(
             allow_promotion_codes=True,
             client_reference_id=str(current_user.id),
             metadata={
-                "app_user_id": str(current_user.id),
-                "plan": plan,
+                "app_user_id":  str(current_user.id),
+                "plan":         plan,
                 "billing_cycle": billing_cycle,
             },
         )
@@ -1255,17 +1390,225 @@ def create_checkout_session(
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception("❌ Checkout session create failed for user %s", current_user.id)
+        logger.exception("❌ Checkout session failed for user %s", current_user.id)
         raise HTTPException(status_code=500, detail=f"Stripe error: {str(e)}")
 
 # =====================================================================
-# Subscription Status — direct DB count for all tiers
+# ✅ NEW (v8): POST /billing/create_portal_session
+#
+# Creates a Stripe Customer Portal session for the authenticated user.
+# The portal lets them manage payment methods, download invoices,
+# switch billing cadence, and cancel — all hosted by Stripe.
+# Called by DashboardPage.js "💳 Manage Subscription & Billing" button.
+# =====================================================================
+@app.post("/billing/create_portal_session")
+def create_portal_session(
+    payload:      BillingPortalIn,
+    current_user: User    = Depends(get_current_user),
+    db:           Session = Depends(get_db),
+):
+    """
+    Creates a Stripe Customer Portal session.
+    Returns { url } — the frontend redirects the user to this URL.
+    The portal handles payment methods, invoices, billing cadence,
+    and subscription cancellation entirely within Stripe's hosted UI.
+    """
+    if not stripe or not os.getenv("STRIPE_SECRET_KEY"):
+        raise HTTPException(
+            status_code=503,
+            detail="Billing portal is not available. Stripe is not configured.",
+        )
+
+    # Ensure the user has a Stripe customer record
+    ensure_stripe_customer_for_user(current_user, db)
+    customer_id = getattr(current_user, "stripe_customer_id", None)
+    if not customer_id:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "No billing record found for your account. "
+                "If you've never subscribed, there's nothing to manage. "
+                "Please contact support if you believe this is an error."
+            ),
+        )
+
+    # return_url: where Stripe sends the user when they click "Return to PixelPerfect"
+    return_url = (
+        (payload.return_url or "").strip()
+        or f"{FRONTEND_URL}/dashboard"
+    )
+
+    try:
+        portal_session = stripe.billing_portal.Session.create(
+            customer=customer_id,
+            return_url=return_url,
+        )
+        logger.info(
+            "✅ Stripe portal session created for user %s (customer=%s)",
+            current_user.id,
+            customer_id,
+        )
+        return {"url": portal_session.url}
+
+    except stripe.error.InvalidRequestError as e:
+        # Common cause: no active subscription (Free users without prior sub)
+        logger.warning(
+            "Stripe portal session failed for user %s: %s",
+            current_user.id,
+            e,
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Could not open the billing portal. "
+                "This usually means no billing record exists yet. "
+                "Please upgrade to a paid plan first, then try again."
+            ),
+        )
+    except Exception as e:
+        logger.exception(
+            "❌ Stripe portal session error for user %s", current_user.id
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to open billing portal: {str(e)}",
+        )
+
+# =====================================================================
+# ✅ NEW (v8): POST /billing/cancel_subscription
+#
+# Cancels the user's active Stripe subscription at period end.
+# Sets cancel_at_period_end=True so the user keeps access until
+# the billing period expires. Stripe fires a
+# customer.subscription.deleted webhook at that point, which our
+# webhook_handler uses to downgrade the user to Free.
+# Called by AccountSettings.js "🚫 Cancel Subscription" flow.
+# =====================================================================
+@app.post("/billing/cancel_subscription")
+def cancel_subscription(
+    current_user: User    = Depends(get_current_user),
+    db:           Session = Depends(get_db),
+):
+    """
+    Cancels the authenticated user's active Stripe subscription at period end.
+    The user retains full access until the billing period expires, then
+    Stripe fires a webhook that downgrades them to the Free tier.
+    """
+    if not stripe or not os.getenv("STRIPE_SECRET_KEY"):
+        raise HTTPException(
+            status_code=503,
+            detail="Stripe is not configured. Please contact support.",
+        )
+
+    tier = (getattr(current_user, "subscription_tier", "free") or "free").lower()
+    if tier == "free":
+        raise HTTPException(
+            status_code=400,
+            detail="You are on the Free plan — there is no paid subscription to cancel.",
+        )
+
+    customer_id = getattr(current_user, "stripe_customer_id", None)
+    if not customer_id:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "No Stripe billing record found for your account. "
+                "Please contact support at onetechly@gmail.com."
+            ),
+        )
+
+    # Find the user's active subscription
+    try:
+        subscriptions = stripe.Subscription.list(
+            customer=customer_id,
+            status="active",
+            limit=5,
+        )
+    except Exception as e:
+        logger.exception("❌ Stripe subscription list failed for user %s", current_user.id)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not retrieve subscription info from Stripe: {str(e)}",
+        )
+
+    active_subs = list(subscriptions.auto_paging_iter())
+
+    if not active_subs:
+        # Check for subscriptions that are already scheduled to cancel
+        try:
+            all_subs = stripe.Subscription.list(customer=customer_id, limit=5)
+            for sub in all_subs.auto_paging_iter():
+                if sub.get("cancel_at_period_end"):
+                    return {
+                        "ok":        True,
+                        "message":   "Your subscription is already scheduled to cancel at the end of the billing period.",
+                        "cancel_at": sub.get("current_period_end"),
+                    }
+        except Exception:
+            pass
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "No active subscription found to cancel. "
+                "Your subscription may have already ended. "
+                "Contact support if you're still being charged."
+            ),
+        )
+
+    # Cancel at period end (not immediately) — preserves access
+    cancelled_at = None
+    for sub in active_subs:
+        try:
+            updated = stripe.Subscription.modify(
+                sub["id"],
+                cancel_at_period_end=True,
+            )
+            cancelled_at = updated.get("current_period_end")
+            logger.info(
+                "✅ Subscription %s set to cancel at period end for user %s (ends %s)",
+                sub["id"],
+                current_user.id,
+                cancelled_at,
+            )
+        except Exception as e:
+            logger.exception(
+                "❌ Failed to set cancel_at_period_end for sub %s (user %s): %s",
+                sub.get("id"),
+                current_user.id,
+                e,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to cancel subscription: {str(e)}",
+            )
+
+    # Convert Unix timestamp to ISO string for the frontend
+    cancel_at_iso = None
+    if cancelled_at:
+        try:
+            cancel_at_iso = datetime.utcfromtimestamp(int(cancelled_at)).isoformat()
+        except (ValueError, TypeError):
+            cancel_at_iso = str(cancelled_at)
+
+    return {
+        "ok":      True,
+        "message": (
+            "Subscription cancellation scheduled. "
+            "You retain full access until the end of your current billing period. "
+            "No refund is issued for unused time."
+        ),
+        "cancel_at": cancel_at_iso,
+    }
+
+# =====================================================================
+# Subscription Status — direct DB count for all tiers (v1 fix)
 # =====================================================================
 @app.get("/subscription_status")
 def subscription_status(
-    request: Request,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
+    request:      Request,
+    current_user: User    = Depends(get_current_user),
+    db:           Session = Depends(get_db),
 ):
     try:
         _apply_local_overdue_downgrade_if_possible(current_user, db)
@@ -1278,16 +1621,16 @@ def subscription_status(
         except Exception as e:
             logger.warning("Stripe sync failed: %s", e)
 
-    tier = (getattr(current_user, "subscription_tier", "free") or "free").lower()
+    tier        = (getattr(current_user, "subscription_tier", "free") or "free").lower()
     tier_limits = get_tier_limits(tier)
 
-    now = datetime.utcnow()
+    now          = datetime.utcnow()
     period_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
     screenshots_used = (
         db.query(Screenshot)
         .filter(
-            Screenshot.user_id == current_user.id,
+            Screenshot.user_id  == current_user.id,
             Screenshot.created_at >= period_start,
         )
         .count()
@@ -1299,7 +1642,7 @@ def subscription_status(
         batch_used = (
             db.query(BatchJob)
             .filter(
-                BatchJob.user_id == current_user.id,
+                BatchJob.user_id   == current_user.id,
                 BatchJob.created_at >= period_start,
             )
             .count()
@@ -1309,17 +1652,24 @@ def subscription_status(
 
     api_calls_used = screenshots_used + batch_used
 
+    # Return usage under multiple field name variants so the frontend
+    # dashboard works regardless of which variant it reads.
     usage = {
-        "screenshots":    screenshots_used,
-        "batch_requests": batch_used,
-        "api_calls":      api_calls_used,
+        # Primary names
+        "screenshots":         screenshots_used,
+        "batch_requests":      batch_used,
+        "api_calls":           api_calls_used,
+        # Alias names (consumed by DashboardPage fallback chain)
+        "screenshots_used":    screenshots_used,
+        "batch_jobs":          batch_used,
+        "api_calls_this_month": api_calls_used,
     }
 
     next_reset = getattr(current_user, "usage_reset_at", None)
 
     response = {
-        "tier": tier,
-        "usage": usage,
+        "tier":   tier,
+        "usage":  usage,
         "limits": tier_limits,
         "account": canonical_account(current_user),
         "tier_concurrency_limit": _tier_limit_for_user(current_user),
@@ -1327,11 +1677,13 @@ def subscription_status(
 
     if next_reset:
         response["next_reset"] = (
-            next_reset.isoformat() if isinstance(next_reset, datetime) else next_reset
+            next_reset.isoformat()
+            if isinstance(next_reset, datetime)
+            else next_reset
         )
 
     logger.info(
-        "subscription_status user=%s tier=%s screenshots=%d batch=%d api_calls=%d",
+        "subscription_status user=%s tier=%s screenshots=%d batch=%d api=%d",
         current_user.id, tier, screenshots_used, batch_used, api_calls_used,
     )
 
@@ -1342,11 +1694,18 @@ def subscription_status(
 # =====================================================================
 FRONTEND_BUILD = Path(__file__).resolve().parents[1] / "frontend" / "build"
 if FRONTEND_BUILD.exists():
-    app.mount("/_spa", StaticFiles(directory=str(FRONTEND_BUILD), html=True), name="spa")
+    app.mount(
+        "/_spa",
+        StaticFiles(directory=str(FRONTEND_BUILD), html=True),
+        name="spa",
+    )
 
     @app.get("/{full_path:path}", include_in_schema=False)
     def spa_catch_all(full_path: str):
-        if full_path.startswith(("api/", "health", "token", "register", "webhook/", "screenshots/")):
+        if full_path.startswith((
+            "api/", "health", "token", "register",
+            "webhook/", "screenshots/",
+        )):
             raise HTTPException(status_code=404, detail="Not found")
         index_file = FRONTEND_BUILD / "index.html"
         if index_file.exists():
@@ -1361,3 +1720,4 @@ if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
 
 # ======= END OF main.py ==============================================
+
