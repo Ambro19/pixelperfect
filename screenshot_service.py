@@ -834,4 +834,4 @@ def check_usage_limit(user, tier_limits) -> bool:
     current_usage = user.usage_screenshots or 0
     return current_usage < limit
 
-# ===== END OF screenshot_service.py ==========================================
+# ===== END OF screenshot_service.py =====
