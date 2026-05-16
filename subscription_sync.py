@@ -200,14 +200,17 @@ def sync_user_subscription_from_stripe(user, db) -> None:
 
     try:
         # ── Fetch active subscription — expand price so attributes are available ─
+        # NOTE: "data.items.data.price" is 4 levels deep — the Stripe API maximum.
+        # "data.items.data.price.product" would be 5 levels and raises:
+        #   "You cannot expand more than 4 levels of a property"
+        # Product metadata (Path 5 in resolver) is therefore skipped during
+        # live sync — the other 4 paths (lookup_key, nickname, price_id,
+        # subscription metadata) are sufficient for all current tiers.
         subscriptions = stripe.Subscription.list(
             customer=stripe_customer_id,
             status="active",
             limit=1,
-            expand=[
-                "data.items.data.price",          # price object (lookup_key, nickname, id)
-                "data.items.data.price.product",  # product object (product metadata)
-            ],
+            expand=["data.items.data.price"],   # 4 levels — Stripe maximum
         )
 
         if not subscriptions.data:
@@ -380,6 +383,395 @@ def debug_user_subscription(user_id: int, db) -> dict:
             result["stripe_debug_error"] = str(e)
 
     return result
+
+
+# ============================================================================
+# END OF subscription_sync.py
+# ============================================================================
+
+######################################
+ # ============================================================================
+# # SUBSCRIPTION SYNC - STRIPE INTEGRATION (PRODUCTION READY)
+# # ============================================================================
+# # File: backend/subscription_sync.py
+# # Author: OneTechly
+# # Updated: May 2026
+# # ============================================================================
+# # ✅ PRODUCTION READY
+# # ✅ FIX (May 2026): Bulletproof tier detection — 5-layer fallback chain
+# #    Root cause of FREE tier bug:
+# #      1. lookup_key was read via dict .get() on a Stripe StripeObject,
+# #         which silently returned "" instead of the actual lookup_key value.
+# #      2. price_id fallback checked for "business"/"pro" as a substring of
+# #         the raw price ID (e.g. "price_1Abc123XYZ") — never matches.
+# #      3. Result: tier always stayed "free" after checkout.
+# #    Fix: Use a dedicated _resolve_tier_from_subscription() function that
+# #    walks all five resolution paths in order and logs each attempt.
+# # ✅ FIX (May 2026): Premium tier added to all tier-mapping paths
+# # ✅ FIX (May 2026): Stripe StripeObject attribute access (.attribute)
+# #    instead of dict .get() for nested price fields
+# # ✅ Existing: datetime comparison errors fixed via datetime_fix utilities
+# # ✅ Existing: proper handling of subscription expiration
+# # ============================================================================
+
+# import logging
+# from typing import Optional
+# import os
+
+# from datetime_fix import make_aware, utc_now, is_expired
+
+# logger = logging.getLogger("pixelperfect")
+
+# try:
+#     import stripe
+#     STRIPE_AVAILABLE = bool(os.getenv("STRIPE_SECRET_KEY"))
+# except ImportError:
+#     stripe = None
+#     STRIPE_AVAILABLE = False
+
+
+# # ── Tier keyword maps ────────────────────────────────────────────────────────
+# # Used by all fallback paths. Order matters — premium before business before pro
+# # so that a string containing both "premium" and "pro" resolves to premium.
+# _TIER_KEYWORDS = [
+#     ("premium",  "premium"),
+#     ("business", "business"),
+#     ("pro",      "pro"),
+# ]
+
+# def _keyword_to_tier(s: str) -> Optional[str]:
+#     """Return the first matching tier keyword found in string s, or None."""
+#     s_lower = (s or "").lower()
+#     for keyword, tier in _TIER_KEYWORDS:
+#         if keyword in s_lower:
+#             return tier
+#     return None
+
+
+# def _resolve_tier_from_subscription(sub, user_id: int) -> str:
+#     """
+#     Walk five resolution paths to determine the user's subscription tier.
+
+#     Returns one of: "pro" | "business" | "premium" | "free"
+
+#     Resolution order (stops at first match):
+#       1. lookup_key on the price object (most reliable — set in Stripe dashboard)
+#       2. nickname on the price object (human-readable label)
+#       3. raw price_id substring check (last resort — almost never matches)
+#       4. subscription metadata["tier"] (set by checkout session creation)
+#       5. product metadata["tier"] (fallback if product metadata is set)
+
+#     Why this replaces the old code:
+#       The old code used sub.get("items", {}).get("data", [{}])[0].get("price", {})
+#       which returns {} on a Stripe StripeObject (not a plain dict), so lookup_key
+#       was always "". This function uses attribute access on the live objects.
+#     """
+#     # ── Extract price object via attribute access (not dict .get) ────────────
+#     price = None
+#     try:
+#         items_data = sub.items.data          # StripeObject attribute
+#         if items_data:
+#             price = items_data[0].price      # Price StripeObject
+#     except Exception as e:
+#         logger.warning("user %s: could not extract price from subscription: %s", user_id, e)
+
+#     # Path 1 — lookup_key (set by us in Stripe dashboard)
+#     if price:
+#         try:
+#             lk = price.lookup_key or ""
+#             if lk:
+#                 tier = _keyword_to_tier(lk)
+#                 if tier:
+#                     logger.info(
+#                         "user %s: tier '%s' resolved via lookup_key='%s'",
+#                         user_id, tier, lk,
+#                     )
+#                     return tier
+#                 logger.warning(
+#                     "user %s: lookup_key='%s' found but no keyword matched — "
+#                     "check STRIPE_*_LOOKUP_KEY env vars match Stripe dashboard",
+#                     user_id, lk,
+#                 )
+#         except Exception as e:
+#             logger.debug("user %s: lookup_key read error: %s", user_id, e)
+
+#     # Path 2 — price nickname (human-readable label, optional but useful)
+#     if price:
+#         try:
+#             nick = price.nickname or ""
+#             if nick:
+#                 tier = _keyword_to_tier(nick)
+#                 if tier:
+#                     logger.info(
+#                         "user %s: tier '%s' resolved via price.nickname='%s'",
+#                         user_id, tier, nick,
+#                     )
+#                     return tier
+#         except Exception as e:
+#             logger.debug("user %s: nickname read error: %s", user_id, e)
+
+#     # Path 3 — raw price_id substring (almost never matches, kept as belt+suspenders)
+#     if price:
+#         try:
+#             pid = price.id or ""
+#             tier = _keyword_to_tier(pid)
+#             if tier:
+#                 logger.info(
+#                     "user %s: tier '%s' resolved via price.id='%s'",
+#                     user_id, tier, pid,
+#                 )
+#                 return tier
+#         except Exception as e:
+#             logger.debug("user %s: price.id read error: %s", user_id, e)
+
+#     # Path 4 — subscription metadata["tier"] (set during checkout session creation)
+#     try:
+#         meta_tier = (sub.metadata or {}).get("tier", "").lower().strip()
+#         if meta_tier in ("pro", "business", "premium"):
+#             logger.info(
+#                 "user %s: tier '%s' resolved via subscription metadata",
+#                 user_id, meta_tier,
+#             )
+#             return meta_tier
+#     except Exception as e:
+#         logger.debug("user %s: subscription metadata read error: %s", user_id, e)
+
+#     # Path 5 — product metadata["tier"] (optional extra safety net)
+#     if price:
+#         try:
+#             product = price.product
+#             if isinstance(product, str):
+#                 # Not expanded — skip
+#                 pass
+#             elif product:
+#                 prod_meta_tier = (getattr(product, "metadata", {}) or {}).get("tier", "").lower().strip()
+#                 if prod_meta_tier in ("pro", "business", "premium"):
+#                     logger.info(
+#                         "user %s: tier '%s' resolved via product metadata",
+#                         user_id, prod_meta_tier,
+#                     )
+#                     return prod_meta_tier
+#         except Exception as e:
+#             logger.debug("user %s: product metadata read error: %s", user_id, e)
+
+#     logger.warning(
+#         "user %s: could not resolve tier from any path — defaulting to free. "
+#         "Ensure the Stripe price has a lookup_key matching pixelperfect_pro_monthly / "
+#         "pixelperfect_business_monthly / pixelperfect_premium_monthly, OR that "
+#         "STRIPE_*_LOOKUP_KEY env vars on Render match the Stripe dashboard values.",
+#         user_id,
+#     )
+#     return "free"
+
+
+# def sync_user_subscription_from_stripe(user, db) -> None:
+#     """
+#     Sync user's subscription status from Stripe.
+
+#     Fetches the user's active subscription from Stripe, resolves the tier
+#     using a 5-layer fallback chain, and updates the database.
+
+#     ✅ FIX (May 2026): Uses attribute access on StripeObject (not dict .get)
+#     ✅ FIX (May 2026): 5-layer tier resolution — lookup_key, nickname,
+#        price_id, subscription metadata, product metadata
+#     ✅ FIX (May 2026): Premium tier supported in all resolution paths
+#     ✅ Existing: timezone-aware datetime comparisons via datetime_fix
+
+#     Args:
+#         user: User model instance
+#         db: SQLAlchemy session
+#     """
+#     if not STRIPE_AVAILABLE or not stripe:
+#         logger.debug("Stripe not available, skipping sync")
+#         return
+
+#     stripe_customer_id = getattr(user, "stripe_customer_id", None)
+#     if not stripe_customer_id:
+#         logger.debug("user %s has no Stripe customer ID", user.id)
+#         return
+
+#     try:
+#         # ── Fetch active subscription — expand price so attributes are available ─
+#         subscriptions = stripe.Subscription.list(
+#             customer=stripe_customer_id,
+#             status="active",
+#             limit=1,
+#             expand=[
+#                 "data.items.data.price",          # price object (lookup_key, nickname, id)
+#                 "data.items.data.price.product",  # product object (product metadata)
+#             ],
+#         )
+
+#         if not subscriptions.data:
+#             # No active subscription — downgrade to free
+#             if (user.subscription_tier or "free") != "free":
+#                 logger.info(
+#                     "user %s: no active Stripe subscription — downgrading to free",
+#                     user.id,
+#                 )
+#                 user.subscription_tier = "free"
+#                 _set_status(user, "inactive")
+#                 db.commit()
+#             return
+
+#         sub = subscriptions.data[0]
+
+#         # ── Resolve tier ──────────────────────────────────────────────────────
+#         tier = _resolve_tier_from_subscription(sub, user.id)
+
+#         old_tier = user.subscription_tier or "free"
+#         user.subscription_tier = tier
+
+#         # ── Update subscription metadata fields ───────────────────────────────
+#         _set_status(user, sub.status)
+
+#         if hasattr(user, "subscription_updated_at"):
+#             user.subscription_updated_at = utc_now()
+
+#         # ── Update expiry from current_period_end ─────────────────────────────
+#         period_end = getattr(sub, "current_period_end", None)
+#         if period_end:
+#             from datetime import datetime, timezone
+#             expires_dt = datetime.fromtimestamp(int(period_end), tz=timezone.utc)
+#             if hasattr(user, "subscription_expires_at"):
+#                 user.subscription_expires_at = expires_dt
+#             if hasattr(user, "subscription_ends_at"):
+#                 user.subscription_ends_at = expires_dt
+
+#         db.commit()
+
+#         if old_tier != tier:
+#             logger.info("✅ user %s subscription synced: %s → %s", user.id, old_tier, tier)
+#         else:
+#             logger.info("✅ user %s subscription confirmed: %s (unchanged)", user.id, tier)
+
+#     except Exception as e:
+#         logger.error("❌ Failed to sync subscription for user %s: %s", user.id, e)
+#         import traceback
+#         logger.error(traceback.format_exc())
+
+
+# def _set_status(user, status: str) -> None:
+#     """Set subscription status fields that exist on the user model."""
+#     if hasattr(user, "stripe_subscription_status"):
+#         user.stripe_subscription_status = status
+#     if hasattr(user, "subscription_status"):
+#         user.subscription_status = status
+
+
+# def _apply_local_overdue_downgrade_if_possible(user, db) -> None:
+#     """
+#     Check if user's subscription has expired and downgrade if needed.
+
+#     ✅ Uses timezone-aware datetime comparisons via datetime_fix utilities.
+
+#     Args:
+#         user: User model instance
+#         db: SQLAlchemy session
+#     """
+#     try:
+#         expires_at = (
+#             getattr(user, "subscription_expires_at", None) or
+#             getattr(user, "subscription_ends_at", None)
+#         )
+#         if not expires_at:
+#             return
+
+#         expires_at_aware = make_aware(expires_at)
+
+#         if is_expired(expires_at_aware):
+#             current_tier = (getattr(user, "subscription_tier", "free") or "free").lower()
+#             if current_tier in ("pro", "business", "premium"):
+#                 logger.info(
+#                     "user %s: subscription expired on %s — downgrading from %s to free",
+#                     user.id, expires_at_aware, current_tier,
+#                 )
+#                 user.subscription_tier = "free"
+#                 _set_status(user, "expired")
+#                 user.usage_screenshots    = 0
+#                 user.usage_batch_requests = 0
+#                 user.usage_api_calls      = 0
+#                 if hasattr(user, "usage_reset_at"):
+#                     user.usage_reset_at = utc_now()
+#                 db.commit()
+#                 db.refresh(user)
+#                 logger.info("✅ user %s downgraded to free (expiry)", user.id)
+#         else:
+#             logger.debug("user %s subscription active until %s", user.id, expires_at_aware)
+
+#     except Exception as e:
+#         logger.error("❌ Local downgrade check failed for user %s: %s", user.id, e)
+#         import traceback
+#         logger.debug(traceback.format_exc())
+
+
+# # ============================================================================
+# # DEBUG HELPER
+# # ============================================================================
+
+# def debug_user_subscription(user_id: int, db) -> dict:
+#     """
+#     Debug helper — returns all subscription-related fields for a user.
+#     Also resolves tier from Stripe live data if possible.
+#     """
+#     from models import User
+
+#     user = db.query(User).filter(User.id == user_id).first()
+#     if not user:
+#         return {"error": "User not found"}
+
+#     result = {
+#         "user_id":              user.id,
+#         "email":                user.email,
+#         "subscription_tier":    user.subscription_tier,
+#         "stripe_customer_id":   getattr(user, "stripe_customer_id", None),
+#     }
+
+#     datetime_fields = [
+#         "subscription_expires_at",
+#         "subscription_ends_at",
+#         "subscription_updated_at",
+#         "usage_reset_at",
+#         "created_at",
+#     ]
+#     for field in datetime_fields:
+#         if hasattr(user, field):
+#             value = getattr(user, field)
+#             if value is not None:
+#                 aware_value = make_aware(value)
+#                 result[field] = {
+#                     "value": str(aware_value),
+#                     "is_expired": is_expired(aware_value) if "expires" in field or "ends" in field else None,
+#                 }
+
+#     for field in ("stripe_subscription_status", "subscription_status"):
+#         if hasattr(user, field):
+#             result[field] = getattr(user, field)
+
+#     for field in ("usage_screenshots", "usage_batch_requests", "usage_api_calls"):
+#         if hasattr(user, field):
+#             result[field] = getattr(user, field)
+
+#     # Live Stripe check
+#     if STRIPE_AVAILABLE and stripe and result.get("stripe_customer_id"):
+#         try:
+#             subs = stripe.Subscription.list(
+#                 customer=result["stripe_customer_id"],
+#                 status="active", limit=1,
+#                 expand=["data.items.data.price"],
+#             )
+#             if subs.data:
+#                 sub = subs.data[0]
+#                 live_tier = _resolve_tier_from_subscription(sub, user_id)
+#                 result["stripe_live_tier"]   = live_tier
+#                 result["stripe_sub_status"]  = sub.status
+#                 result["stripe_period_end"]  = sub.current_period_end
+#             else:
+#                 result["stripe_live_tier"]  = "free (no active subscription)"
+#         except Exception as e:
+#             result["stripe_debug_error"] = str(e)
+
+#     return result
 
 
 # ============================================================================

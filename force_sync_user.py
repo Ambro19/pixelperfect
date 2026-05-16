@@ -153,14 +153,13 @@ def main():
         # Fetch active subscriptions
         logger.info("Fetching subscriptions for customer %s...", customer_id)
         try:
+            # Only expand 4 levels (Stripe maximum). price.product is not
+            # expanded — lookup_key/nickname resolution is sufficient.
             subs = _stripe.Subscription.list(
                 customer=customer_id,
                 status="active",
                 limit=1,
-                expand=[
-                    "data.items.data.price",
-                    "data.items.data.price.product",
-                ],
+                expand=["data.items.data.price"],
             )
         except Exception as e:
             logger.error("Stripe subscription fetch failed: %s", e)
