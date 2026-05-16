@@ -95,7 +95,7 @@ $PRO_PASS  = "7Rt;Lk+5(-"
 # REQUIRED for most Phase 2 + Phase 3 tests.
 # Leave empty to skip Business-tier tests and see their SKIP reason.
 $BIZ_USER  = "UserProdTest_003"
-$BIZ_PASS  = "Sp%36-/Tk"
+$BIZ_PASS  = "Sp%36=/Tk"
 
 # Test URLs
 $TEST_URL    = "https://example.com"          # simple, fast, reliable
