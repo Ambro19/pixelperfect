@@ -553,7 +553,7 @@ class UserResponse(BaseModel):
     username:          Optional[str] = None
     email:             str
     created_at:        Optional[datetime] = None
-    subscription_tier: Optional[str] = None   # P-03 fix: test script checks this
+    subscription_tier: Optional[str] = None   # ✅ Fix: P-03 needs this
     class Config:
         from_attributes = True
 
@@ -1502,12 +1502,28 @@ def cancel_subscription(
         )
 
     customer_id = getattr(current_user, "stripe_customer_id", None)
+
+    # ✅ Fix: email fallback when stripe_customer_id is None
+    if not customer_id:
+        email = (getattr(current_user, "email", "") or "").strip().lower()
+        if email and stripe:
+            try:
+                customers = stripe.Customer.list(email=email, limit=1)
+                if customers.data:
+                    customer_id = customers.data[0].id
+                    current_user.stripe_customer_id = customer_id
+                    db.commit()
+                    logger.info("cancel_subscription: found customer %s by email", customer_id)
+            except Exception as e:
+                logger.warning("Stripe customer email lookup failed: %s", e)
+
     if not customer_id:
         raise HTTPException(
             status_code=400,
             detail=(
-                "No Stripe billing record found for your account. "
-                "Please contact support at onetechly@gmail.com."
+                "No Stripe billing record found. "
+                "If you just subscribed, wait a moment and try again. "
+                "Contact support at onetechly@gmail.com if this persists."
             ),
         )
 
