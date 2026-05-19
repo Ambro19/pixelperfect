@@ -46,17 +46,32 @@ param(
 $LOCAL_BASE = "http://192.168.1.185:8000"
 $PROD_BASE  = "https://api.pixelperfectapi.net"
 
-# Free user — any account on the free tier
-$FREE_USER = "UserProdTest"
-$FREE_PASS = "Rt%@gP35="
+# # Free user — any account on the free tier
+# $FREE_USER = "UserProdTest"
+# $FREE_PASS = "Rt%@gP35="
 
-# Pro user — subscription_tier = 'pro' in DB (e.g. UserProdTest_002)
-$PRO_USER  = "UserProdTest_002"
-$PRO_PASS  = "7Rt;Lk+5(-"
+# # Pro user — subscription_tier = 'pro' in DB (e.g. UserProdTest_002)
+# $PRO_USER  = "UserProdTest_002"
+# $PRO_PASS  = "7Rt;Lk+5(-"
 
-# Business user — subscription_tier = 'business' (leave empty to skip biz tests)
-$BIZ_USER  = ""
-$BIZ_PASS  = ""
+# # Business user — subscription_tier = 'business' (leave empty to skip biz tests)
+# $BIZ_USER  = ""
+# $BIZ_PASS  = ""
+
+# Free user — any free-tier account
+$FREE_USER = 'userprodtest01'
+$FREE_PASS = 'Xp?%(4Ts'
+
+#  Pro user — subscription_tier = 'pro' in DB
+$PRO_USER  = 'userprodtest02'
+$PRO_PASS  = 'St;&39H!'
+
+# Business user — subscription_tier = 'business' in DB
+# REQUIRED for most Phase 2 + Phase 3 tests.
+# Leave empty to skip Business-tier tests and see their SKIP reason.
+$BIZ_USER  = 'userprodtest03'
+$BIZ_PASS  = '!Mxp#63B'
+
 
 # Test URL used for most screenshot calls
 $TEST_URL  = "https://example.com"
