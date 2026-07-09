@@ -257,3 +257,5 @@ curl -X GET https://api.pixelperfectapi.net/api/v1/screenshot/ \
 curl -X GET https://api.pixelperfectapi.net/api/v1/screenshot/ \
   -H "Authorization: Bearer invalid_token"
 """
+
+# # ============ END OF backend\auth_deps.py ====================================

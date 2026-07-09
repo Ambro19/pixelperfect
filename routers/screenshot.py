@@ -1,7 +1,14 @@
 # backend/routers/screenshot.py
 # PixelPerfect Screenshot API Router — Phase 1 + Phase 2 Advanced Features
 # Author: OneTechly
-# Updated: May 2026
+# Updated: July 2026
+#
+# ✅ FIX (Jul 2026 — PDF Tier Gate messaging):
+#   Enforcement was already correct — has_feature(current_user, "pdf") reads
+#   TIER_FEATURES in models.py, which now grants PDF to Pro+ (Pro, Business,
+#   Premium). But the 403 error message and the docstring tier table still
+#   said "Business tier", which would mislead Free users into buying the
+#   wrong plan. Message and docs updated to "Pro tier or higher".
 #
 # ✅ Phase 1 changes vs January 2026 scaffolding:
 #   - Added has_feature from models (replaces inline check_feature_access dict)
@@ -240,9 +247,9 @@ async def create_screenshot(
     |---|---|
     | `custom_js`      | Pro |
     | `device`         | Pro |
+    | PDF format       | Pro |
     | `target_element` | Business |
     | `webhook_url`    | Business |
-    | PDF format       | Business |
 
     **JavaScript errors** are non-fatal (option-c). If `custom_js` throws,
     the screenshot still captures and `js_warning` contains the error.
@@ -265,10 +272,13 @@ async def create_screenshot(
     # ── Tier gates (all via has_feature — single source of truth) ─────────────
     tier_limits = get_tier_limits(current_user.subscription_tier or "free")
 
+    # ✅ FIX (Jul 2026): PDF is Pro+, not Business-only. Enforcement was already
+    # correct via has_feature (models.py TIER_FEATURES["pro"]["pdf"] = True);
+    # only the error message needed updating.
     if request.format == "pdf" and not has_feature(current_user, "pdf"):
         raise HTTPException(
             status_code=403,
-            detail="PDF generation requires Business tier. Please upgrade.",
+            detail="PDF generation requires Pro tier or higher. Please upgrade.",
         )
 
     if request.custom_js and not has_feature(current_user, "custom_js"):
@@ -612,55 +622,30 @@ async def delete_screenshot(
 
 # ===== END OF routers/screenshot.py ==========================================
 
-# # ====================================================================================
-
 # # backend/routers/screenshot.py
-# # PixelPerfect Screenshot API Router — Phase 1 Advanced Features
+# # PixelPerfect Screenshot API Router — Phase 1 + Phase 2 Advanced Features
 # # Author: OneTechly
 # # Updated: May 2026
 # #
 # # ✅ Phase 1 changes vs January 2026 scaffolding:
+# #   - Added has_feature from models (replaces inline check_feature_access dict)
+# #   - Added asyncio, hashlib, hmac, json (for webhook retry + HMAC signing)
+# #   - ScreenshotRequest: added webhook_secret field
+# #   - ScreenshotResponse: added js_warning: Optional[str]
+# #   - check_feature_access() replaced by has_feature() from models.py
+# #   - send_webhook_notification(): exponential-backoff retry, HMAC-SHA256 signing
+# #   - create_screenshot(): all tier gates use has_feature(), Phase 1 params wired
 # #
-# #   IMPORTS
-# #     - Added `has_feature` from models (replaces inline check_feature_access dict)
-# #     - Added asyncio, hashlib, hmac, json (for webhook retry + HMAC signing)
-# #
-# #   ScreenshotRequest
-# #     - Added webhook_secret field (HMAC signing key for X-PixelPerfect-Signature)
-# #
-# #   ScreenshotResponse
-# #     - Added js_warning: Optional[str] field (option-c: capture always succeeds,
-# #       JS errors surface as a non-fatal warning rather than failing the request)
-# #
-# #   check_feature_access() → REPLACED by has_feature() from models.py
-# #     - Removed the inline feature_access dict — TIER_FEATURES in models.py
-# #       is now the single source of truth. All tier gates call has_feature().
-# #
-# #   send_webhook_notification()
-# #     - Added exponential-backoff retry: 3 attempts, 2s → 4s → 8s between tries
-# #     - Added HMAC-SHA256 signing: X-PixelPerfect-Signature header
-# #     - Added X-PixelPerfect-Timestamp header (replay-attack mitigation)
-# #     - Added webhook_secret parameter
-# #
-# #   create_screenshot()
-# #     - All tier gates now use has_feature() instead of check_feature_access()
-# #     - Service call passes new Phase 1 params: device, custom_js,
-# #       wait_for_selector, target_element
-# #     - Service return is Dict (not bytes) — result unpacked correctly:
-# #         screenshot_bytes read from disk via filepath in result dict
-# #         js_warning extracted from result dict
-# #     - js_warning included in ScreenshotResponse and in webhook payload
-# #     - webhook_secret wired from request to send_webhook_notification()
-# #
-# #   get_usage_stats()
-# #     - Added white_label to features dict
-# #     - All feature checks use has_feature()
-# #
-# # WIRING NOTE: This router is activated in main.py via:
-# #   from routers.screenshot import router as screenshot_router
-# #   app.include_router(screenshot_router)
-# # The old @app.post("/api/v1/screenshot") from screenshot_endpoints.py
-# # must be removed or commented out to avoid route conflicts.
+# # ✅ Phase 2 changes (May 2026):
+# #   - ScreenshotResponse: added element_selector: Optional[str] = None
+# #     Root cause of TC-EL-* failures: the field existed in the service return dict
+# #     but was missing from the Pydantic response model, so it was silently dropped
+# #     from every API response. PowerShell read it as empty string → all 14 tests failed.
+# #   - create_screenshot(): extracts element_selector from result dict and passes it
+# #     to ScreenshotResponse and to the webhook payload.
+# #   - Webhook payload: element_selector now included in data block.
+# #   - get_usage_stats(): element_selection and webhooks now correctly reported
+# #     for business tier (was already working via has_feature — no change needed).
 
 # import asyncio
 # import hashlib
@@ -721,11 +706,12 @@ async def delete_screenshot(
 #         description="CSS selector to wait for before capture (Pro+).",
 #     )
 
-#     # Phase 2 stub — Business+
+#     # Phase 2 — Business+
 #     target_element: Optional[str] = Field(
 #         default=None,
 #         max_length=200,
-#         description="CSS selector to crop to (Business+). Ships in Phase 2.",
+#         description="CSS selector to crop to (Business+). "
+#                     "The full page is captured first, then Pillow crops to this element.",
 #     )
 
 #     # Phase 3 — Business+ webhook
@@ -742,7 +728,14 @@ async def delete_screenshot(
 
 
 # class ScreenshotResponse(BaseModel):
-#     """Screenshot response — js_warning is non-None when custom_js threw an error."""
+#     """
+#     Screenshot response model.
+
+#     ✅ Phase 2 (May 2026): added element_selector field.
+#        Without this field the Pydantic model silently dropped element_selector
+#        from all API responses even though the service returned it correctly,
+#        causing every TC-EL-* test to fail with element_selector=''.
+#     """
 #     url: str
 #     screenshot_url: Optional[str] = None
 #     screenshot_id: str
@@ -753,7 +746,8 @@ async def delete_screenshot(
 #     created_at: str
 #     usage: dict
 #     device_used: Optional[str] = None
-#     js_warning: Optional[str] = None   # ← Phase 1 (option-c JS error handling)
+#     js_warning: Optional[str] = None       # Phase 1: non-None when custom_js threw
+#     element_selector: Optional[str] = None # Phase 2: selector used for crop, or None
 
 
 # class DeviceListResponse(BaseModel):
@@ -866,16 +860,19 @@ async def delete_screenshot(
 #     Capture a screenshot with all advertised features.
 
 #     **Tier gates**
-#     | Feature | Minimum tier |
+#     | Feature          | Minimum tier |
 #     |---|---|
-#     | `custom_js` | Pro |
-#     | `device` | Pro |
-#     | `target_element` | Business (Phase 2) |
-#     | `webhook_url` | Business |
-#     | PDF format | Business |
+#     | `custom_js`      | Pro |
+#     | `device`         | Pro |
+#     | `target_element` | Business |
+#     | `webhook_url`    | Business |
+#     | PDF format       | Business |
 
 #     **JavaScript errors** are non-fatal (option-c). If `custom_js` throws,
 #     the screenshot still captures and `js_warning` contains the error.
+
+#     **Element selection** crops the screenshot to the element's bounding box.
+#     Returns HTTP 400 if the selector matches nothing or the element has zero size.
 
 #     **Webhook delivery** uses exponential-backoff retry (3 attempts) and
 #     optional HMAC-SHA256 signing via `webhook_secret`.
@@ -938,7 +935,9 @@ async def delete_screenshot(
 
 #         # Service returns Dict[str, Any] with keys:
 #         #   filename, filepath, url, width, height, format, full_page,
-#         #   dark_mode, file_size, created_at, js_warning   ← Phase 1 addition
+#         #   dark_mode, file_size, created_at,
+#         #   js_warning        ← Phase 1
+#         #   element_selector  ← Phase 2 (None when target_element not used)
 #         result = await screenshot_service.capture_screenshot(
 #             url=str(request.url),
 #             width=request.width,
@@ -952,13 +951,15 @@ async def delete_screenshot(
 #             device=request.device,
 #             custom_js=request.custom_js,
 #             wait_for_selector=request.wait_for_selector,
+#             # Phase 2 param
 #             target_element=request.target_element,
 #         )
 
-#         # Extract js_warning from result (None if no JS error or no custom_js)
-#         js_warning: Optional[str] = result.get("js_warning")
+#         # Extract Phase 1 + Phase 2 fields from result dict
+#         js_warning: Optional[str]       = result.get("js_warning")
+#         element_selector: Optional[str] = result.get("element_selector")  # ← Phase 2
 
-#         # Read captured bytes from disk (service writes to local SCREENSHOTS_DIR)
+#         # Read captured bytes from disk
 #         from pathlib import Path
 #         screenshot_bytes = Path(result["filepath"]).read_bytes()
 
@@ -1015,7 +1016,11 @@ async def delete_screenshot(
 #         db.refresh(screenshot_record)
 #         db.refresh(current_user)
 
-#         logger.info("✅ Screenshot created: %s for user %s", screenshot_id, current_user.id)
+#         logger.info(
+#             "✅ Screenshot created: %s for user %s (element=%s)",
+#             screenshot_id, current_user.id,
+#             repr(element_selector) if element_selector else "none",
+#         )
 
 #         # ── Webhook (background, Business+) ───────────────────────────────────
 #         if request.webhook_url:
@@ -1023,13 +1028,14 @@ async def delete_screenshot(
 #                 send_webhook_notification,
 #                 webhook_url=request.webhook_url,
 #                 screenshot_data={
-#                     "screenshot_id": screenshot_id,
-#                     "url": str(request.url),
-#                     "screenshot_url": screenshot_url,
-#                     "format": request.format,
-#                     "size_bytes": len(screenshot_bytes),
+#                     "screenshot_id":   screenshot_id,
+#                     "url":             str(request.url),
+#                     "screenshot_url":  screenshot_url,
+#                     "format":          request.format,
+#                     "size_bytes":      len(screenshot_bytes),
 #                     "processing_time_ms": processing_time,
-#                     "js_warning": js_warning,
+#                     "js_warning":      js_warning,
+#                     "element_selector": element_selector,  # ← Phase 2 in webhook payload
 #                 },
 #                 secret=request.webhook_secret,
 #             )
@@ -1045,9 +1051,10 @@ async def delete_screenshot(
 #             created_at=screenshot_record.created_at.isoformat(),
 #             device_used=request.device,
 #             js_warning=js_warning,
+#             element_selector=element_selector,   # ← Phase 2: the key that was missing
 #             usage={
-#                 "current": current_user.usage_screenshots,
-#                 "limit": limit,
+#                 "current":   current_user.usage_screenshots,
+#                 "limit":     limit,
 #                 "remaining": limit - current_user.usage_screenshots,
 #             },
 #         )
@@ -1106,14 +1113,14 @@ async def delete_screenshot(
 #         "tier": current_user.subscription_tier or "free",
 #         "usage": {
 #             "screenshots": {
-#                 "used": screenshots_used,
-#                 "limit": screenshots_limit,
+#                 "used":      screenshots_used,
+#                 "limit":     screenshots_limit,
 #                 "remaining": max(0, screenshots_limit - screenshots_used)
 #                 if screenshots_limit != "unlimited" else "unlimited",
 #                 "percentage": pct,
 #             },
 #             "batch_requests": {
-#                 "used": current_user.usage_batch_requests or 0,
+#                 "used":  current_user.usage_batch_requests or 0,
 #                 "limit": tier_limits["batch_requests"],
 #                 "remaining": max(
 #                     0,
@@ -1154,17 +1161,17 @@ async def delete_screenshot(
 #         raise HTTPException(status_code=404, detail="Screenshot not found")
 
 #     return {
-#         "id": screenshot.id,
-#         "url": screenshot.url,
-#         "screenshot_url": screenshot.storage_url,
-#         "width": screenshot.width,
-#         "height": screenshot.height,
-#         "format": screenshot.format,
-#         "size_bytes": screenshot.size_bytes,
-#         "status": screenshot.status,
+#         "id":                screenshot.id,
+#         "url":               screenshot.url,
+#         "screenshot_url":    screenshot.storage_url,
+#         "width":             screenshot.width,
+#         "height":            screenshot.height,
+#         "format":            screenshot.format,
+#         "size_bytes":        screenshot.size_bytes,
+#         "status":            screenshot.status,
 #         "processing_time_ms": screenshot.processing_time_ms,
-#         "created_at": screenshot.created_at.isoformat(),
-#         "expires_at": screenshot.expires_at.isoformat() if screenshot.expires_at else None,
+#         "created_at":        screenshot.created_at.isoformat(),
+#         "expires_at":        screenshot.expires_at.isoformat() if screenshot.expires_at else None,
 #     }
 
 
@@ -1183,20 +1190,20 @@ async def delete_screenshot(
 #     return {
 #         "screenshots": [
 #             {
-#                 "id": s.id,
-#                 "url": s.url,
+#                 "id":             s.id,
+#                 "url":            s.url,
 #                 "screenshot_url": s.storage_url,
-#                 "width": s.width,
-#                 "height": s.height,
-#                 "format": s.format,
-#                 "size_bytes": s.size_bytes,
-#                 "status": s.status,
-#                 "created_at": s.created_at.isoformat(),
+#                 "width":          s.width,
+#                 "height":         s.height,
+#                 "format":         s.format,
+#                 "size_bytes":     s.size_bytes,
+#                 "status":         s.status,
+#                 "created_at":     s.created_at.isoformat(),
 #             }
 #             for s in screenshots
 #         ],
-#         "total": total,
-#         "limit": limit,
+#         "total":  total,
+#         "limit":  limit,
 #         "offset": offset,
 #     }
 
