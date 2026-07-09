@@ -1,506 +1,813 @@
 # ============================================================================
-# DATABASE MODELS - PixelPerfect Screenshot API
-# File: backend/models.py
+# SCREENSHOT ENDPOINTS — PixelPerfect Screenshot API
+# File: backend/screenshot_endpoints.py
 # Author: OneTechly
 # Updated: July 2026
 # ============================================================================
 # PRODUCTION READY
 #
-# ✅ FIX (Jul 2026 — Tier Limits Source of Truth):
-#   get_tier_limits() now reads ALL limit values from environment variables
-#   with hardcoded fallbacks matching the documented defaults.
-#   Root cause: business.batch_requests was hardcoded as 500 in this file,
-#   while batch.py defines TIER_BATCH_LIMITS["business"] = 200 and .env
-#   defines BUSINESS_BATCH_LIMIT=200. Three files had three different values.
-#   Fix: .env is now the single source of truth for all tier limits.
-#   Changing a limit now requires editing .env only — no code change needed.
+# ✅ FIX (July 2026 — PDF Tier Gate: Business-only → Pro+):
+#   Root cause: Three files disagreed on which tier PDF requires:
+#     - models.py TIER_FEATURES["pro"]["pdf"] = False  ← wrong
+#     - screenshot_endpoints.py error said "Business tier" ← wrong
+#     - ScreenshotPage.js had no client-side gate ← wrong
+#     - Features.jsx Feature Availability table showed PDF as free ← wrong
+#   Fix applied here: has_feature(user, "pdf") now returns True for Pro
+#   because models.py TIER_FEATURES["pro"]["pdf"] is now True.
+#   Error message updated: "Pro tier or higher" (not "Business tier").
+#   PDF is now available on: Pro, Business, Premium.
+#   PDF is blocked on: Free.
 #
-# ✅ FIX (Mar 2026): SQLite WAL journal mode, FK enforcement, NORMAL sync
-# ✅ FIX (Mar 2026): Added BatchJob model — fixes frozen batch counter
-# ✅ FIX (Apr 2026): Added BatchJob.urls_json — enables job reconstruction
-#     after server restart.
-# ✅ FIX (Apr 2026): Added Screenshot.batch_job_id — links screenshots to
-#     parent BatchJob. Required by _reconstruct_job_from_db() in batch.py.
-# ✅ FIX (Apr 2026): add_missing_columns() adds urls_json and batch_job_id.
-# ✅ NEW (May 2026 — Phase 1): TIER_FEATURES dict + has_feature() added.
+# Previous fixes (retained):
+# ✅ FIX (May 2026 — Phase 2): element_selector field in ScreenshotResponse
+# ✅ FIX (May 2026 — Phase 1): Device emulation + custom_js + wait_for_selector
+# ✅ FIX (Apr 2026): Per-user asyncio Semaphore concurrency limiter
+# ✅ FIX (Apr 2026): 5-layer tier resolution chain prevents None tier errors
+# ✅ FIX (Mar 2026): Batch job URLs stored in DB for crash recovery
 # ============================================================================
 
-from __future__ import annotations
-
+import asyncio
+import hashlib
+import json
+import logging
 import os
-from datetime import datetime, timedelta
-from typing import Any, Dict, Optional
-from uuid import uuid4
+import re
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Union
 
-from sqlalchemy import (
-    Boolean,
-    Column,
-    DateTime,
-    Float,
-    ForeignKey,
-    Index,
-    Integer,
-    String,
-    Text,
-    create_engine,
-    event,
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, UploadFile, File, Form
+from pydantic import BaseModel, Field, validator
+from sqlalchemy.orm import Session
+
+from auth_deps import get_current_user, get_optional_user
+from database import get_db
+from models import (
+    BatchJob, Screenshot, User,
+    get_tier_limits, has_feature, reset_monthly_usage
 )
-from sqlalchemy.engine import Engine
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import Session, sessionmaker
+from screenshot_service import ScreenshotService
+from storage_service import StorageService
 
-# ============================================================================
-# DATABASE CONFIGURATION
-# ============================================================================
+logger = logging.getLogger(__name__)
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./pixelperfect.db")
+# ── Router ────────────────────────────────────────────────────────────────────
+router = APIRouter(prefix="/api/v1", tags=["screenshots"])
 
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg2://", 1)
-elif DATABASE_URL.startswith("postgresql://") and "+psycopg2" not in DATABASE_URL:
-    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
+# ── Thread pool (one thread per Playwright call) ──────────────────────────────
+_executor = ThreadPoolExecutor(max_workers=1)
 
-_IS_SQLITE = DATABASE_URL.startswith("sqlite")
-_connect_args = {"check_same_thread": False} if _IS_SQLITE else {}
+# ── Per-user concurrency semaphores ───────────────────────────────────────────
+_user_semaphores: Dict[int, asyncio.Semaphore] = {}
+_semaphore_lock  = asyncio.Lock()
 
-engine = create_engine(
-    DATABASE_URL,
-    connect_args=_connect_args,
-    pool_pre_ping=True,
-    future=True,
-)
+CONCURRENCY_ACQUIRE_TIMEOUT = int(os.getenv("CONCURRENCY_ACQUIRE_TIMEOUT_SECONDS", "5"))
 
-if _IS_SQLITE:
-    @event.listens_for(Engine, "connect")
-    def _set_sqlite_pragmas(dbapi_connection, connection_record):
-        cursor = dbapi_connection.cursor()
-        cursor.execute("PRAGMA foreign_keys=ON;")
-        cursor.execute("PRAGMA journal_mode=WAL;")
-        cursor.execute("PRAGMA synchronous=NORMAL;")
-        cursor.close()
+TIER_CONCURRENCY: Dict[str, int] = {
+    "free":     2,
+    "starter":  2,
+    "pro":      3,
+    "business": 5,
+    "premium":  5,
+}
 
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
+# ── Batch URL limits (must match models.py get_tier_limits) ──────────────────
+TIER_BATCH_LIMITS: Dict[str, int] = {
+    "free":     0,
+    "starter":  0,
+    "pro":      50,
+    "business": 200,
+    "premium":  1000,
+}
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _resolve_tier(user: User) -> str:
+    """5-layer tier resolution — prevents None or missing tier errors."""
+    raw = (
+        getattr(user, "subscription_tier", None) or
+        getattr(user, "tier",              None) or
+        getattr(user, "plan",              None) or
+        getattr(user, "account_type",      None) or
+        "free"
+    )
+    return (str(raw) or "free").lower().strip()
 
 
-def get_db():
-    db = SessionLocal()
+async def _get_semaphore(user_id: int, max_concurrent: int) -> asyncio.Semaphore:
+    async with _semaphore_lock:
+        sem = _user_semaphores.get(user_id)
+        if sem is None or sem._value != max_concurrent:
+            sem = asyncio.Semaphore(max_concurrent)
+            _user_semaphores[user_id] = sem
+        return sem
+
+
+def _build_storage_url(key: str) -> str:
+    storage_type = os.getenv("STORAGE_TYPE", "local").lower()
+    if storage_type == "r2":
+        base = os.getenv("BACKEND_URL", "").rstrip("/")
+        return f"{base}/screenshots/{key}"
+    base = os.getenv("BACKEND_URL", "").rstrip("/") or os.getenv("CUSTOM_API_DOMAIN", "").rstrip("/")
+    return f"{base}/screenshots/{key}"
+
+
+def _increment_usage(user: User, field: str, db: Session, amount: int = 1) -> None:
+    current = getattr(user, field, 0) or 0
+    setattr(user, field, current + amount)
     try:
-        yield db
+        db.commit()
+    except Exception as e:
+        logger.error(f"Usage increment failed ({field}): {e}")
+        db.rollback()
+
+
+# ── Request / Response models ─────────────────────────────────────────────────
+
+class ScreenshotRequest(BaseModel):
+    url:    str = Field(..., description="Target website URL (must start with http:// or https://)")
+    width:  int = Field(1920, ge=320, le=3840)
+    height: int = Field(1080, ge=240, le=2160)
+    format: str = Field("png",   description="png | jpeg | webp | pdf")
+    quality: Optional[int] = Field(None, ge=1, le=100)
+
+    full_page: bool = Field(False)
+    dark_mode: bool = Field(False)
+    delay:     int  = Field(0, ge=0, le=10)
+
+    remove_elements: Optional[List[str]] = Field(None)
+
+    # Phase 1 — Pro+
+    device:            Optional[str] = Field(None)
+    custom_js:         Optional[str] = Field(None, max_length=10000)
+    wait_for_selector: Optional[str] = Field(None)
+
+    # Phase 2 — Business+
+    target_element: Optional[str] = Field(None)
+
+    # Phase 3 — Business+
+    webhook_url: Optional[str] = Field(None)
+
+    @validator("url")
+    def validate_url(cls, v):
+        if not v.startswith(("http://", "https://")):
+            raise ValueError("URL must start with http:// or https://")
+        return v.strip()
+
+    @validator("format")
+    def validate_format(cls, v):
+        allowed = {"png", "jpeg", "jpg", "webp", "pdf"}
+        v = v.lower().strip()
+        if v not in allowed:
+            raise ValueError(f"Format must be one of: {', '.join(sorted(allowed))}")
+        return v
+
+
+class ScreenshotResponse(BaseModel):
+    screenshot_url:  str
+    screenshot_id:   str
+    format:          str
+    width:           int
+    height:          int
+    size_bytes:      int
+    processing_time: float
+    created_at:      str
+    storage_type:    str
+    js_warning:      Optional[str] = None
+    element_selector: Optional[str] = None
+
+
+class BatchSubmitRequest(BaseModel):
+    urls:     Optional[List[str]] = Field(None)
+    csv_text: Optional[str]       = Field(None)
+    format:   str                 = Field("png")
+    width:    int                 = Field(1920)
+    height:   int                 = Field(1080)
+    full_page: bool               = Field(False)
+    quality:  Optional[int]       = Field(None)
+
+    @validator("format")
+    def validate_format(cls, v):
+        allowed = {"png", "jpeg", "jpg", "webp", "pdf"}
+        v = v.lower().strip()
+        if v not in allowed:
+            raise ValueError(f"Format must be one of: {', '.join(sorted(allowed))}")
+        return v
+
+
+class BatchJobStatusResponse(BaseModel):
+    id:          str
+    status:      str
+    format:      str
+    total:       int
+    completed:   int
+    failed:      int
+    queued:      int
+    processing:  int
+    created_at:  str
+    completed_at: Optional[str]
+    items:       List[Dict[str, Any]]
+
+
+# ── Single screenshot endpoint ────────────────────────────────────────────────
+
+@router.post("/screenshot/", response_model=ScreenshotResponse)
+async def capture_screenshot(
+    request_data: ScreenshotRequest,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Capture a single website screenshot.
+    Authentication: JWT Bearer token or X-API-Key header.
+    """
+    start_time = time.time()
+    tier = _resolve_tier(current_user)
+    limits = get_tier_limits(tier)
+
+    # ── Usage limit check ──────────────────────────────────────────────────────
+    screenshots_used  = getattr(current_user, "usage_screenshots",    0) or 0
+    screenshots_limit = limits.get("screenshots", 100)
+    if (
+        screenshots_limit != "unlimited"
+        and isinstance(screenshots_limit, int)
+        and screenshots_used >= screenshots_limit
+    ):
+        raise HTTPException(
+            status_code=429,
+            detail=f"Monthly screenshot limit reached ({screenshots_limit}). Please upgrade your plan.",
+        )
+
+    # ── PDF tier gate ─────────────────────────────────────────────────────────
+    # ✅ FIX (July 2026): Changed from Business-only to Pro+.
+    # has_feature(user, "pdf") returns True for Pro, Business, Premium.
+    # Returns False for Free tier.
+    if request_data.format.lower() == "pdf" and not has_feature(current_user, "pdf"):
+        raise HTTPException(
+            status_code=403,
+            detail="PDF generation requires Pro tier or higher. Please upgrade.",
+        )
+
+    # ── Phase 1 feature gates (Pro+) ──────────────────────────────────────────
+    if request_data.device and not has_feature(current_user, "device_emulation"):
+        raise HTTPException(status_code=403, detail="Device emulation requires Pro tier or higher.")
+
+    if request_data.custom_js and not has_feature(current_user, "custom_js"):
+        raise HTTPException(status_code=403, detail="Custom JavaScript requires Pro tier or higher.")
+
+    # ── Phase 2 feature gate (Business+) ──────────────────────────────────────
+    if request_data.target_element and not has_feature(current_user, "element_selection"):
+        raise HTTPException(status_code=403, detail="Element selection requires Business tier or higher.")
+
+    # ── Phase 3 feature gate (Business+) ──────────────────────────────────────
+    if request_data.webhook_url and not has_feature(current_user, "webhooks"):
+        raise HTTPException(status_code=403, detail="Webhooks require Business tier or higher.")
+
+    # ── Per-user concurrency limiter ───────────────────────────────────────────
+    max_concurrent = TIER_CONCURRENCY.get(tier, 2)
+    semaphore = await _get_semaphore(current_user.id, max_concurrent)
+    acquired  = False
+
+    try:
+        acquired = await asyncio.wait_for(
+            semaphore.acquire(),
+            timeout=CONCURRENCY_ACQUIRE_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many concurrent requests. Please wait and retry.",
+            headers={"Retry-After": "1"},
+        )
+
+    try:
+        # ── Playwright capture ────────────────────────────────────────────────
+        loop    = asyncio.get_event_loop()
+        service = ScreenshotService()
+
+        capture_kwargs: Dict[str, Any] = {
+            "url":             request_data.url,
+            "width":           request_data.width,
+            "height":          request_data.height,
+            "format":          request_data.format,
+            "full_page":       request_data.full_page,
+            "dark_mode":       request_data.dark_mode,
+            "delay":           request_data.delay,
+            "remove_elements": request_data.remove_elements or [],
+        }
+        if request_data.quality is not None:
+            capture_kwargs["quality"] = request_data.quality
+        if request_data.device:
+            capture_kwargs["device"] = request_data.device
+        if request_data.custom_js:
+            capture_kwargs["custom_js"] = request_data.custom_js
+        if request_data.wait_for_selector:
+            capture_kwargs["wait_for_selector"] = request_data.wait_for_selector
+        if request_data.target_element:
+            capture_kwargs["target_element"] = request_data.target_element
+
+        result = await loop.run_in_executor(
+            _executor,
+            lambda: service.take_screenshot(**capture_kwargs),
+        )
+
+        if not result.get("success"):
+            raise HTTPException(
+                status_code=500,
+                detail=result.get("error", "Screenshot capture failed."),
+            )
+
+        # ── Storage ───────────────────────────────────────────────────────────
+        image_data   = result["image_data"]
+        storage_type = os.getenv("STORAGE_TYPE", "local").lower()
+        ext          = request_data.format if request_data.format != "jpg" else "jpeg"
+        filename     = f"screenshot_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}.{ext}"
+
+        storage_svc = StorageService()
+        if storage_type == "r2":
+            r2_key = f"screenshots/{filename}"
+            storage_svc.upload_to_r2(image_data, r2_key, f"image/{ext}")
+            storage_url = _build_storage_url(r2_key)
+        else:
+            os.makedirs("screenshots", exist_ok=True)
+            path = f"screenshots/{filename}"
+            with open(path, "wb") as fp:
+                fp.write(image_data)
+            storage_url = _build_storage_url(filename)
+
+        # ── DB record ─────────────────────────────────────────────────────────
+        screenshot_id  = uuid.uuid4().hex
+        processing_time = time.time() - start_time
+
+        screenshot = Screenshot(
+            id              = screenshot_id,
+            user_id         = current_user.id,
+            url             = request_data.url,
+            width           = result.get("width",  request_data.width),
+            height          = result.get("height", request_data.height),
+            format          = ext,
+            full_page       = request_data.full_page,
+            dark_mode       = request_data.dark_mode,
+            size_bytes      = len(image_data),
+            storage_url     = storage_url,
+            status          = "completed",
+            processing_time_ms = processing_time * 1000,
+            created_at      = datetime.utcnow(),
+        )
+        db.add(screenshot)
+
+        _increment_usage(current_user, "usage_screenshots", db)
+        _increment_usage(current_user, "usage_api_calls",   db)
+
+        db.refresh(screenshot)
+
+        processing_time = time.time() - start_time
+
+        return ScreenshotResponse(
+            screenshot_url   = storage_url,
+            screenshot_id    = screenshot_id,
+            format           = ext,
+            width            = result.get("width",  request_data.width),
+            height           = result.get("height", request_data.height),
+            size_bytes       = len(image_data),
+            processing_time  = processing_time,
+            created_at       = datetime.utcnow().isoformat(),
+            storage_type     = storage_type,
+            js_warning       = result.get("js_warning"),
+            element_selector = result.get("element_selector"),
+        )
+
+    finally:
+        if acquired:
+            semaphore.release()
+
+
+# ── Batch submit (JSON) ────────────────────────────────────────────────────────
+
+@router.post("/batch/submit")
+async def batch_submit(
+    request_data: BatchSubmitRequest,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    tier        = _resolve_tier(current_user)
+    batch_limit = TIER_BATCH_LIMITS.get(tier, 0)
+
+    if batch_limit == 0:
+        raise HTTPException(
+            status_code=403,
+            detail="Batch processing requires Pro tier or higher. Please upgrade.",
+        )
+
+    # ── PDF gate for batch ────────────────────────────────────────────────────
+    # ✅ FIX (July 2026): PDF is Pro+, not Business-only.
+    if request_data.format.lower() == "pdf" and not has_feature(current_user, "pdf"):
+        raise HTTPException(
+            status_code=403,
+            detail="PDF generation requires Pro tier or higher. Please upgrade.",
+        )
+
+    # ── Parse URLs ─────────────────────────────────────────────────────────────
+    urls: List[str] = []
+    if request_data.urls:
+        urls = request_data.urls
+    elif request_data.csv_text:
+        sep  = "\t" if "\t" in request_data.csv_text else ","
+        for line in request_data.csv_text.splitlines():
+            for cell in line.split(sep):
+                cell = cell.strip().strip('"').strip("'")
+                if cell.startswith(("http://", "https://")):
+                    urls.append(cell)
+
+    urls = list(dict.fromkeys(urls))  # deduplicate preserving order
+
+    if not urls:
+        raise HTTPException(status_code=400, detail="No valid URLs provided.")
+
+    if len(urls) > batch_limit:
+        raise HTTPException(
+            status_code=400,
+            detail=f"URL count ({len(urls)}) exceeds your plan limit ({batch_limit}). Reduce the list or upgrade.",
+        )
+
+    # ── Create job ─────────────────────────────────────────────────────────────
+    job_id = uuid.uuid4().hex[:16]
+    job    = BatchJob(
+        id         = job_id,
+        user_id    = current_user.id,
+        status     = "queued",
+        format     = request_data.format,
+        width      = request_data.width,
+        height     = request_data.height,
+        full_page  = request_data.full_page,
+        total_urls = len(urls),
+        urls_json  = json.dumps(urls),
+        created_at = datetime.utcnow(),
+    )
+    db.add(job)
+    db.commit()
+
+    background_tasks.add_task(_process_batch_job, job_id, urls, request_data, current_user.id)
+
+    return {
+        "job_id":      job_id,
+        "status":      "queued",
+        "total_urls":  len(urls),
+        "format":      request_data.format,
+        "message":     f"Batch job queued. {len(urls)} URL(s) will be processed.",
+    }
+
+
+# ── Batch submit (file upload) ─────────────────────────────────────────────────
+
+@router.post("/batch/submit_file")
+async def batch_submit_file(
+    background_tasks: BackgroundTasks,
+    file:      UploadFile = File(...),
+    format:    str        = Form("png"),
+    width:     int        = Form(1920),
+    height:    int        = Form(1080),
+    full_page: bool       = Form(False),
+    current_user: User    = Depends(get_current_user),
+    db: Session           = Depends(get_db),
+):
+    tier        = _resolve_tier(current_user)
+    batch_limit = TIER_BATCH_LIMITS.get(tier, 0)
+
+    if batch_limit == 0:
+        raise HTTPException(
+            status_code=403,
+            detail="Batch processing requires Pro tier or higher. Please upgrade.",
+        )
+
+    if format.lower() == "pdf" and not has_feature(current_user, "pdf"):
+        raise HTTPException(
+            status_code=403,
+            detail="PDF generation requires Pro tier or higher. Please upgrade.",
+        )
+
+    content = (await file.read()).decode("utf-8", errors="replace")
+    urls: List[str] = []
+    sep  = "\t" if "\t" in content else ","
+    for line in content.splitlines():
+        for cell in line.split(sep):
+            cell = cell.strip().strip('"').strip("'")
+            if cell.startswith(("http://", "https://")):
+                urls.append(cell)
+
+    urls = list(dict.fromkeys(urls))
+
+    if not urls:
+        raise HTTPException(status_code=400, detail="No valid URLs found in file.")
+
+    if len(urls) > batch_limit:
+        raise HTTPException(
+            status_code=400,
+            detail=f"URL count ({len(urls)}) exceeds your plan limit ({batch_limit}).",
+        )
+
+    job_id = uuid.uuid4().hex[:16]
+    req    = BatchSubmitRequest(
+        format=format, width=width, height=height, full_page=full_page
+    )
+    job = BatchJob(
+        id         = job_id,
+        user_id    = current_user.id,
+        status     = "queued",
+        format     = format,
+        width      = width,
+        height     = height,
+        full_page  = full_page,
+        total_urls = len(urls),
+        urls_json  = json.dumps(urls),
+        created_at = datetime.utcnow(),
+    )
+    db.add(job)
+    db.commit()
+
+    background_tasks.add_task(_process_batch_job, job_id, urls, req, current_user.id)
+
+    return {
+        "job_id":     job_id,
+        "status":     "queued",
+        "total_urls": len(urls),
+        "message":    f"Batch job queued from file upload. {len(urls)} URL(s) to process.",
+    }
+
+
+# ── Batch background processor ────────────────────────────────────────────────
+
+async def _process_batch_job(
+    job_id:    str,
+    urls:      List[str],
+    req:       BatchSubmitRequest,
+    user_id:   int,
+):
+    from database import SessionLocal
+    db      = SessionLocal()
+    service = ScreenshotService()
+
+    try:
+        job = db.query(BatchJob).filter(BatchJob.id == job_id).first()
+        if not job:
+            return
+
+        job.status = "processing"
+        db.commit()
+
+        completed = 0
+        failed    = 0
+        items: List[Dict[str, Any]] = []
+
+        for idx, url in enumerate(urls):
+            item_start = time.time()
+            try:
+                result = await asyncio.get_event_loop().run_in_executor(
+                    _executor,
+                    lambda u=url: service.take_screenshot(
+                        url=u, width=req.width, height=req.height,
+                        format=req.format, full_page=req.full_page,
+                    ),
+                )
+                if not result.get("success"):
+                    raise RuntimeError(result.get("error", "Unknown error"))
+
+                image_data   = result["image_data"]
+                ext          = req.format if req.format != "jpg" else "jpeg"
+                filename     = f"batch_{job_id}_{idx}_{uuid.uuid4().hex[:6]}.{ext}"
+                storage_type = os.getenv("STORAGE_TYPE", "local").lower()
+
+                storage_svc = StorageService()
+                if storage_type == "r2":
+                    r2_key = f"screenshots/{filename}"
+                    storage_svc.upload_to_r2(image_data, r2_key, f"image/{ext}")
+                    screenshot_url = _build_storage_url(r2_key)
+                else:
+                    os.makedirs("screenshots", exist_ok=True)
+                    path = f"screenshots/{filename}"
+                    with open(path, "wb") as fp:
+                        fp.write(image_data)
+                    screenshot_url = _build_storage_url(filename)
+
+                processing_time = time.time() - item_start
+                items.append({
+                    "idx":             idx,
+                    "url":             url,
+                    "status":          "completed",
+                    "screenshot_url":  screenshot_url,
+                    "file_size":       len(image_data),
+                    "processing_time": round(processing_time, 2),
+                })
+                completed += 1
+
+            except Exception as e:
+                logger.error(f"Batch item {idx} failed ({url}): {e}")
+                items.append({
+                    "idx":    idx,
+                    "url":    url,
+                    "status": "failed",
+                    "error":  str(e),
+                })
+                failed += 1
+
+        if failed == 0:
+            final_status = "completed"
+        elif completed == 0:
+            final_status = "failed"
+        else:
+            final_status = "partial"
+
+        job.status          = final_status
+        job.completed_count = completed
+        job.failed_count    = failed
+        job.completed_at    = datetime.utcnow()
+        db.commit()
+
+        # Store item results in snapshot JSON
+        snap_path = ".batch_jobs_snapshot.json"
+        try:
+            existing: Dict = {}
+            if os.path.exists(snap_path):
+                with open(snap_path) as f:
+                    existing = json.load(f)
+            existing[job_id] = {
+                "status":    final_status,
+                "items":     items,
+                "completed": completed,
+                "failed":    failed,
+            }
+            with open(snap_path, "w") as f:
+                json.dump(existing, f)
+        except Exception as e:
+            logger.warning(f"Failed to write snapshot: {e}")
+
+    except Exception as e:
+        logger.error(f"Batch job {job_id} crashed: {e}")
+        try:
+            job = db.query(BatchJob).filter(BatchJob.id == job_id).first()
+            if job:
+                job.status = "failed"
+                db.commit()
+        except Exception:
+            pass
     finally:
         db.close()
 
 
-# ============================================================================
-# USER MODEL
-# ============================================================================
+# ── Batch job status ──────────────────────────────────────────────────────────
 
-class User(Base):
-    __tablename__ = "users"
-
-    id              = Column(Integer,     primary_key=True, index=True)
-    username        = Column(String(50),  unique=True, index=True, nullable=False)
-    email           = Column(String(100), unique=True, index=True, nullable=False)
-    hashed_password = Column(String(255), nullable=False)
-
-    stripe_customer_id = Column(String(100), unique=True, nullable=True)
-
-    subscription_tier = Column(String(20), default="free", nullable=False)
-
-    stripe_subscription_status = Column(String(20), nullable=True)
-    subscription_status        = Column(String(20), default="active", nullable=True)
-
-    subscription_id = Column(String(100), unique=True, nullable=True)
-
-    subscription_expires_at = Column(DateTime, nullable=True)
-    subscription_ends_at    = Column(DateTime, nullable=True)
-    subscription_updated_at = Column(DateTime, nullable=True)
-
-    usage_screenshots    = Column(Integer, default=0)
-    usage_batch_requests = Column(Integer, default=0)
-    usage_api_calls      = Column(Integer, default=0)
-    usage_reset_at       = Column(DateTime, nullable=True)
-
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    is_active  = Column(Boolean,  default=True,            nullable=False)
-
-    __table_args__ = (
-        Index("idx_user_email",    "email"),
-        Index("idx_user_username", "username"),
-        Index("idx_user_stripe",   "stripe_customer_id"),
-        Index("idx_user_tier",     "subscription_tier"),
+@router.get("/batch/jobs", response_model=List[Dict[str, Any]])
+async def list_batch_jobs(
+    current_user: User = Depends(get_current_user),
+    db: Session        = Depends(get_db),
+):
+    jobs = (
+        db.query(BatchJob)
+        .filter(BatchJob.user_id == current_user.id)
+        .order_by(BatchJob.created_at.desc())
+        .limit(100)
+        .all()
     )
+    return [
+        {
+            "id":          j.id,
+            "status":      j.status,
+            "format":      j.format,
+            "total":       j.total_urls,
+            "completed":   j.completed_count or 0,
+            "failed":      j.failed_count    or 0,
+            "created_at":  j.created_at.isoformat() if j.created_at else None,
+            "completed_at": j.completed_at.isoformat() if j.completed_at else None,
+        }
+        for j in jobs
+    ]
 
 
-# ============================================================================
-# API KEY MODEL
-# ============================================================================
-
-class ApiKey(Base):
-    __tablename__ = "api_keys"
-
-    id      = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
-
-    key_hash   = Column(String(64), unique=True, nullable=False, index=True)
-    key_prefix = Column(String(16), nullable=False)
-
-    name         = Column(String(100), default="Default API Key", nullable=False)
-    is_active    = Column(Boolean,     default=True,              nullable=False)
-    last_used_at = Column(DateTime,    nullable=True)
-    created_at   = Column(DateTime,    default=datetime.utcnow,  nullable=False)
-
-    __table_args__ = (
-        Index("idx_api_key_hash",   "key_hash"),
-        Index("idx_api_key_user",   "user_id"),
-        Index("idx_api_key_active", "is_active"),
+@router.get("/batch/jobs/{job_id}", response_model=Dict[str, Any])
+async def get_batch_job(
+    job_id:       str,
+    current_user: User    = Depends(get_current_user),
+    db: Session           = Depends(get_db),
+):
+    job = (
+        db.query(BatchJob)
+        .filter(BatchJob.id == job_id, BatchJob.user_id == current_user.id)
+        .first()
     )
+    if not job:
+        raise HTTPException(status_code=404, detail="Batch job not found.")
 
+    queued     = max(0, (job.total_urls or 0) - (job.completed_count or 0) - (job.failed_count or 0))
+    processing = 1 if job.status == "processing" else 0
 
-# ============================================================================
-# SCREENSHOT MODEL
-# ============================================================================
-
-class Screenshot(Base):
-    __tablename__ = "screenshots"
-
-    id = Column(String, primary_key=True, index=True, default=lambda: str(uuid4()))
-
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-
-    url = Column(Text, nullable=False)
-
-    width     = Column(Integer,    nullable=False, default=1920)
-    height    = Column(Integer,    nullable=False, default=1080)
-    full_page = Column(Boolean,    nullable=True)
-    format    = Column(String(10), nullable=False, default="png")
-    quality   = Column(Integer,    nullable=True)
-
-    size_bytes = Column(Integer, nullable=False, default=0)
-
-    storage_url = Column(Text,   nullable=False, default="")
-    storage_key = Column(String, nullable=True)
-
-    processing_time_ms = Column(Float, nullable=True)
-
-    status        = Column(String, nullable=True, default="completed")
-    error_message = Column(Text,   nullable=True)
-
-    dark_mode       = Column(Boolean, nullable=True)
-    delay_seconds   = Column(Integer, nullable=True)
-    remove_elements = Column(Text,    nullable=True)
-
-    created_at = Column(DateTime, nullable=True, default=datetime.utcnow)
-    expires_at = Column(DateTime, nullable=True)
-
-    is_baseline              = Column(Boolean, nullable=True)
-    baseline_screenshot_id   = Column(String, ForeignKey("screenshots.id"), nullable=True)
-    difference_percentage    = Column(Float,   nullable=True)
-    has_changes              = Column(Boolean, nullable=True)
-
-    screenshot_path = Column(Text, nullable=True)
-
-    batch_job_id = Column(
-        String(32),
-        ForeignKey("batch_jobs.id", ondelete="SET NULL"),
-        nullable=True,
-        index=True,
-    )
-
-    __table_args__ = (
-        Index("idx_screenshot_user",      "user_id"),
-        Index("idx_screenshot_created",   "created_at"),
-        Index("idx_screenshot_status",    "status"),
-        Index("idx_screenshot_format",    "format"),
-        Index("idx_screenshot_batch_job", "batch_job_id"),
-    )
-
-
-# ============================================================================
-# BATCH JOB MODEL
-# ============================================================================
-
-class BatchJob(Base):
-    __tablename__ = "batch_jobs"
-
-    id = Column(String(32), primary_key=True, index=True)
-
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
-
-    status    = Column(String(20),  nullable=False, default="queued")
-    format    = Column(String(10),  nullable=False, default="png")
-    width     = Column(Integer,     nullable=False, default=1920)
-    height    = Column(Integer,     nullable=False, default=1080)
-    full_page = Column(Boolean,     nullable=False, default=False)
-
-    total_urls = Column(Integer, nullable=False, default=0)
-
-    completed_count = Column(Integer, nullable=True, default=0)
-    failed_count    = Column(Integer, nullable=True, default=0)
-
-    urls_json = Column(Text, nullable=True)
-
-    created_at   = Column(DateTime, nullable=False, default=datetime.utcnow)
-    completed_at = Column(DateTime, nullable=True)
-
-    __table_args__ = (
-        Index("idx_batch_job_user",    "user_id"),
-        Index("idx_batch_job_created", "created_at"),
-        Index("idx_batch_job_status",  "status"),
-    )
-
-
-# ============================================================================
-# SUBSCRIPTION MODEL
-# ============================================================================
-
-class Subscription(Base):
-    __tablename__ = "subscriptions"
-
-    id      = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-
-    stripe_subscription_id = Column(String(100), unique=True, nullable=False)
-    stripe_customer_id     = Column(String(100), nullable=False)
-
-    tier   = Column(String(20), nullable=False)
-    status = Column(String(20), nullable=False)
-
-    current_period_start = Column(DateTime, nullable=True)
-    current_period_end   = Column(DateTime, nullable=True)
-    cancel_at_period_end = Column(Boolean,  default=False, nullable=False)
-
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at = Column(
-        DateTime,
-        default=datetime.utcnow,
-        onupdate=datetime.utcnow,
-        nullable=False,
-    )
-
-    __table_args__ = (
-        Index("idx_subscription_user",   "user_id"),
-        Index("idx_subscription_stripe", "stripe_subscription_id"),
-    )
-
-
-# ============================================================================
-# TIER LIMITS CONFIGURATION
-# ============================================================================
-# ✅ FIX (Jul 2026): All limit values now read from environment variables.
-#    .env is the single source of truth. Defaults match documented values.
-#
-#    Confirmed correct values from .env:
-#      FREE_SCREENSHOTS_LIMIT=100    FREE_BATCH_LIMIT=0
-#      PRO_SCREENSHOTS_LIMIT=5000    PRO_BATCH_LIMIT=50
-#      BUSINESS_SCREENSHOTS_LIMIT=50000   BUSINESS_BATCH_LIMIT=200  ← was 500
-#      PREMIUM_SCREENSHOTS_LIMIT=999999999  PREMIUM_BATCH_LIMIT=999999999
-#
-#    To change any limit: edit .env only. No code change required.
-# ============================================================================
-
-def _env_int(key: str, default: int) -> int:
-    """Read an integer from env; fall back to default if missing or invalid."""
+    # Load items from snapshot
+    items: List[Dict] = []
     try:
-        return int(os.getenv(key, str(default)))
-    except (TypeError, ValueError):
-        return default
+        snap_path = ".batch_jobs_snapshot.json"
+        if os.path.exists(snap_path):
+            with open(snap_path) as f:
+                snap = json.load(f)
+            snap_job = snap.get(job_id, {})
+            items    = snap_job.get("items", [])
+    except Exception as e:
+        logger.warning(f"Failed to load snapshot for job {job_id}: {e}")
 
-
-def _env_limit(key: str, default: int):
-    """
-    Read a limit from env. Returns 'unlimited' if the value is >= 999_999_999
-    (the sentinel used in .env for Premium), otherwise returns the integer.
-    """
-    val = _env_int(key, default)
-    return "unlimited" if val >= 999_999_999 else val
-
-
-def get_tier_limits(tier: str) -> Dict[str, Any]:
-    """
-    Return usage limits for a subscription tier.
-    All values are read from environment variables; the .env file is the
-    single source of truth so limits can be changed without a code deploy.
-    """
-    tier = (tier or "free").lower()
-
-    limits: Dict[str, Dict[str, Any]] = {
-        "free": {
-            "screenshots":    _env_int("FREE_SCREENSHOTS_LIMIT",    100),
-            "batch_requests": _env_int("FREE_BATCH_LIMIT",          0),
-            "api_calls":      _env_int("FREE_API_CALLS_LIMIT",      1_000),
-            "features": ["basic_customization", "community_support"],
-        },
-        "pro": {
-            "screenshots":    _env_int("PRO_SCREENSHOTS_LIMIT",     5_000),
-            "batch_requests": _env_int("PRO_BATCH_LIMIT",           50),
-            "api_calls":      _env_int("PRO_API_CALLS_LIMIT",       10_000),
-            "features": ["full_customization", "batch_processing", "priority_support"],
-        },
-        "business": {
-            # ✅ FIXED: env default is 200 (was hardcoded 500).
-            # Confirmed by BUSINESS_BATCH_LIMIT=200 in .env and
-            # TIER_BATCH_LIMITS["business"] = 200 in batch.py.
-            "screenshots":    _env_int("BUSINESS_SCREENSHOTS_LIMIT", 50_000),
-            "batch_requests": _env_int("BUSINESS_BATCH_LIMIT",       200),
-            "api_calls":      _env_int("BUSINESS_API_CALLS_LIMIT",   100_000),
-            "features": ["webhooks", "change_detection", "dedicated_support", "batch_processing"],
-        },
-        "premium": {
-            "screenshots":    _env_limit("PREMIUM_SCREENSHOTS_LIMIT", 999_999_999),
-            "batch_requests": _env_limit("PREMIUM_BATCH_LIMIT",       999_999_999),
-            "api_calls":      _env_limit("PREMIUM_API_CALLS_LIMIT",   999_999_999),
-            "features": ["white_label", "custom_sla", "account_manager", "webhooks", "change_detection"],
-        },
+    return {
+        "id":           job.id,
+        "status":       job.status,
+        "format":       job.format,
+        "total":        job.total_urls or 0,
+        "completed":    job.completed_count or 0,
+        "failed":       job.failed_count    or 0,
+        "queued":       queued,
+        "processing":   processing,
+        "created_at":   job.created_at.isoformat()   if job.created_at   else None,
+        "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+        "items":        items,
     }
 
-    return limits.get(tier, limits["free"])
 
+@router.post("/batch/jobs/{job_id}/retry_failed")
+async def retry_failed_batch_items(
+    job_id:          str,
+    background_tasks: BackgroundTasks,
+    current_user:    User    = Depends(get_current_user),
+    db: Session              = Depends(get_db),
+):
+    job = (
+        db.query(BatchJob)
+        .filter(BatchJob.id == job_id, BatchJob.user_id == current_user.id)
+        .first()
+    )
+    if not job:
+        raise HTTPException(status_code=404, detail="Batch job not found.")
+    if job.status == "processing":
+        raise HTTPException(status_code=409, detail="Job is still processing.")
 
-# ============================================================================
-# ✅ NEW (May 2026 — Phase 1): TIER_FEATURES + has_feature()
-# ============================================================================
+    # Load failed URLs from snapshot
+    failed_urls: List[str] = []
+    try:
+        snap_path = ".batch_jobs_snapshot.json"
+        if os.path.exists(snap_path):
+            with open(snap_path) as f:
+                snap = json.load(f)
+            items       = snap.get(job_id, {}).get("items", [])
+            failed_urls = [i["url"] for i in items if i.get("status") == "failed"]
+    except Exception as e:
+        logger.warning(f"Could not read snapshot for retry: {e}")
 
-TIER_FEATURES: Dict[str, Dict[str, bool]] = {
-    "free": {
-        "custom_js":         False,
-        "device_emulation":  False,
-        "element_selection": False,
-        "webhooks":          False,
-        "white_label":       False,
-        "pdf":               False,
-    },
-    "pro": {
-        "custom_js":         True,
-        "device_emulation":  True,
-        "element_selection": False,
-        "webhooks":          False,
-        "white_label":       False,
-        # ✅ FIX (July 2026): PDF is Pro+, not Business-only.
-        # models.py TIER_FEATURES was out of sync with the documented tier matrix.
-        "pdf":               True,
-    },
-    "business": {
-        "custom_js":         True,
-        "device_emulation":  True,
-        "element_selection": True,
-        "webhooks":          True,
-        "white_label":       False,
-        "pdf":               True,
-    },
-    "premium": {
-        "custom_js":         True,
-        "device_emulation":  True,
-        "element_selection": True,
-        "webhooks":          True,
-        "white_label":       True,
-        "pdf":               True,
-    },
-}
+    if not failed_urls:
+        return {"message": "No failed items to retry.", "retried": 0}
 
-
-def has_feature(user: "User", feature_name: str) -> bool:
-    """
-    Return True if the user's subscription tier includes the named feature.
-    This is the authoritative check — TIER_FEATURES is the only place
-    feature-to-tier mappings live. Do not duplicate this logic elsewhere.
-    """
-    tier = (getattr(user, "subscription_tier", None) or "free").lower()
-    return TIER_FEATURES.get(tier, {}).get(feature_name, False)
-
-
-# ============================================================================
-# USAGE RESET HELPER
-# ============================================================================
-
-def reset_monthly_usage(user: User, db: Session) -> None:
-    """
-    Reset user's monthly usage counters.
-    Called when a Stripe billing cycle renews (via webhook_handler.py on
-    invoice.paid events), NOT on the calendar 1st of the month.
-    The reset_at timestamp is set to 30 days from now as a rolling fallback
-    for users who have no active Stripe subscription.
-    """
-    user.usage_screenshots    = 0
-    user.usage_batch_requests = 0
-    user.usage_api_calls      = 0
-    user.usage_reset_at       = datetime.utcnow() + timedelta(days=30)
+    job.status          = "queued"
+    job.completed_count = (job.completed_count or 0)
+    job.failed_count    = 0
     db.commit()
 
+    req = BatchSubmitRequest(
+        format=job.format, width=job.width, height=job.height, full_page=job.full_page
+    )
+    background_tasks.add_task(_process_batch_job, job_id, failed_urls, req, current_user.id)
 
-# ============================================================================
-# DATABASE INITIALIZATION
-# ============================================================================
-
-def initialize_database() -> None:
-    Base.metadata.create_all(bind=engine)
-    print("✅ Database tables created successfully")
+    return {"message": f"Retrying {len(failed_urls)} failed item(s).", "retried": len(failed_urls)}
 
 
-# ============================================================================
-# MIGRATION HELPER
-# ============================================================================
+@router.delete("/batch/jobs/{job_id}")
+async def delete_batch_job(
+    job_id:       str,
+    current_user: User    = Depends(get_current_user),
+    db: Session           = Depends(get_db),
+):
+    job = (
+        db.query(BatchJob)
+        .filter(BatchJob.id == job_id, BatchJob.user_id == current_user.id)
+        .first()
+    )
+    if not job:
+        raise HTTPException(status_code=404, detail="Batch job not found.")
+    db.delete(job)
+    db.commit()
 
-def add_missing_columns() -> None:
-    """
-    Add columns that are new in this version to existing live databases.
-    Idempotent — safe to call on every startup.
-    """
-    from sqlalchemy import inspect, text
-
-    inspector = inspect(engine)
-    is_sqlite = _IS_SQLITE
-
-    user_cols = [col["name"] for col in inspector.get_columns("users")]
-    with engine.begin() as conn:
-        if "stripe_subscription_status" not in user_cols:
-            conn.execute(text(
-                "ALTER TABLE users ADD COLUMN stripe_subscription_status VARCHAR(20)"
-            ))
-            print("✅ Added users.stripe_subscription_status")
-
-        if "subscription_expires_at" not in user_cols:
-            conn.execute(text(
-                "ALTER TABLE users ADD COLUMN subscription_expires_at TIMESTAMP"
-            ))
-            print("✅ Added users.subscription_expires_at")
-
-        if "subscription_updated_at" not in user_cols:
-            conn.execute(text(
-                "ALTER TABLE users ADD COLUMN subscription_updated_at TIMESTAMP"
-            ))
-            print("✅ Added users.subscription_updated_at")
-
+    # Remove from snapshot
     try:
-        batch_cols = [col["name"] for col in inspector.get_columns("batch_jobs")]
-        with engine.begin() as conn:
-            if "urls_json" not in batch_cols:
-                conn.execute(text("ALTER TABLE batch_jobs ADD COLUMN urls_json TEXT"))
-                print("✅ Added batch_jobs.urls_json")
-    except Exception as e:
-        print(f"ℹ️  batch_jobs migration skipped: {e}")
+        snap_path = ".batch_jobs_snapshot.json"
+        if os.path.exists(snap_path):
+            with open(snap_path) as f:
+                snap = json.load(f)
+            snap.pop(job_id, None)
+            with open(snap_path, "w") as f:
+                json.dump(snap, f)
+    except Exception:
+        pass
 
-    try:
-        ss_cols = [col["name"] for col in inspector.get_columns("screenshots")]
-        with engine.begin() as conn:
-            if "batch_job_id" not in ss_cols:
-                if is_sqlite:
-                    conn.execute(text(
-                        "ALTER TABLE screenshots ADD COLUMN batch_job_id VARCHAR(32)"
-                    ))
-                else:
-                    conn.execute(text(
-                        "ALTER TABLE screenshots "
-                        "ADD COLUMN batch_job_id VARCHAR(32) "
-                        "REFERENCES batch_jobs(id) ON DELETE SET NULL"
-                    ))
-                print("✅ Added screenshots.batch_job_id")
-    except Exception as e:
-        print(f"ℹ️  screenshots migration skipped: {e}")
+    return {"message": "Batch job deleted.", "job_id": job_id}
 
-    print("✅ DB migrations completed")
+# ===== END OF screenshot_endpoints.py =====
 
-# ===== END OF models.py ======================================================
 
 # # =====================================================
 # # SCREENSHOT ENDPOINTS - PixelPerfect Screenshot API
