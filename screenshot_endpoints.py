@@ -42,7 +42,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, UploadFi
 from pydantic import BaseModel, Field, validator
 from sqlalchemy.orm import Session
 
-from auth_deps import get_current_user, get_optional_user
+from auth_deps import get_current_user
 from database import get_db
 from models import (
     BatchJob, Screenshot, User,
@@ -806,7 +806,7 @@ async def delete_batch_job(
 
     return {"message": "Batch job deleted.", "job_id": job_id}
 
-# ===== END OF screenshot_endpoints.py =====
+# ===== END OF screenshot_endpoints.py =======================
 
 
 # # =====================================================
