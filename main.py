@@ -584,6 +584,9 @@ class UpdateProfileRequest(BaseModel):
     username: Optional[str] = None
     email:    Optional[str] = None
 
+class ForgotUsernameIn(BaseModel):
+    email: EmailStr
+
 # =====================================================================
 # CONTACT FORM
 # =====================================================================
@@ -947,6 +950,102 @@ def forgot_password(payload: ForgotPasswordIn, db: Session = Depends(get_db)):
         except Exception:
             logger.exception("Failed to send reset email")
     return {"ok": True}
+
+# ── Forgot Username email helper ─────────────────────────────────────────────
+ 
+def _send_username_reminder_email(email: str, username: str) -> None:
+    """
+    Send a branded username reminder email via Gmail SMTP.
+    Matches the style of the password reset email.
+    """
+    smtp_host     = os.getenv("SMTP_HOST",      "smtp.gmail.com")
+    smtp_port     = int(os.getenv("SMTP_PORT",  "587"))
+    smtp_user     = os.getenv("SMTP_USERNAME",  "")
+    smtp_password = os.getenv("SMTP_PASSWORD",  "")
+    
+    if not smtp_user or not smtp_password:
+        raise ValueError("SMTP credentials not configured.")
+ 
+    text_body = (
+        f"Hello,\n\n"
+        f"We received a request to look up the username for your PixelPerfect account.\n\n"
+        f"Your username is: {username}\n\n"
+        f"If you didn't request this, you can safely ignore this email — "
+        f"your account is secure and nothing has changed.\n\n"
+        f"— The PixelPerfect Team\n"
+        f"pixelperfectapi.net"
+    )
+ 
+    html_body = f"""
+<html><body style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px;">
+  <div style="background:#1e40af;padding:24px 20px;border-radius:8px 8px 0 0;">
+    <h2 style="color:white;margin:0;font-size:20px;">&#128100; Your PixelPerfect Username</h2>
+    <p style="color:#bfdbfe;margin:6px 0 0;font-size:14px;">PixelPerfect Screenshot API</p>
+  </div>
+  <div style="background:#f8fafc;border:1px solid #e2e8f0;border-top:none;padding:28px 24px;border-radius:0 0 8px 8px;">
+    <p style="color:#374151;font-size:15px;margin:0 0 16px;">Hello,</p>
+    <p style="color:#374151;font-size:15px;margin:0 0 20px;">
+      We received a request to look up the username associated with this email address.
+      Here it is:
+    </p>
+    <div style="background:#1e40af;border-radius:8px;padding:16px 24px;text-align:center;margin:0 0 24px;">
+      <p style="color:#bfdbfe;font-size:13px;margin:0 0 4px;text-transform:uppercase;letter-spacing:0.05em;">Your username</p>
+      <p style="color:white;font-size:24px;font-weight:bold;margin:0;font-family:monospace;">{username}</p>
+    </div>
+    <p style="color:#6b7280;font-size:14px;margin:0 0 8px;">
+      You can use this username or your email address to sign in.
+    </p>
+    <p style="color:#9ca3af;font-size:13px;margin:0;">
+      If you didn't request this, your account is secure and nothing has changed
+      — you can safely ignore this email.
+    </p>
+  </div>
+</body></html>"""
+ 
+    msg = MIMEMultipart("alternative")
+    msg["Subject"]  = "Your PixelPerfect username"
+    msg["From"]     = f"PixelPerfect <{smtp_user}>"
+    msg["To"]       = email
+ 
+    msg.attach(MIMEText(text_body, "plain"))
+    msg.attach(MIMEText(html_body, "html"))
+ 
+    with smtplib.SMTP(smtp_host, smtp_port) as server:
+        server.ehlo()
+        server.starttls()
+        server.login(smtp_user, smtp_password)
+        server.sendmail(smtp_user, email, msg.as_string())
+ 
+    logger.info("✅ Username reminder sent to %s (username=%s)", email, username)
+ 
+ 
+# ── Endpoint ─────────────────────────────────────────────────────────────────
+ 
+@app.post("/auth/forgot-username")
+def forgot_username(payload: ForgotUsernameIn, db: Session = Depends(get_db)):
+    """
+    Send a username reminder email.
+ 
+    Security: always returns 200 regardless of whether an account exists,
+    to prevent account enumeration attacks.
+    Never reveals in the response whether the email matched any account.
+    """
+    email = (payload.email or "").strip().lower()
+    user  = db.query(User).filter(User.email == email).first()
+ 
+    if user:
+        try:
+            _send_username_reminder_email(email, user.username or "")
+        except Exception:
+            logger.exception("Failed to send username reminder to %s", email)
+            # Non-fatal: still return 200 so as not to reveal account existence.
+ 
+    # Always 200 — whether account exists or not.
+    return {"ok": True}
+ 
+# ============================================================================
+# END of forgot_username snippet — paste above into main.py
+# ============================================================================
 
 @app.post("/auth/reset-password")
 def reset_password(payload: ResetPasswordIn, db: Session = Depends(get_db)):
