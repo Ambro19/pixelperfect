@@ -1702,8 +1702,15 @@ def cancel_subscription(
         "cancel_at": cancel_at_iso,
     }
 
+# ── Helper: first day of next calendar month, 00:00 UTC (naive, matches DB) ──
+def _first_of_next_month_utc(now: datetime) -> datetime:
+    if now.month == 12:
+        return datetime(now.year + 1, 1, 1)
+    return datetime(now.year, now.month + 1, 1)
+ 
 # =====================================================================
 # Subscription Status — direct DB count for all tiers (v1 fix)
+# ✅ Jul 2026: next_reset always included (see patch header)
 # =====================================================================
 @app.get("/subscription_status")
 def subscription_status(
@@ -1715,19 +1722,19 @@ def subscription_status(
         _apply_local_overdue_downgrade_if_possible(current_user, db)
     except Exception as e:
         logger.warning("Local downgrade check failed: %s", e)
-
+ 
     if request.query_params.get("sync") == "1":
         try:
             sync_user_subscription_from_stripe(current_user, db)
         except Exception as e:
             logger.warning("Stripe sync failed: %s", e)
-
+ 
     tier        = (getattr(current_user, "subscription_tier", "free") or "free").lower()
     tier_limits = get_tier_limits(tier)
-
+ 
     now          = datetime.utcnow()
     period_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-
+ 
     screenshots_used = (
         db.query(Screenshot)
         .filter(
@@ -1736,7 +1743,7 @@ def subscription_status(
         )
         .count()
     )
-
+ 
     batch_used = 0
     try:
         from models import BatchJob
@@ -1750,9 +1757,9 @@ def subscription_status(
         )
     except Exception:
         batch_used = getattr(current_user, "usage_batch_requests", 0) or 0
-
+ 
     api_calls_used = screenshots_used + batch_used
-
+ 
     usage = {
         "screenshots":         screenshots_used,
         "batch_requests":      batch_used,
@@ -1761,31 +1768,47 @@ def subscription_status(
         "batch_jobs":          batch_used,
         "api_calls_this_month": api_calls_used,
     }
-
+ 
+    # ── ✅ FIX (Jul 2026): next_reset is ALWAYS present ────────────────────
+    # 1. Honor usage_reset_at only if it's a real, FUTURE datetime.
+    #    (Stale/past values are ignored rather than displayed as nonsense.)
+    # 2. Otherwise fall back to the first of next month — which is when the
+    #    period_start window above actually rolls over.
     next_reset = getattr(current_user, "usage_reset_at", None)
-
+    if isinstance(next_reset, datetime):
+        if next_reset <= now:
+            next_reset = None            # stale — ignore
+    elif next_reset is not None:
+        next_reset = None                # unexpected type — ignore
+ 
+    if next_reset is None:
+        next_reset = _first_of_next_month_utc(now)
+ 
     response = {
         "tier":   tier,
         "usage":  usage,
         "limits": tier_limits,
         "account": canonical_account(current_user),
         "tier_concurrency_limit": _tier_limit_for_user(current_user),
+        "next_reset": next_reset.isoformat(),        # ✅ always present now
     }
-
-    if next_reset:
-        response["next_reset"] = (
-            next_reset.isoformat()
-            if isinstance(next_reset, datetime)
-            else next_reset
-        )
-
+ 
+    # ── Bonus: Stripe renewal date, exposed under its own (honest) name ────
+    # This is the billing anniversary, NOT the usage reset. The frontend
+    # ignores it today; available if you ever want "Renews on [date]".
+    renews = getattr(current_user, "subscription_expires_at", None) \
+        or getattr(current_user, "subscription_ends_at", None)
+    if isinstance(renews, datetime):
+        response["subscription_renews_at"] = renews.isoformat()
+ 
     logger.info(
-        "subscription_status user=%s tier=%s screenshots=%d batch=%d api=%d",
+        "subscription_status user=%s tier=%s screenshots=%d batch=%d api=%d next_reset=%s",
         current_user.id, tier, screenshots_used, batch_used, api_calls_used,
+        response["next_reset"],
     )
-
+ 
     return response
-
+ 
 # =====================================================================
 # Optional SPA mount
 # =====================================================================
