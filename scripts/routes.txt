@@ -49,3 +49,48 @@
 # Example:
 # /help/article/how-to-get-an-api-key    priority=0.7
 # ===========================================================================
+# --- /help/article/* (added by add_dynamic_routes.py) ---
+/help/article/quick-start-guide  changefreq=monthly priority=0.7
+/help/article/how-to-create-account  changefreq=monthly priority=0.7
+/help/article/getting-your-api-key  changefreq=monthly priority=0.7
+/help/article/making-first-api-request  changefreq=monthly priority=0.7
+/help/article/api-authentication-methods  changefreq=monthly priority=0.7
+/help/article/screenshot-parameters-explained  changefreq=monthly priority=0.7
+/help/article/batch-processing-guide  changefreq=monthly priority=0.7
+/help/article/rate-limits-and-quotas  changefreq=monthly priority=0.7
+/help/article/node-js-integration  changefreq=monthly priority=0.7
+/help/article/python-integration  changefreq=monthly priority=0.7
+/help/article/social-media-preview-guide  changefreq=monthly priority=0.7
+/help/article/website-monitoring-guide  changefreq=monthly priority=0.7
+/help/article/how-to-upgrade-plan  changefreq=monthly priority=0.7
+/help/article/managing-payment-methods  changefreq=monthly priority=0.7
+/help/article/understanding-your-invoice  changefreq=monthly priority=0.7
+/help/article/cancellation-and-refunds  changefreq=monthly priority=0.7
+/help/article/understanding-pricing-plans  changefreq=monthly priority=0.7
+/help/article/common-error-codes  changefreq=monthly priority=0.7
+/help/article/screenshot-quality-issues  changefreq=monthly priority=0.7
+/help/article/api-timeout-errors  changefreq=monthly priority=0.7
+/help/article/webhook-delivery-failures  changefreq=monthly priority=0.7
+/help/article/data-retention-policy  changefreq=monthly priority=0.7
+/help/article/api-key-security-best-practices  changefreq=monthly priority=0.7
+/help/article/account-security  changefreq=monthly priority=0.7
+/help/article/gdpr-compliance  changefreq=monthly priority=0.7
+/help/article/soc2-certification  changefreq=monthly priority=0.7
+/help/article/updating-account-details  changefreq=monthly priority=0.7
+/help/article/managing-your-subscription  changefreq=monthly priority=0.7
+/help/article/team-member-management  changefreq=monthly priority=0.7
+/help/article/password-reset  changefreq=monthly priority=0.7
+/help/article/deleting-your-account  changefreq=monthly priority=0.7
+/help/article/two-factor-authentication  changefreq=monthly priority=0.7
+/help/article/javascript-execution  changefreq=monthly priority=0.7
+/help/article/device-emulation-guide  changefreq=monthly priority=0.7
+/help/article/element-selection-guide  changefreq=monthly priority=0.7
+/help/article/webhooks-guide  changefreq=monthly priority=0.7
+/help/article/white-label-guide  changefreq=monthly priority=0.7
+
+# --- /blog/* (added by add_dynamic_routes.py) ---
+/blog/website-monitoring-screenshots  changefreq=monthly priority=0.6
+/blog/automate-screenshots-nodejs  changefreq=monthly priority=0.6
+/blog/screenshot-reliability-javascript-heavy-sites  changefreq=monthly priority=0.6
+/blog/how-pixelperfect-authentication-works  changefreq=monthly priority=0.6
+/blog/what-are-sdks-pixelperfect-api  changefreq=monthly priority=0.6
