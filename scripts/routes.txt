@@ -1,0 +1,51 @@
+# routes.txt - verified against frontend/src/App.js (Aug 2026)
+# Only canonical URLs. Aliases are excluded on purpose:
+#   /documentation -> canonical /docs
+#   /help-center   -> canonical /help
+#   /api-status    -> canonical /status
+#   /signup        -> canonical /register
+
+# --- Core marketing ---
+/
+/pricing                priority=0.9
+/features               priority=0.8
+
+# --- Product / developer ---
+/docs                   changefreq=weekly priority=0.9
+/api                    priority=0.8
+/guides                 changefreq=weekly priority=0.8
+/status                 changefreq=daily  priority=0.4
+
+# --- Support ---
+/help                   changefreq=weekly priority=0.8
+/faq                    priority=0.7
+/contact                priority=0.5
+
+# --- Content ---
+/blog                   changefreq=weekly priority=0.7
+
+# --- Company ---
+/about                  priority=0.5
+/community              priority=0.4
+/careers                priority=0.4
+
+# --- Legal ---
+/privacy                changefreq=yearly priority=0.3
+/terms                  changefreq=yearly priority=0.3
+/cookies                changefreq=yearly priority=0.3
+
+# --- Auth entry points (indexable so people can find them) ---
+/login                  changefreq=yearly priority=0.4
+/register               changefreq=yearly priority=0.4
+
+# ===========================================================================
+# TODO - DYNAMIC ROUTES. These cannot be extracted from source; the router
+# only knows the pattern, not the values. Append one line per real item.
+#
+# Help articles      /help/article/<slug>      (you have ~31)
+# Guides             /guides/<guideId>
+# Blog posts         /blog/<slug>
+#
+# Example:
+# /help/article/how-to-get-an-api-key    priority=0.7
+# ===========================================================================
