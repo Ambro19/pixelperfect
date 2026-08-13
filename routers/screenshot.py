@@ -1,8 +1,71 @@
 # backend/routers/screenshot.py
 # PixelPerfect Screenshot API Router — Phase 1 + Phase 2 Advanced Features
 # Author: OneTechly
-# Updated: July 2026
+# Updated: August 2026
 #
+# ============================================================================
+# ✅ FIX (Aug 2026 — Round 4): FOUR BUGS. Read this before editing.
+# ============================================================================
+#
+# ── BUG 1 (CRITICAL): Premium tier returned HTTP 500 on every capture ───────
+#   get_tier_limits("premium")["screenshots"] returns the STRING "unlimited"
+#   (models.py _env_limit converts any value >= 999_999_999 to that sentinel).
+#   check_user_screenshot_limit then evaluated:
+#
+#       current < limit          # int < "unlimited"
+#
+#   In Python 3 that raises TypeError, and the call sits OUTSIDE the try
+#   block, so it surfaced as an unhandled 500. The same fault existed in the
+#   response payload: `limit - current_user.usage_screenshots`.
+#   Every Premium screenshot request failed. Fix: "unlimited" is now checked
+#   explicitly before any arithmetic or comparison, everywhere.
+#
+# ── BUG 2: Usage enforcement disagreed with the dashboard ───────────────────
+#   Enforcement read user.usage_screenshots (a lifetime counter), while
+#   /subscription_status counted rows in the current calendar month. Two
+#   different systems, two different answers.
+#
+#   The counter is reset by reset_monthly_usage(), which per its own docstring
+#   fires on Stripe invoice.paid events. Free-tier users never generate an
+#   invoice, so their counter NEVER reset — it accumulated from signup
+#   forever. A Free user who took 100 screenshots across three months got
+#   permanently locked out with "Screenshot limit reached (100/100)" while
+#   their dashboard showed 0/100, because the calendar month had rolled over.
+#   No error, no explanation, no way for them to self-diagnose.
+#
+#   Fix: enforcement now calls screenshots_used_this_period() from
+#   usage_accounting.py — the same function /subscription_status uses. One
+#   source of truth. Resets automatically at the period boundary with no
+#   reset job required. user.usage_screenshots is still incremented for
+#   backward compatibility but is no longer authoritative for any decision.
+#
+# ── BUG 3: DELETE here bypassed the usage tombstone ─────────────────────────
+#   There are TWO delete endpoints:
+#       DELETE /api/v1/screenshots/{id}   (main.py — patched Aug 2026)
+#       DELETE /api/v1/screenshot/{id}    (this file — was NOT patched)
+#   The second one hard-deleted the row with no tombstone, so deleting
+#   through it still refunded quota. Fix: record_screenshot_deletion() is
+#   called here too, before the delete, in the same transaction.
+#
+# ── BUG 4: max_width tier gate rejected every width above 1920 ──────────────
+#   The check read tier_limits.get("max_width", 1920), but get_tier_limits()
+#   in models.py returns only: screenshots, batch_requests, api_calls,
+#   features. There is no max_width key, so .get() ALWAYS returned the 1920
+#   default — for every tier including Premium.
+#
+#   ScreenshotRequest allows width up to 3840 and ScreenshotPage.js ships an
+#   "Ultrawide (3440x1440)" preset, so that preset returned
+#   "Width exceeds tier limit (1920px). Please upgrade." for everyone —
+#   and upgrading did not help, because no tier defines max_width.
+#
+#   Fix: TIER_MAX_WIDTH is defined here explicitly, with Free capped at 1920
+#   and paid tiers allowed the full 3840 the request model accepts. If you
+#   would rather gate this differently, change TIER_MAX_WIDTH — it is now a
+#   real, visible policy instead of an accidental default.
+#
+# ============================================================================
+# Previous fixes (all retained)
+# ============================================================================
 # ✅ FIX (Jul 2026 — PDF Tier Gate messaging):
 #   Enforcement was already correct — has_feature(current_user, "pdf") reads
 #   TIER_FEATURES in models.py, which now grants PDF to Pro+ (Pro, Business,
@@ -37,7 +100,7 @@ import json
 import uuid
 import logging
 from datetime import datetime, timezone, timedelta
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple, Union
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
@@ -45,12 +108,73 @@ from pydantic import BaseModel, HttpUrl, Field
 
 from auth_deps import get_current_user
 from models import User, get_db, Screenshot, get_tier_limits, has_feature
+
+# ✅ NEW (Aug 2026): single source of truth for usage. Enforcement and the
+# dashboard now read the same number, and deleting a screenshot no longer
+# refunds quota. See usage_accounting.py.
+from usage_accounting import (
+    screenshots_used_this_period,
+    batch_used_this_period,
+    record_screenshot_deletion,
+    current_period_start,
+    first_of_next_month,
+)
+
 from services.screenshot_service import screenshot_service
 from services.storage_service import storage_service
 
 logger = logging.getLogger("pixelperfect")
 
 router = APIRouter(prefix="/api/v1/screenshot", tags=["Screenshot"])
+
+
+# ============================================================================
+# TIER POLICY — explicit, not accidental
+# ============================================================================
+# ✅ NEW (Aug 2026 — BUG 4): max viewport width per tier.
+#
+# This used to be read as tier_limits.get("max_width", 1920), but
+# get_tier_limits() never returns a max_width key, so the 1920 default
+# applied to every tier and silently broke the Ultrawide preset for
+# everyone. Making the policy explicit here means it can be changed
+# deliberately and reviewed.
+#
+# 3840 is the ceiling ScreenshotRequest already validates against
+# (width: le=3840), so paid tiers get the full documented range.
+TIER_MAX_WIDTH: Dict[str, int] = {
+    "free":     1920,
+    "pro":      3840,
+    "business": 3840,
+    "premium":  3840,
+}
+DEFAULT_MAX_WIDTH = 1920
+
+
+def _max_width_for(user: User) -> int:
+    tier = (getattr(user, "subscription_tier", None) or "free").lower()
+    return TIER_MAX_WIDTH.get(tier, DEFAULT_MAX_WIDTH)
+
+
+def is_unlimited(limit: Any) -> bool:
+    """
+    True when a tier limit is the 'unlimited' sentinel.
+
+    models.py _env_limit() returns the STRING "unlimited" for Premium.
+    Every comparison and every subtraction involving a limit must go
+    through this check first — see BUG 1 in the header. Comparing an int
+    against "unlimited" raises TypeError, not a falsy result.
+    """
+    return limit == "unlimited" or limit is None or limit == float("inf")
+
+
+def remaining_for(limit: Any, used: int) -> Union[int, str]:
+    """Safe 'remaining' value that never subtracts from a string."""
+    if is_unlimited(limit):
+        return "unlimited"
+    try:
+        return max(0, int(limit) - int(used))
+    except (TypeError, ValueError):
+        return "unlimited"
 
 
 # ============================================================================
@@ -142,16 +266,72 @@ class DeviceListResponse(BaseModel):
 # HELPERS
 # ============================================================================
 
-def check_user_screenshot_limit(user: User) -> tuple[bool, int, int]:
-    """Return (allowed, current_count, limit)."""
+def check_user_screenshot_limit(
+    user: User,
+    db,
+) -> Tuple[bool, int, Any]:
+    """
+    Return (allowed, current_count, limit).
+
+    ✅ REWRITTEN (Aug 2026 — BUGS 1 and 2).
+
+    Was:
+        current = user.usage_screenshots or 0
+        return current < limit, current, limit
+
+    Two faults in those two lines:
+
+    1. `current < limit` raised TypeError for Premium, whose limit is the
+       string "unlimited". Unhandled → HTTP 500 on every Premium capture.
+
+    2. user.usage_screenshots is a LIFETIME counter reset only by
+       reset_monthly_usage(), which fires on Stripe invoice.paid. Free users
+       never generate an invoice, so their counter never reset and they were
+       permanently locked out once they hit 100 — while the dashboard, which
+       counts per calendar month, cheerfully showed 0/100.
+
+    Now: usage comes from screenshots_used_this_period(), the same function
+    /subscription_status uses. Enforcement and display can no longer diverge,
+    and the period rolls over on its own with no reset job.
+
+    NOTE the signature changed — this now needs `db`. Any other caller must
+    be updated.
+    """
     tier_limits = get_tier_limits(user.subscription_tier or "free")
-    current = user.usage_screenshots or 0
     limit = tier_limits["screenshots"]
-    return current < limit, current, limit
+
+    current = screenshots_used_this_period(db, user.id)
+
+    # ✅ Unlimited is checked BEFORE any comparison. Never compare int < str.
+    if is_unlimited(limit):
+        return True, current, "unlimited"
+
+    try:
+        return current < int(limit), current, int(limit)
+    except (TypeError, ValueError):
+        # A malformed .env value should not hard-fail a paying customer's
+        # capture. Log it and allow through — the dashboard will still show
+        # the real usage.
+        logger.error(
+            "Malformed screenshot limit %r for tier %s — allowing capture.",
+            limit, user.subscription_tier,
+        )
+        return True, current, limit
 
 
 def increment_user_usage(user: User, db, usage_type: str = "screenshots"):
-    """Increment usage counter and commit."""
+    """
+    Increment the legacy usage counters and commit.
+
+    ⚠️ NO LONGER AUTHORITATIVE (Aug 2026). These columns are kept updated for
+    backward compatibility with anything still reading them, but no limit
+    decision is made from them any more — see check_user_screenshot_limit().
+    The authoritative figure is screenshots_used_this_period(), derived from
+    the screenshots table plus deletion tombstones.
+
+    Do not reintroduce enforcement based on these columns. They do not reset
+    for Free-tier users.
+    """
     if usage_type == "screenshots":
         user.usage_screenshots = (user.usage_screenshots or 0) + 1
     elif usage_type == "batch_requests":
@@ -248,6 +428,7 @@ async def create_screenshot(
     | `custom_js`      | Pro |
     | `device`         | Pro |
     | PDF format       | Pro |
+    | width > 1920px   | Pro |
     | `target_element` | Business |
     | `webhook_url`    | Business |
 
@@ -262,11 +443,20 @@ async def create_screenshot(
     """
 
     # ── Usage limit ───────────────────────────────────────────────────────────
-    can_use, current, limit = check_user_screenshot_limit(current_user)
+    # ✅ FIX (Aug 2026): now passes db and uses period-scoped usage.
+    # Premium ("unlimited") no longer raises TypeError here.
+    can_use, current, limit = check_user_screenshot_limit(current_user, db)
     if not can_use:
+        # %-d is not portable (fails on Windows); %d is fine and dev runs on
+        # Windows while production runs Linux.
+        resets_on = first_of_next_month().strftime("%B %d, %Y")
         raise HTTPException(
             status_code=429,
-            detail=f"Screenshot limit reached ({current}/{limit}). Please upgrade your plan.",
+            detail=(
+                f"Screenshot limit reached ({current}/{limit}) for this billing "
+                f"period. Your usage resets on {resets_on}. "
+                "Upgrade your plan for a higher limit."
+            ),
         )
 
     # ── Tier gates (all via has_feature — single source of truth) ─────────────
@@ -305,11 +495,28 @@ async def create_screenshot(
             detail="Webhook notifications require Business tier. Please upgrade.",
         )
 
-    if request.width > tier_limits.get("max_width", 1920):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Width exceeds tier limit ({tier_limits.get('max_width', 1920)}px). Please upgrade.",
-        )
+    # ✅ FIX (Aug 2026 — BUG 4): width gate now reads a real per-tier policy.
+    # Previously this was tier_limits.get("max_width", 1920), but
+    # get_tier_limits() has no max_width key, so the 1920 default applied to
+    # EVERY tier — including Premium — and the Ultrawide (3440x1440) preset
+    # in ScreenshotPage.js failed for everyone with an "upgrade" message that
+    # would not have helped. A device preset overrides width entirely, so the
+    # gate is skipped in that case.
+    if not request.device:
+        max_width = _max_width_for(current_user)
+        if request.width > max_width:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Width {request.width}px exceeds the {max_width}px limit for "
+                    f"your plan. "
+                    + (
+                        "Upgrade to Pro or higher for widths up to 3840px."
+                        if max_width < 3840
+                        else "The maximum supported width is 3840px."
+                    )
+                ),
+            )
 
     # ── Capture ───────────────────────────────────────────────────────────────
     try:
@@ -378,12 +585,22 @@ async def create_screenshot(
         retention_days = tier_limits.get("screenshot_retention_days", 7)
         expires_at = datetime.utcnow() + timedelta(days=retention_days)
 
+        # ✅ FIX (Aug 2026): width/height are NOT NULL in models.py
+        # (Column(Integer, nullable=False, default=1920)). The previous code
+        # wrote None whenever a device preset was used, which SQLAlchemy sends
+        # as an explicit NULL — the column default does not apply to an
+        # explicitly-set None — producing an IntegrityError on Postgres for
+        # every device-emulation capture. We now persist the dimensions the
+        # service actually produced, falling back to the requested values.
+        actual_width  = int(result.get("width")  or request.width)
+        actual_height = int(result.get("height") or request.height)
+
         screenshot_record = Screenshot(
             id=screenshot_id,
             user_id=current_user.id,
             url=str(request.url),
-            width=request.width if not request.device else None,
-            height=request.height if not request.device else None,
+            width=actual_width,
+            height=actual_height,
             full_page=request.full_page,
             format=request.format,
             quality=request.quality,
@@ -426,12 +643,16 @@ async def create_screenshot(
                 secret=request.webhook_secret,
             )
 
+        # ✅ FIX (Aug 2026 — BUG 1): usage block is computed with the
+        # unlimited-safe helpers. `limit - used` on a Premium account used to
+        # raise TypeError here even when the capture itself had succeeded.
+        used_now = current + 1
         return ScreenshotResponse(
             url=str(request.url),
             screenshot_url=screenshot_url if request.return_url else None,
             screenshot_id=screenshot_id,
-            width=request.width,
-            height=request.height,
+            width=actual_width,
+            height=actual_height,
             format=request.format,
             size_bytes=len(screenshot_bytes),
             created_at=screenshot_record.created_at.isoformat(),
@@ -439,12 +660,19 @@ async def create_screenshot(
             js_warning=js_warning,
             element_selector=element_selector,   # ← Phase 2: the key that was missing
             usage={
-                "current":   current_user.usage_screenshots,
+                "current":   used_now,
                 "limit":     limit,
-                "remaining": limit - current_user.usage_screenshots,
+                "remaining": remaining_for(limit, used_now),
+                "period_start": current_period_start().isoformat(),
+                "resets_at":    first_of_next_month().isoformat(),
             },
         )
 
+    except HTTPException:
+        # Tier gates and validation errors must pass through untouched —
+        # without this they would be swallowed by the generic handler below
+        # and returned as a 500.
+        raise
     except httpx.HTTPError as exc:
         logger.error("HTTP error loading URL %s: %s", request.url, exc)
         raise HTTPException(status_code=400, detail=f"Failed to load URL: {exc}")
@@ -485,41 +713,54 @@ async def get_usage_stats(
     current_user: User = Depends(get_current_user),
     db=Depends(get_db),
 ):
-    """Detailed usage statistics including feature access flags."""
+    """
+    Detailed usage statistics including feature access flags.
+
+    ✅ FIX (Aug 2026): reports the same period-scoped numbers as
+    /subscription_status and as the enforcement path. Previously this read
+    the lifetime user.usage_* counters, so this endpoint, the dashboard, and
+    the limit check could all disagree with each other simultaneously.
+    """
     tier_limits = get_tier_limits(current_user.subscription_tier or "free")
-    screenshots_used  = current_user.usage_screenshots or 0
+
+    screenshots_used  = screenshots_used_this_period(db, current_user.id)
     screenshots_limit = tier_limits["screenshots"]
-    pct = (
-        round((screenshots_used / screenshots_limit) * 100, 1)
-        if screenshots_limit and screenshots_limit != "unlimited"
-        else 0
-    )
+    batch_used        = batch_used_this_period(db, current_user)
+    batch_limit       = tier_limits["batch_requests"]
+
+    # ✅ Unlimited-safe percentage — no division by a string.
+    if is_unlimited(screenshots_limit):
+        pct = 0
+    else:
+        try:
+            pct = round((screenshots_used / int(screenshots_limit)) * 100, 1) if int(screenshots_limit) else 0
+        except (TypeError, ValueError, ZeroDivisionError):
+            pct = 0
 
     return {
         "tier": current_user.subscription_tier or "free",
         "usage": {
             "screenshots": {
-                "used":      screenshots_used,
-                "limit":     screenshots_limit,
-                "remaining": max(0, screenshots_limit - screenshots_used)
-                if screenshots_limit != "unlimited" else "unlimited",
+                "used":       screenshots_used,
+                "limit":      screenshots_limit,
+                "remaining":  remaining_for(screenshots_limit, screenshots_used),
                 "percentage": pct,
             },
             "batch_requests": {
-                "used":  current_user.usage_batch_requests or 0,
-                "limit": tier_limits["batch_requests"],
-                "remaining": max(
-                    0,
-                    (tier_limits["batch_requests"] or 0) - (current_user.usage_batch_requests or 0),
-                ) if tier_limits["batch_requests"] != "unlimited" else "unlimited",
+                "used":      batch_used,
+                "limit":     batch_limit,
+                "remaining": remaining_for(batch_limit, batch_used),
             },
-            "api_calls": {"used": current_user.usage_api_calls or 0},
+            "api_calls": {"used": screenshots_used + batch_used},
         },
         "limits": tier_limits,
-        "reset_date": (
-            current_user.usage_reset_at.isoformat()
-            if current_user.usage_reset_at else None
-        ),
+        "max_width": _max_width_for(current_user),
+        "period_start": current_period_start().isoformat(),
+        # ✅ FIX (Aug 2026): reset_date now always present and always correct.
+        # It used to echo user.usage_reset_at, which is null for every Free
+        # user (that field is only written by the Stripe invoice.paid path),
+        # so this endpoint returned null for the majority of accounts.
+        "reset_date": first_of_next_month().isoformat(),
         "features": {
             "custom_js":         has_feature(current_user, "custom_js"),
             "device_emulation":  has_feature(current_user, "device_emulation"),
@@ -556,7 +797,7 @@ async def get_screenshot(
         "size_bytes":        screenshot.size_bytes,
         "status":            screenshot.status,
         "processing_time_ms": screenshot.processing_time_ms,
-        "created_at":        screenshot.created_at.isoformat(),
+        "created_at":        screenshot.created_at.isoformat() if screenshot.created_at else None,
         "expires_at":        screenshot.expires_at.isoformat() if screenshot.expires_at else None,
     }
 
@@ -584,7 +825,7 @@ async def list_screenshots(
                 "format":         s.format,
                 "size_bytes":     s.size_bytes,
                 "status":         s.status,
-                "created_at":     s.created_at.isoformat(),
+                "created_at":     s.created_at.isoformat() if s.created_at else None,
             }
             for s in screenshots
         ],
@@ -600,7 +841,20 @@ async def delete_screenshot(
     current_user: User = Depends(get_current_user),
     db=Depends(get_db),
 ):
-    """Delete a screenshot and its storage file."""
+    """
+    Delete a screenshot and its storage file.
+
+    ⚠️ NOTE: this is the SECOND delete endpoint in the codebase.
+        DELETE /api/v1/screenshots/{id}   → main.py    (used by History.js)
+        DELETE /api/v1/screenshot/{id}    → this file  (API clients)
+
+    ✅ FIX (Aug 2026 — BUG 3): main.py was patched to write a usage tombstone
+    before deleting; this path was not, so deleting through the API still
+    refunded the caller's quota. Both paths now record the tombstone.
+
+    Deleting a screenshot removes the artifact. It does NOT refund usage —
+    the capture cost was already spent when Chromium rendered the page.
+    """
     screenshot = (
         db.query(Screenshot)
         .filter(Screenshot.id == screenshot_id, Screenshot.user_id == current_user.id)
@@ -615,17 +869,34 @@ async def delete_screenshot(
     except Exception as exc:
         logger.warning("Failed to delete from storage %s: %s", screenshot_id, exc)
 
+    # ✅ Must run BEFORE db.delete() — it reads created_at off the row.
+    # Shares the caller's transaction, so the tombstone and the delete
+    # commit together or not at all.
+    record_screenshot_deletion(db, screenshot)
+
     db.delete(screenshot)
     db.commit()
-    logger.info("🗑️ Screenshot deleted: %s", screenshot_id)
-    return {"status": "deleted", "screenshot_id": screenshot_id}
+    logger.info("🗑️ Screenshot deleted: %s (usage tombstone recorded)", screenshot_id)
+    return {
+        "status": "deleted",
+        "screenshot_id": screenshot_id,
+        "usage_refunded": False,
+    }
 
-# ===== END OF routers/screenshot.py ==========================================
+
+# ===== END OF routers/screenshot.py ===============
 
 # # backend/routers/screenshot.py
 # # PixelPerfect Screenshot API Router — Phase 1 + Phase 2 Advanced Features
 # # Author: OneTechly
-# # Updated: May 2026
+# # Updated: July 2026
+# #
+# # ✅ FIX (Jul 2026 — PDF Tier Gate messaging):
+# #   Enforcement was already correct — has_feature(current_user, "pdf") reads
+# #   TIER_FEATURES in models.py, which now grants PDF to Pro+ (Pro, Business,
+# #   Premium). But the 403 error message and the docstring tier table still
+# #   said "Business tier", which would mislead Free users into buying the
+# #   wrong plan. Message and docs updated to "Pro tier or higher".
 # #
 # # ✅ Phase 1 changes vs January 2026 scaffolding:
 # #   - Added has_feature from models (replaces inline check_feature_access dict)
@@ -864,9 +1135,9 @@ async def delete_screenshot(
 #     |---|---|
 #     | `custom_js`      | Pro |
 #     | `device`         | Pro |
+#     | PDF format       | Pro |
 #     | `target_element` | Business |
 #     | `webhook_url`    | Business |
-#     | PDF format       | Business |
 
 #     **JavaScript errors** are non-fatal (option-c). If `custom_js` throws,
 #     the screenshot still captures and `js_warning` contains the error.
@@ -889,10 +1160,13 @@ async def delete_screenshot(
 #     # ── Tier gates (all via has_feature — single source of truth) ─────────────
 #     tier_limits = get_tier_limits(current_user.subscription_tier or "free")
 
+#     # ✅ FIX (Jul 2026): PDF is Pro+, not Business-only. Enforcement was already
+#     # correct via has_feature (models.py TIER_FEATURES["pro"]["pdf"] = True);
+#     # only the error message needed updating.
 #     if request.format == "pdf" and not has_feature(current_user, "pdf"):
 #         raise HTTPException(
 #             status_code=403,
-#             detail="PDF generation requires Business tier. Please upgrade.",
+#             detail="PDF generation requires Pro tier or higher. Please upgrade.",
 #         )
 
 #     if request.custom_js and not has_feature(current_user, "custom_js"):
@@ -1234,5 +1508,5 @@ async def delete_screenshot(
 #     logger.info("🗑️ Screenshot deleted: %s", screenshot_id)
 #     return {"status": "deleted", "screenshot_id": screenshot_id}
 
-# # ===== END OF routers/screenshot.py ==========================================
 
+# # ===== END OF routers/screenshot.py ===============

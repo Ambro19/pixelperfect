@@ -95,6 +95,7 @@ from subscription_sync import sync_user_subscription_from_stripe, _apply_local_o
 from models import (
     User,
     Screenshot,
+    ScreenshotDeletion,          # ✅ NEW (Aug 2026): usage tombstone
     Subscription,
     ApiKey,
     get_db,
@@ -102,6 +103,15 @@ from models import (
     engine,
     get_tier_limits,
     reset_monthly_usage,
+)
+
+# ✅ NEW (Aug 2026 — quota bypass fix): single source of truth for usage.
+# Deleting a screenshot must NOT refund quota. See usage_accounting.py.
+from usage_accounting import (
+    usage_summary,
+    record_screenshot_deletion,
+    purge_user_deletion_records,
+    first_of_next_month,
 )
 from db_migrations import run_startup_migrations
 from auth_deps import get_current_user
@@ -1212,15 +1222,27 @@ async def delete_account_endpoint(
         logger.exception("❌ Screenshot deletion failed for user %s", user_id)
 
     # 3. Delete batch jobs
-    try:
-        from models import BatchJob
-        db.query(BatchJob).filter(BatchJob.user_id == user_id).delete(
-            synchronize_session=False
-        )
-        logger.info("✅ Deleted batch jobs for user %s", user_id)
-    except Exception as e:
-        logger.warning("BatchJob deletion failed for user %s (may not exist): %s", user_id, e)
+    # try:
+    #     from models import BatchJob
+    #     db.query(BatchJob).filter(BatchJob.user_id == user_id).delete(
+    #         synchronize_session=False
+    #     )
+    #     logger.info("✅ Deleted batch jobs for user %s", user_id)
+    # except Exception as e:
+    #     logger.warning("BatchJob deletion failed for user %s (may not exist): %s", user_id, e)
 
+    # 3. Delete batch jobs
+    # ✅ NEW (Aug 2026): purge usage tombstones.
+    # Safe here and nowhere else — the account is going away, so there is no
+    # quota left to protect, and orphaned rows would violate the erasure
+    # promise in the privacy policy.
+    try:
+        n = purge_user_deletion_records(db, user_id)
+        logger.info("✅ Purged %d usage tombstone(s) for user %s", n, user_id)
+    except Exception:
+        logger.exception("❌ Tombstone purge failed for user %s", user_id)
+    
+    
     # 4. Delete API keys
     try:
         db.query(ApiKey).filter(ApiKey.user_id == user_id).delete(
@@ -1345,10 +1367,29 @@ async def delete_screenshot(
         except Exception as e:
             logger.warning("⚠️ Could not delete file %s: %s", filepath, e)
 
+    # ✅ FIX (Aug 2026 — quota bypass): record the usage tombstone BEFORE the
+    # row disappears. Without this, /subscription_status (which counts live
+    # rows) refunds the user's quota on every delete — capture 100, delete
+    # 100, capture 100 more, forever. The capture cost was already spent;
+    # deleting the artifact does not un-spend it.
+    #
+    # Both statements share one transaction, so the tombstone and the delete
+    # can never diverge. record_screenshot_deletion() does not commit.
+    record_screenshot_deletion(db, record)
+
     db.delete(record)
     db.commit()
-    logger.info("✅ Deleted screenshot id=%s for user %s", screenshot_id, current_user.id)
-    return {"ok": True, "deleted_id": screenshot_id, "message": "Screenshot deleted successfully."}
+    logger.info(
+        "✅ Deleted screenshot id=%s for user %s (usage tombstone recorded)",
+        screenshot_id, current_user.id,
+    )
+    return {
+        "ok": True,
+        "deleted_id": screenshot_id,
+        "message": "Screenshot deleted successfully.",
+        # Surfaced so the UI can be honest if you ever want to show it.
+        "usage_refunded": False,
+    }        
 
 # =====================================================================
 # ✅ Phase 1 (v9): Screenshot capture — advanced router handler
@@ -1703,10 +1744,10 @@ def cancel_subscription(
     }
 
 # ── Helper: first day of next calendar month, 00:00 UTC (naive, matches DB) ──
-def _first_of_next_month_utc(now: datetime) -> datetime:
-    if now.month == 12:
-        return datetime(now.year + 1, 1, 1)
-    return datetime(now.year, now.month + 1, 1)
+# def _first_of_next_month_utc(now: datetime) -> datetime:
+#     if now.month == 12:
+#         return datetime(now.year + 1, 1, 1)
+#     return datetime(now.year, now.month + 1, 1)
  
 # =====================================================================
 # Subscription Status — direct DB count for all tiers (v1 fix)
@@ -1732,42 +1773,57 @@ def subscription_status(
     tier        = (getattr(current_user, "subscription_tier", "free") or "free").lower()
     tier_limits = get_tier_limits(tier)
  
-    now          = datetime.utcnow()
-    period_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    # now          = datetime.utcnow()
+    # period_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
  
-    screenshots_used = (
-        db.query(Screenshot)
-        .filter(
-            Screenshot.user_id  == current_user.id,
-            Screenshot.created_at >= period_start,
-        )
-        .count()
-    )
+    # screenshots_used = (
+    #     db.query(Screenshot)
+    #     .filter(
+    #         Screenshot.user_id  == current_user.id,
+    #         Screenshot.created_at >= period_start,
+    #     )
+    #     .count()
+    # )
  
-    batch_used = 0
-    try:
-        from models import BatchJob
-        batch_used = (
-            db.query(BatchJob)
-            .filter(
-                BatchJob.user_id   == current_user.id,
-                BatchJob.created_at >= period_start,
-            )
-            .count()
-        )
-    except Exception:
-        batch_used = getattr(current_user, "usage_batch_requests", 0) or 0
+    # batch_used = 0
+    # try:
+    #     from models import BatchJob
+    #     batch_used = (
+    #         db.query(BatchJob)
+    #         .filter(
+    #             BatchJob.user_id   == current_user.id,
+    #             BatchJob.created_at >= period_start,
+    #         )
+    #         .count()
+    #     )
+    # except Exception:
+    #     batch_used = getattr(current_user, "usage_batch_requests", 0) or 0
  
-    api_calls_used = screenshots_used + batch_used
+    # api_calls_used = screenshots_used + batch_used
  
-    usage = {
-        "screenshots":         screenshots_used,
-        "batch_requests":      batch_used,
-        "api_calls":           api_calls_used,
-        "screenshots_used":    screenshots_used,
-        "batch_jobs":          batch_used,
-        "api_calls_this_month": api_calls_used,
-    }
+    # usage = {
+    #     "screenshots":         screenshots_used,
+    #     "batch_requests":      batch_used,
+    #     "api_calls":           api_calls_used,
+    #     "screenshots_used":    screenshots_used,
+    #     "batch_jobs":          batch_used,
+    #     "api_calls_this_month": api_calls_used,
+    # }
+
+    now = datetime.utcnow()
+
+    # ✅ FIX (Aug 2026 — quota bypass): usage now comes from
+    # usage_accounting.usage_summary(), which counts
+    #     live screenshots in period + tombstoned screenshots captured in period
+    # so deleting from the History page no longer refunds quota.
+    #
+    # Previously this was a bare COUNT(*) on the screenshots table, which meant
+    # 8 used -> delete -> 7 used. Both this counter AND api_calls moved, since
+    # api_calls is derived from it.
+    usage          = usage_summary(db, current_user)
+    screenshots_used = usage["screenshots"]
+    batch_used       = usage["batch_requests"]
+    api_calls_used   = usage["api_calls"]
  
     # ── ✅ FIX (Jul 2026): next_reset is ALWAYS present ────────────────────
     # 1. Honor usage_reset_at only if it's a real, FUTURE datetime.
@@ -1781,8 +1837,10 @@ def subscription_status(
     elif next_reset is not None:
         next_reset = None                # unexpected type — ignore
  
+    # if next_reset is None:
+    #     next_reset = _first_of_next_month_utc(now)
     if next_reset is None:
-        next_reset = _first_of_next_month_utc(now)
+        next_reset = first_of_next_month(now)   # was _first_of_next_month_utc(now)
  
     response = {
         "tier":   tier,

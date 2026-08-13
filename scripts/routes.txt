@@ -1,9 +1,9 @@
-# routes.txt - verified against frontend/src/App.js (Aug 2026)
-# Only canonical URLs. Aliases are excluded on purpose:
-#   /documentation -> canonical /docs
-#   /help-center   -> canonical /help
-#   /api-status    -> canonical /status
-#   /signup        -> canonical /register
+# routes.txt — verified against frontend/src/App.js, helpArticles.js, blogData.js
+# Rebuilt Aug 2026. Expected output: 55 URLs.
+#
+# Route aliases excluded (canonical tag handles them, see SEO.jsx):
+#   /documentation -> /docs      /help-center -> /help
+#   /api-status    -> /status    /signup      -> /register
 
 # --- Core marketing ---
 /
@@ -34,63 +34,92 @@
 /terms                  changefreq=yearly priority=0.3
 /cookies                changefreq=yearly priority=0.3
 
-# --- Auth entry points (indexable so people can find them) ---
+# --- Auth entry points ---
 /login                  changefreq=yearly priority=0.4
 /register               changefreq=yearly priority=0.4
 
 # ===========================================================================
-# TODO - DYNAMIC ROUTES. These cannot be extracted from source; the router
-# only knows the pattern, not the values. Append one line per real item.
-#
-# Help articles      /help/article/<slug>      (you have ~31)
-# Guides             /guides/<guideId>
-# Blog posts         /blog/<slug>
-#
-# Example:
-# /help/article/how-to-get-an-api-key    priority=0.7
+# HELP ARTICLES — /help/article/<slug>
+# 37 exist in helpArticles.js; 31 are listed. The 6 omissions are recorded at
+# the bottom of this section with the reason, so nobody re-adds them later.
 # ===========================================================================
-# --- /help/article/* (added by add_dynamic_routes.py) ---
-/help/article/quick-start-guide  changefreq=monthly priority=0.7
-/help/article/how-to-create-account  changefreq=monthly priority=0.7
-/help/article/getting-your-api-key  changefreq=monthly priority=0.7
-/help/article/making-first-api-request  changefreq=monthly priority=0.7
-/help/article/api-authentication-methods  changefreq=monthly priority=0.7
-/help/article/screenshot-parameters-explained  changefreq=monthly priority=0.7
-/help/article/batch-processing-guide  changefreq=monthly priority=0.7
-/help/article/rate-limits-and-quotas  changefreq=monthly priority=0.7
-/help/article/node-js-integration  changefreq=monthly priority=0.7
-/help/article/python-integration  changefreq=monthly priority=0.7
-/help/article/social-media-preview-guide  changefreq=monthly priority=0.7
-/help/article/website-monitoring-guide  changefreq=monthly priority=0.7
-/help/article/how-to-upgrade-plan  changefreq=monthly priority=0.7
-/help/article/managing-payment-methods  changefreq=monthly priority=0.7
-/help/article/understanding-your-invoice  changefreq=monthly priority=0.7
-/help/article/cancellation-and-refunds  changefreq=monthly priority=0.7
-/help/article/understanding-pricing-plans  changefreq=monthly priority=0.7
-/help/article/common-error-codes  changefreq=monthly priority=0.7
-/help/article/screenshot-quality-issues  changefreq=monthly priority=0.7
-/help/article/api-timeout-errors  changefreq=monthly priority=0.7
-/help/article/webhook-delivery-failures  changefreq=monthly priority=0.7
-/help/article/data-retention-policy  changefreq=monthly priority=0.7
-/help/article/api-key-security-best-practices  changefreq=monthly priority=0.7
-/help/article/account-security  changefreq=monthly priority=0.7
-/help/article/gdpr-compliance  changefreq=monthly priority=0.7
-/help/article/soc2-certification  changefreq=monthly priority=0.7
-/help/article/updating-account-details  changefreq=monthly priority=0.7
-/help/article/managing-your-subscription  changefreq=monthly priority=0.7
-/help/article/team-member-management  changefreq=monthly priority=0.7
-/help/article/password-reset  changefreq=monthly priority=0.7
-/help/article/deleting-your-account  changefreq=monthly priority=0.7
-/help/article/two-factor-authentication  changefreq=monthly priority=0.7
-/help/article/javascript-execution  changefreq=monthly priority=0.7
-/help/article/device-emulation-guide  changefreq=monthly priority=0.7
-/help/article/element-selection-guide  changefreq=monthly priority=0.7
-/help/article/webhooks-guide  changefreq=monthly priority=0.7
-/help/article/white-label-guide  changefreq=monthly priority=0.7
 
-# --- /blog/* (added by add_dynamic_routes.py) ---
-/blog/website-monitoring-screenshots  changefreq=monthly priority=0.6
-/blog/automate-screenshots-nodejs  changefreq=monthly priority=0.6
-/blog/screenshot-reliability-javascript-heavy-sites  changefreq=monthly priority=0.6
-/blog/how-pixelperfect-authentication-works  changefreq=monthly priority=0.6
-/blog/what-are-sdks-pixelperfect-api  changefreq=monthly priority=0.6
+# 1. Getting Started
+/help/article/quick-start-guide                    priority=0.8
+/help/article/how-to-create-account                priority=0.6
+/help/article/getting-your-api-key                 priority=0.8
+/help/article/making-first-api-request             priority=0.8
+
+# 2. API Usage
+/help/article/api-authentication-methods           priority=0.7
+/help/article/screenshot-parameters-explained      priority=0.8
+/help/article/batch-processing-guide               priority=0.7
+/help/article/rate-limits-and-quotas               priority=0.7
+/help/article/node-js-integration                  priority=0.8
+/help/article/python-integration                   priority=0.8
+/help/article/social-media-preview-guide           priority=0.7
+/help/article/website-monitoring-guide             priority=0.7
+
+# 3. Billing & Subscription
+/help/article/managing-payment-methods             priority=0.5
+/help/article/understanding-your-invoice           priority=0.5
+/help/article/understanding-pricing-plans          priority=0.6
+
+# 4. Troubleshooting
+/help/article/common-error-codes                   priority=0.7
+/help/article/screenshot-quality-issues            priority=0.7
+/help/article/api-timeout-errors                   priority=0.7
+/help/article/webhook-delivery-failures            priority=0.6
+
+# 5. Security & Privacy
+/help/article/data-retention-policy                priority=0.6
+/help/article/api-key-security-best-practices      priority=0.7
+/help/article/account-security                     priority=0.6
+/help/article/gdpr-compliance                      priority=0.6
+
+# 6. Account Management
+/help/article/updating-account-details             priority=0.5
+/help/article/managing-your-subscription           priority=0.6
+/help/article/password-reset                       priority=0.5
+/help/article/deleting-your-account                priority=0.5
+
+# 7. Advanced Features
+/help/article/javascript-execution                 priority=0.8
+/help/article/device-emulation-guide               priority=0.7
+/help/article/element-selection-guide              priority=0.7
+/help/article/webhooks-guide                       priority=0.7
+
+# --- OMITTED ON PURPOSE — do not uncomment without checking first ---
+#
+# component: null in helpArticles.js — renders only "Guide Coming Soon".
+# Thin content; ArticleDetail.js also marks these noindex.
+#/help/article/team-member-management
+#/help/article/white-label-guide
+#
+# Share a guide component with another article, so they render identical
+# content. articleSeo.js canonicalises each to its primary:
+#/help/article/how-to-upgrade-plan        -> managing-your-subscription
+#/help/article/cancellation-and-refunds   -> managing-your-subscription
+#/help/article/two-factor-authentication  -> account-security
+#/help/article/soc2-certification         -> gdpr-compliance
+
+# ===========================================================================
+# BLOG POSTS — /blog/<slug>  (from blogData.js)
+# ===========================================================================
+/blog/website-monitoring-screenshots                    priority=0.6
+/blog/automate-screenshots-nodejs                       priority=0.6
+/blog/screenshot-reliability-javascript-heavy-sites     priority=0.6
+/blog/how-pixelperfect-authentication-works             priority=0.6
+/blog/what-are-sdks-pixelperfect-api                    priority=0.6
+
+# ===========================================================================
+# NOT YET INCLUDED
+#
+# /help/category/<id>  — 7 real categories. Add once you confirm the route
+#   renders: getting-started, api-usage, billing, troubleshooting, security,
+#   account, advanced-features
+#
+# /guides/<guideId>    — unresolved. No guides data file exists; component
+#   names map to frontend/src/guides/, so this route may render the same
+#   content as the help articles. Leave out until confirmed.
+# ===========================================================================

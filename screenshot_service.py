@@ -820,18 +820,82 @@ def get_screenshot_url(filename: str, base_url: str = "") -> str:
 
     return f"{base_url.rstrip('/')}/screenshots/{filename}"
 
-
 # IMPORTANT: NO db.commit() here. Caller controls the transaction.
 def increment_user_usage(user) -> None:
+    """
+    Bump the legacy lifetime usage counters.
+
+    ⚠️ NO LONGER AUTHORITATIVE (Aug 2026). These columns are still written so
+    nothing that reads them breaks, but no limit decision is made from them.
+    The authoritative figure is usage_accounting.screenshots_used_this_period().
+
+    Why they were abandoned: these counters are only reset by
+    models.reset_monthly_usage(), which fires on Stripe invoice.paid events.
+    Free-tier users never generate an invoice, so their counter accumulated
+    from signup forever — a Free user who took 100 screenshots across three
+    months was permanently locked out, while the dashboard (which counts per
+    calendar month) showed 0/100. Do not reintroduce enforcement here.
+    """
     user.usage_screenshots = (user.usage_screenshots or 0) + 1
     user.usage_api_calls = (user.usage_api_calls or 0) + 1
 
 
-def check_usage_limit(user, tier_limits) -> bool:
+def check_usage_limit(user, tier_limits, db=None) -> bool:
+    """
+    True when the user may capture another screenshot this period.
+
+    ✅ REWRITTEN (Aug 2026): counts the current billing period from the
+    screenshots table plus deletion tombstones, matching /subscription_status
+    and routers/screenshot.py. Previously read user.usage_screenshots, which
+    never resets for Free users (see increment_user_usage above).
+
+    `db` is optional ONLY so that an un-updated caller degrades to the old
+    behaviour with a loud log line rather than raising TypeError in
+    production. Every call site should pass it. If you see the warning below
+    in the logs, find that caller and fix it.
+    """
     limit = tier_limits.get("screenshots")
-    if limit == "unlimited":
+
+    # "unlimited" is the Premium sentinel from models._env_limit(). It is a
+    # STRING — comparing it against an int raises TypeError, so it must be
+    # short-circuited before any comparison.
+    if limit == "unlimited" or limit is None:
         return True
-    current_usage = user.usage_screenshots or 0
-    return current_usage < limit
+
+    if db is None:
+        logger.warning(
+            "⚠️ check_usage_limit called without db — falling back to the "
+            "legacy lifetime counter, which never resets for Free users. "
+            "Update this caller to pass db."
+        )
+        current_usage = user.usage_screenshots or 0
+    else:
+        # Imported lazily: keeps module import order simple and avoids a
+        # hard dependency for anything that imports this file only for
+        # capture_screenshot().
+        from usage_accounting import screenshots_used_this_period
+        current_usage = screenshots_used_this_period(db, user.id)
+
+    try:
+        return current_usage < int(limit)
+    except (TypeError, ValueError):
+        logger.error(
+            "Malformed screenshot limit %r — allowing capture rather than "
+            "blocking a paying customer on a config error.", limit,
+        )
+        return True
+
+# # IMPORTANT: NO db.commit() here. Caller controls the transaction.
+# def increment_user_usage(user) -> None:
+#     user.usage_screenshots = (user.usage_screenshots or 0) + 1
+#     user.usage_api_calls = (user.usage_api_calls or 0) + 1
+
+
+# def check_usage_limit(user, tier_limits) -> bool:
+#     limit = tier_limits.get("screenshots")
+#     if limit == "unlimited":
+#         return True
+#     current_usage = user.usage_screenshots or 0
+#     return current_usage < limit
 
 # ===== END OF screenshot_service.py =====
