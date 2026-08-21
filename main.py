@@ -135,6 +135,7 @@ from screenshot_service import (
 from routers.screenshot import (
     router as screenshot_router,
     ScreenshotRequest,
+    ScreenshotResponse, 
     create_screenshot as _advanced_create_screenshot,
 )
 
@@ -1402,7 +1403,8 @@ async def delete_screenshot(
 #   device, custom_js, wait_for_selector (Pro+)
 #   target_element, webhook_url, webhook_secret (Business+, Phase 2/3)
 # =====================================================================
-@app.post("/api/v1/screenshot")
+# @app.post("/api/v1/screenshot")
+@app.post("/api/v1/screenshot", response_model=ScreenshotResponse)
 async def capture_screenshot(
     request:          ScreenshotRequest,
     background_tasks: BackgroundTasks,
