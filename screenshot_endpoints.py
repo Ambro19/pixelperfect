@@ -208,7 +208,8 @@ async def capture_screenshot_endpoint(
     # ✅ FIX (Aug 2026): pass db so the limit is period-scoped and agrees
     # with the dashboard and routers/screenshot.py. Without db this silently
     # falls back to the lifetime counter that never resets for Free users.
-    if not check_usage_limit(current_user, tier_limits, db):
+   # if not check_usage_limit(current_user, tier_limits, db):
+    if not check_usage_limit(current_user, tier_limits, db=db):    
         limit = tier_limits.get("screenshots")
         raise HTTPException(
             status_code=429,

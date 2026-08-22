@@ -1403,8 +1403,14 @@ async def delete_screenshot(
 #   device, custom_js, wait_for_selector (Pro+)
 #   target_element, webhook_url, webhook_secret (Business+, Phase 2/3)
 # =====================================================================
-# @app.post("/api/v1/screenshot")
-@app.post("/api/v1/screenshot", response_model=ScreenshotResponse)
+
+# ✅ FIX (Aug 2026 — 405): the frontend posted to /api/v1/screenshot/ (with
+# trailing slash) while this wrapper was registered without one. The router's
+# own GET "/" claimed that path, so Starlette returned 405 with `allow: GET`
+# rather than falling through. Registering both spellings removes the
+# dependency on which variant a caller happens to use.
+@app.post("/api/v1/screenshot")
+@app.post("/api/v1/screenshot/")
 async def capture_screenshot(
     request:          ScreenshotRequest,
     background_tasks: BackgroundTasks,
@@ -1420,6 +1426,7 @@ async def capture_screenshot(
     )
 
 @app.post("/api/v1/batch/submit")
+@app.post("/api/v1/batch/submit/")
 async def batch_screenshot(
     request:      BatchScreenshotRequest,
     _guard:       None    = Depends(enforce_tier_concurrency),
@@ -1775,43 +1782,6 @@ def subscription_status(
     tier        = (getattr(current_user, "subscription_tier", "free") or "free").lower()
     tier_limits = get_tier_limits(tier)
  
-    # now          = datetime.utcnow()
-    # period_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
- 
-    # screenshots_used = (
-    #     db.query(Screenshot)
-    #     .filter(
-    #         Screenshot.user_id  == current_user.id,
-    #         Screenshot.created_at >= period_start,
-    #     )
-    #     .count()
-    # )
- 
-    # batch_used = 0
-    # try:
-    #     from models import BatchJob
-    #     batch_used = (
-    #         db.query(BatchJob)
-    #         .filter(
-    #             BatchJob.user_id   == current_user.id,
-    #             BatchJob.created_at >= period_start,
-    #         )
-    #         .count()
-    #     )
-    # except Exception:
-    #     batch_used = getattr(current_user, "usage_batch_requests", 0) or 0
- 
-    # api_calls_used = screenshots_used + batch_used
- 
-    # usage = {
-    #     "screenshots":         screenshots_used,
-    #     "batch_requests":      batch_used,
-    #     "api_calls":           api_calls_used,
-    #     "screenshots_used":    screenshots_used,
-    #     "batch_jobs":          batch_used,
-    #     "api_calls_this_month": api_calls_used,
-    # }
-
     now = datetime.utcnow()
 
     # ✅ FIX (Aug 2026 — quota bypass): usage now comes from
@@ -1880,6 +1850,30 @@ if FRONTEND_BUILD.exists():
         name="spa",
     )
 
+    @app.api_route(
+        "/api/{rest_of_path:path}",
+        methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD"],
+        include_in_schema=False,
+    )
+    def api_not_found(rest_of_path: str):
+        raise HTTPException(
+            status_code=404,
+            detail=f"No API route matches /api/{rest_of_path}",
+        )
+
+    # ✅ FIX (Aug 2026 — 405 Method Not Allowed):
+    # This route previously claimed EVERY path with GET only. Starlette checks
+    # path and method separately, so any POST that missed an exact route was
+    # claimed here and returned 405 instead of 404 — and the trailing-slash
+    # redirect was suppressed, because the redirect only fires when nothing
+    # matched the path at all.
+    #
+    # The startswith() guard below did not help: it lives in the function body,
+    # and method matching happens before the function is ever called.
+    #
+    # Fix: an explicit API guard registered FIRST, accepting every method, so
+    # unmatched /api/* requests get an honest 404 instead of a misleading 405.
+    
     @app.get("/{full_path:path}", include_in_schema=False)
     def spa_catch_all(full_path: str):
         if full_path.startswith((
@@ -1891,6 +1885,19 @@ if FRONTEND_BUILD.exists():
         if index_file.exists():
             return HTMLResponse(index_file.read_text(encoding="utf-8"))
         raise HTTPException(status_code=404, detail="Frontend not built")
+
+
+    # @app.get("/{full_path:path}", include_in_schema=False)
+    # def spa_catch_all(full_path: str):
+    #     if full_path.startswith((
+    #         "api/", "health", "token", "register",
+    #         "webhook/", "screenshots/",
+    #     )):
+    #         raise HTTPException(status_code=404, detail="Not found")
+    #     index_file = FRONTEND_BUILD / "index.html"
+    #     if index_file.exists():
+    #         return HTMLResponse(index_file.read_text(encoding="utf-8"))
+    #     raise HTTPException(status_code=404, detail="Frontend not built")
 
 # =====================================================================
 # Entry point (local dev only)
