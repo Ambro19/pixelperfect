@@ -2,9 +2,30 @@
 # DATABASE MODELS - PixelPerfect Screenshot API
 # File: backend/models.py
 # Author: OneTechly
-# Updated: July 2026
+# Updated: August 2026
 # ============================================================================
 # PRODUCTION READY
+#
+# ✅ NEW (Aug 2026 — Billing-anniversary alignment, Patch 1 of N):
+#   User now mirrors the Stripe subscription's current period locally, so
+#   quota can be aligned to what the customer is actually billed for rather
+#   than the calendar month.
+#
+#     subscription_current_period_start
+#     subscription_current_period_end
+#     subscription_verified_at
+#
+#   Written by subscription_sync.py and webhook_handler.py; read by
+#   usage_accounting.py. Null for Free users and for anyone not yet synced —
+#   usage_accounting falls back to the calendar month in that case.
+#
+#   Decisions this encodes (documented here so they are not buried in code):
+#     - Free tier anchors to the calendar month. No subscription, no
+#       anniversary.
+#     - Upgrading starts a fresh paid period. Free-tier usage does not count
+#       against the allowance just purchased.
+#     - Existing paid users' reset date MOVES on deploy (e.g. Sept 1 →
+#       Sept 21). Notify affected customers before shipping.
 #
 # ✅ FIX (Jul 2026 — Tier Limits Source of Truth):
 #   get_tier_limits() now reads ALL limit values from environment variables
@@ -23,6 +44,7 @@
 #     parent BatchJob. Required by _reconstruct_job_from_db() in batch.py.
 # ✅ FIX (Apr 2026): add_missing_columns() adds urls_json and batch_job_id.
 # ✅ NEW (May 2026 — Phase 1): TIER_FEATURES dict + has_feature() added.
+# ✅ NEW (Aug 2026): ScreenshotDeletion tombstone ledger — quota bypass fix.
 # ============================================================================
 
 from __future__ import annotations
@@ -116,6 +138,20 @@ class User(Base):
     subscription_ends_at    = Column(DateTime, nullable=True)
     subscription_updated_at = Column(DateTime, nullable=True)
 
+    # ✅ NEW (Aug 2026 — billing-anniversary alignment):
+    # The Stripe subscription's current period, mirrored locally so quota can
+    # be aligned to what the customer is actually billed for. Written by
+    # subscription_sync.py and webhook_handler.py; read by usage_accounting.
+    # Null for Free users and for anyone not yet synced — usage_accounting
+    # falls back to the calendar month in that case.
+    subscription_current_period_start = Column(DateTime, nullable=True)
+    subscription_current_period_end   = Column(DateTime, nullable=True)
+
+    # ✅ NEW: last time we successfully asked Stripe about this user. Used to
+    # throttle the overdue re-verification in subscription_sync so a stale
+    # webhook cannot leave a lapsed subscription on a paid tier forever.
+    subscription_verified_at = Column(DateTime, nullable=True)
+
     usage_screenshots    = Column(Integer, default=0)
     usage_batch_requests = Column(Integer, default=0)
     usage_api_calls      = Column(Integer, default=0)
@@ -129,6 +165,10 @@ class User(Base):
         Index("idx_user_username", "username"),
         Index("idx_user_stripe",   "stripe_customer_id"),
         Index("idx_user_tier",     "subscription_tier"),
+        # ✅ NEW (Aug 2026): usage_accounting filters on the period start for
+        # every /subscription_status call. Indexed so that stays cheap as the
+        # user table grows.
+        Index("idx_user_period_start", "subscription_current_period_start"),
     )
 
 
@@ -213,14 +253,16 @@ class Screenshot(Base):
         Index("idx_screenshot_status",    "status"),
         Index("idx_screenshot_format",    "format"),
         Index("idx_screenshot_batch_job", "batch_job_id"),
+        # ✅ NEW (Aug 2026): usage_accounting counts screenshots for one user
+        # within one period on every /subscription_status call. The composite
+        # index is what that query actually hits.
+        Index("idx_screenshot_user_created", "user_id", "created_at"),
     )
+
 
 # ============================================================================
 # SCREENSHOT DELETION LEDGER  (Aug 2026 — quota bypass fix)
 # ============================================================================
-# Paste this class into backend/models.py, directly AFTER the Screenshot
-# model and BEFORE the BatchJob model.
-#
 # WHY THIS EXISTS
 # ---------------
 # /subscription_status derived usage from a live COUNT(*) on the screenshots
@@ -235,8 +277,8 @@ class Screenshot(Base):
 # Usage is a record of CONSUMPTION, not an inventory of RETAINED FILES.
 #
 # Rather than soft-deleting screenshots (which would require changing every
-# query that lists history, in files this fix does not touch), we record a
-# tombstone here on delete. Period usage becomes:
+# query that lists history), we record a tombstone here on delete. Period
+# usage becomes:
 #
 #     live screenshots in period  +  deleted screenshots captured in period
 #
@@ -295,6 +337,7 @@ class ScreenshotDeletion(Base):
         Index("idx_ss_deletion_user_created", "user_id", "original_created_at"),
     )
 
+
 # ============================================================================
 # BATCH JOB MODEL
 # ============================================================================
@@ -326,6 +369,9 @@ class BatchJob(Base):
         Index("idx_batch_job_user",    "user_id"),
         Index("idx_batch_job_created", "created_at"),
         Index("idx_batch_job_status",  "status"),
+        # ✅ NEW (Aug 2026): batch_used_this_period() filters by user AND
+        # created_at. Same reasoning as the screenshots composite index.
+        Index("idx_batch_job_user_created", "user_id", "created_at"),
     )
 
 
@@ -499,6 +545,19 @@ def reset_monthly_usage(user: User, db: Session) -> None:
     invoice.paid events), NOT on the calendar 1st of the month.
     The reset_at timestamp is set to 30 days from now as a rolling fallback
     for users who have no active Stripe subscription.
+
+    ⚠️ NOTE (Aug 2026 — billing-anniversary alignment):
+    These counters are NOT the authoritative source of usage. usage_accounting
+    derives usage from the screenshots table plus the deletion ledger, scoped
+    to the billing period. This function remains for the legacy counters that
+    screenshot_service.increment_user_usage() maintains, and for any code
+    still reading user.usage_screenshots directly.
+
+    The `usage_reset_at = now + 30 days` rolling fallback below drifts away
+    from both the calendar month AND the Stripe anniversary over time (12
+    resets of 30 days is 360 days, not a year). Once every read path goes
+    through usage_accounting, this field should be replaced by
+    subscription_current_period_end rather than recomputed here.
     """
     user.usage_screenshots    = 0
     user.usage_batch_requests = 0
@@ -524,6 +583,13 @@ def add_missing_columns() -> None:
     """
     Add columns that are new in this version to existing live databases.
     Idempotent — safe to call on every startup.
+
+    ⚠️ THIS MUST ACTUALLY BE CALLED. Base.metadata.create_all() creates
+    missing TABLES but never adds missing COLUMNS to an existing table. If
+    nothing invokes this function on startup, the columns below will not exist
+    in production and every read of them raises
+    `column users.subscription_current_period_start does not exist`.
+    See the deployment note in main.py's on_startup().
     """
     from sqlalchemy import inspect, text
 
@@ -549,6 +615,28 @@ def add_missing_columns() -> None:
                 "ALTER TABLE users ADD COLUMN subscription_updated_at TIMESTAMP"
             ))
             print("✅ Added users.subscription_updated_at")
+
+        # ✅ NEW (Aug 2026 — billing-anniversary alignment)
+        # These mirror the Stripe subscription period locally so quota can be
+        # aligned to the customer's actual billing cycle.
+        for col in (
+            "subscription_current_period_start",
+            "subscription_current_period_end",
+            "subscription_verified_at",
+        ):
+            if col not in user_cols:
+                conn.execute(text(f"ALTER TABLE users ADD COLUMN {col} TIMESTAMP"))
+                print(f"✅ Added users.{col}")
+
+        # ✅ NEW (Aug 2026): subscription_ends_at is declared on the model but
+        # was never in add_missing_columns(). Any database created before that
+        # column was added to the model is missing it, and SQLAlchemy will
+        # raise on the first read. Added here for the same reason as above.
+        if "subscription_ends_at" not in user_cols:
+            conn.execute(text(
+                "ALTER TABLE users ADD COLUMN subscription_ends_at TIMESTAMP"
+            ))
+            print("✅ Added users.subscription_ends_at")
 
     try:
         batch_cols = [col["name"] for col in inspector.get_columns("batch_jobs")]
@@ -580,4 +668,627 @@ def add_missing_columns() -> None:
     print("✅ DB migrations completed")
 
 
-# ===== END OF models.py ======================================================
+def verify_billing_columns() -> bool:
+    """
+    ✅ NEW (Aug 2026): confirm the billing-anniversary columns actually exist.
+
+    add_missing_columns() is only useful if something calls it. This returns
+    False and prints loudly when the columns are absent, so a misconfigured
+    startup fails visibly at boot rather than silently at the first
+    /subscription_status request.
+
+    Call from main.py's on_startup() immediately after add_missing_columns().
+    """
+    from sqlalchemy import inspect
+
+    required = {
+        "subscription_current_period_start",
+        "subscription_current_period_end",
+        "subscription_verified_at",
+    }
+    try:
+        cols = {c["name"] for c in inspect(engine).get_columns("users")}
+    except Exception as e:
+        print(f"⚠️  Could not inspect users table: {e}")
+        return False
+
+    missing = required - cols
+    if missing:
+        print(
+            "❌ BILLING COLUMNS MISSING: "
+            + ", ".join(sorted(missing))
+            + "\n   add_missing_columns() did not run, or ran against a different"
+              " database.\n   /subscription_status will fail until this is fixed."
+        )
+        return False
+
+    print("✅ Billing-anniversary columns present")
+    return True
+
+
+# ===== END OF models.py =================
+
+
+# # ============================================================================
+# # DATABASE MODELS - PixelPerfect Screenshot API
+# # File: backend/models.py
+# # Author: OneTechly
+# # Updated: July 2026
+# # ============================================================================
+# # PRODUCTION READY
+# #
+# # ✅ FIX (Jul 2026 — Tier Limits Source of Truth):
+# #   get_tier_limits() now reads ALL limit values from environment variables
+# #   with hardcoded fallbacks matching the documented defaults.
+# #   Root cause: business.batch_requests was hardcoded as 500 in this file,
+# #   while batch.py defines TIER_BATCH_LIMITS["business"] = 200 and .env
+# #   defines BUSINESS_BATCH_LIMIT=200. Three files had three different values.
+# #   Fix: .env is now the single source of truth for all tier limits.
+# #   Changing a limit now requires editing .env only — no code change needed.
+# #
+# # ✅ FIX (Mar 2026): SQLite WAL journal mode, FK enforcement, NORMAL sync
+# # ✅ FIX (Mar 2026): Added BatchJob model — fixes frozen batch counter
+# # ✅ FIX (Apr 2026): Added BatchJob.urls_json — enables job reconstruction
+# #     after server restart.
+# # ✅ FIX (Apr 2026): Added Screenshot.batch_job_id — links screenshots to
+# #     parent BatchJob. Required by _reconstruct_job_from_db() in batch.py.
+# # ✅ FIX (Apr 2026): add_missing_columns() adds urls_json and batch_job_id.
+# # ✅ NEW (May 2026 — Phase 1): TIER_FEATURES dict + has_feature() added.
+# # ============================================================================
+
+# from __future__ import annotations
+
+# import os
+# from datetime import datetime, timedelta
+# from typing import Any, Dict, Optional
+# from uuid import uuid4
+
+# from sqlalchemy import (
+#     Boolean,
+#     Column,
+#     DateTime,
+#     Float,
+#     ForeignKey,
+#     Index,
+#     Integer,
+#     String,
+#     Text,
+#     create_engine,
+#     event,
+# )
+# from sqlalchemy.engine import Engine
+# from sqlalchemy.ext.declarative import declarative_base
+# from sqlalchemy.orm import Session, sessionmaker
+
+# # ============================================================================
+# # DATABASE CONFIGURATION
+# # ============================================================================
+
+# DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./pixelperfect.db")
+
+# if DATABASE_URL.startswith("postgres://"):
+#     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg2://", 1)
+# elif DATABASE_URL.startswith("postgresql://") and "+psycopg2" not in DATABASE_URL:
+#     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
+
+# _IS_SQLITE = DATABASE_URL.startswith("sqlite")
+# _connect_args = {"check_same_thread": False} if _IS_SQLITE else {}
+
+# engine = create_engine(
+#     DATABASE_URL,
+#     connect_args=_connect_args,
+#     pool_pre_ping=True,
+#     future=True,
+# )
+
+# if _IS_SQLITE:
+#     @event.listens_for(Engine, "connect")
+#     def _set_sqlite_pragmas(dbapi_connection, connection_record):
+#         cursor = dbapi_connection.cursor()
+#         cursor.execute("PRAGMA foreign_keys=ON;")
+#         cursor.execute("PRAGMA journal_mode=WAL;")
+#         cursor.execute("PRAGMA synchronous=NORMAL;")
+#         cursor.close()
+
+# SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+# Base = declarative_base()
+
+
+# def get_db():
+#     db = SessionLocal()
+#     try:
+#         yield db
+#     finally:
+#         db.close()
+
+
+# # ============================================================================
+# # USER MODEL
+# # ============================================================================
+
+# class User(Base):
+#     __tablename__ = "users"
+
+#     id              = Column(Integer,     primary_key=True, index=True)
+#     username        = Column(String(50),  unique=True, index=True, nullable=False)
+#     email           = Column(String(100), unique=True, index=True, nullable=False)
+#     hashed_password = Column(String(255), nullable=False)
+
+#     stripe_customer_id = Column(String(100), unique=True, nullable=True)
+
+#     subscription_tier = Column(String(20), default="free", nullable=False)
+
+#     stripe_subscription_status = Column(String(20), nullable=True)
+#     subscription_status        = Column(String(20), default="active", nullable=True)
+
+#     subscription_id = Column(String(100), unique=True, nullable=True)
+
+#     subscription_expires_at = Column(DateTime, nullable=True)
+#     subscription_ends_at    = Column(DateTime, nullable=True)
+#     subscription_updated_at = Column(DateTime, nullable=True)
+
+#     usage_screenshots    = Column(Integer, default=0)
+#     usage_batch_requests = Column(Integer, default=0)
+#     usage_api_calls      = Column(Integer, default=0)
+#     usage_reset_at       = Column(DateTime, nullable=True)
+
+#     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+#     is_active  = Column(Boolean,  default=True,            nullable=False)
+
+#     __table_args__ = (
+#         Index("idx_user_email",    "email"),
+#         Index("idx_user_username", "username"),
+#         Index("idx_user_stripe",   "stripe_customer_id"),
+#         Index("idx_user_tier",     "subscription_tier"),
+#     )
+
+
+# # ============================================================================
+# # API KEY MODEL
+# # ============================================================================
+
+# class ApiKey(Base):
+#     __tablename__ = "api_keys"
+
+#     id      = Column(Integer, primary_key=True, index=True)
+#     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+
+#     key_hash   = Column(String(64), unique=True, nullable=False, index=True)
+#     key_prefix = Column(String(16), nullable=False)
+
+#     name         = Column(String(100), default="Default API Key", nullable=False)
+#     is_active    = Column(Boolean,     default=True,              nullable=False)
+#     last_used_at = Column(DateTime,    nullable=True)
+#     created_at   = Column(DateTime,    default=datetime.utcnow,  nullable=False)
+
+#     __table_args__ = (
+#         Index("idx_api_key_hash",   "key_hash"),
+#         Index("idx_api_key_user",   "user_id"),
+#         Index("idx_api_key_active", "is_active"),
+#     )
+
+
+# # ============================================================================
+# # SCREENSHOT MODEL
+# # ============================================================================
+
+# class Screenshot(Base):
+#     __tablename__ = "screenshots"
+
+#     id = Column(String, primary_key=True, index=True, default=lambda: str(uuid4()))
+
+#     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+
+#     url = Column(Text, nullable=False)
+
+#     width     = Column(Integer,    nullable=False, default=1920)
+#     height    = Column(Integer,    nullable=False, default=1080)
+#     full_page = Column(Boolean,    nullable=True)
+#     format    = Column(String(10), nullable=False, default="png")
+#     quality   = Column(Integer,    nullable=True)
+
+#     size_bytes = Column(Integer, nullable=False, default=0)
+
+#     storage_url = Column(Text,   nullable=False, default="")
+#     storage_key = Column(String, nullable=True)
+
+#     processing_time_ms = Column(Float, nullable=True)
+
+#     status        = Column(String, nullable=True, default="completed")
+#     error_message = Column(Text,   nullable=True)
+
+#     dark_mode       = Column(Boolean, nullable=True)
+#     delay_seconds   = Column(Integer, nullable=True)
+#     remove_elements = Column(Text,    nullable=True)
+
+#     created_at = Column(DateTime, nullable=True, default=datetime.utcnow)
+#     expires_at = Column(DateTime, nullable=True)
+
+#     is_baseline              = Column(Boolean, nullable=True)
+#     baseline_screenshot_id   = Column(String, ForeignKey("screenshots.id"), nullable=True)
+#     difference_percentage    = Column(Float,   nullable=True)
+#     has_changes              = Column(Boolean, nullable=True)
+
+#     screenshot_path = Column(Text, nullable=True)
+
+#     batch_job_id = Column(
+#         String(32),
+#         ForeignKey("batch_jobs.id", ondelete="SET NULL"),
+#         nullable=True,
+#         index=True,
+#     )
+
+#     __table_args__ = (
+#         Index("idx_screenshot_user",      "user_id"),
+#         Index("idx_screenshot_created",   "created_at"),
+#         Index("idx_screenshot_status",    "status"),
+#         Index("idx_screenshot_format",    "format"),
+#         Index("idx_screenshot_batch_job", "batch_job_id"),
+#     )
+
+# # ============================================================================
+# # SCREENSHOT DELETION LEDGER  (Aug 2026 — quota bypass fix)
+# # ============================================================================
+# # Paste this class into backend/models.py, directly AFTER the Screenshot
+# # model and BEFORE the BatchJob model.
+# #
+# # WHY THIS EXISTS
+# # ---------------
+# # /subscription_status derived usage from a live COUNT(*) on the screenshots
+# # table. Deleting a row therefore refunded the user's quota:
+# #
+# #     8 used -> delete 1 -> 7 used -> delete 1 -> 6 used
+# #
+# # That is a quota bypass. Capture 100 on Free, delete them, capture 100 more,
+# # repeat forever. The compute was already spent — Playwright launched,
+# # Chromium rendered, R2 was written — so the usage must not be refundable.
+# #
+# # Usage is a record of CONSUMPTION, not an inventory of RETAINED FILES.
+# #
+# # Rather than soft-deleting screenshots (which would require changing every
+# # query that lists history, in files this fix does not touch), we record a
+# # tombstone here on delete. Period usage becomes:
+# #
+# #     live screenshots in period  +  deleted screenshots captured in period
+# #
+# # original_created_at is the CAPTURE time, not the deletion time. That is
+# # what makes the counter reset correctly at the billing boundary: a
+# # screenshot captured in August and deleted in September still counts
+# # against August, and against nothing in September.
+# #
+# # Side benefit: this is an audit trail. You can now answer "how many
+# # screenshots did this user actually take last month" even after they
+# # clear their history.
+# # ============================================================================
+
+# class ScreenshotDeletion(Base):
+#     """
+#     Tombstone for a deleted screenshot, so usage accounting survives deletion.
+
+#     One row is written each time a user deletes a screenshot. Rows are only
+#     removed when the user's account itself is deleted.
+#     """
+#     __tablename__ = "screenshot_deletions"
+
+#     id = Column(Integer, primary_key=True, index=True)
+
+#     user_id = Column(
+#         Integer,
+#         ForeignKey("users.id", ondelete="CASCADE"),
+#         nullable=False,
+#         index=True,
+#     )
+
+#     # The id of the screenshot row that was removed. Kept for audit only —
+#     # deliberately NOT a foreign key, because the row it referenced is gone.
+#     screenshot_id = Column(String, nullable=True)
+
+#     # ✅ The field that makes period accounting correct.
+#     # This is the CAPTURE timestamp copied off the screenshot before deletion,
+#     # NOT the time of deletion. Usage is attributed to the period in which the
+#     # screenshot was taken.
+#     original_created_at = Column(DateTime, nullable=True, index=True)
+
+#     deleted_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+#     # Light audit context — useful for support questions and abuse review.
+#     url    = Column(Text,       nullable=True)
+#     format = Column(String(10), nullable=True)
+
+#     # True when the screenshot was part of a batch job. Lets you separate
+#     # single-capture usage from batch usage later if you ever need to.
+#     from_batch = Column(Boolean, nullable=True, default=False)
+
+#     __table_args__ = (
+#         Index("idx_ss_deletion_user",    "user_id"),
+#         Index("idx_ss_deletion_created", "original_created_at"),
+#         # The composite index is what /subscription_status actually hits.
+#         Index("idx_ss_deletion_user_created", "user_id", "original_created_at"),
+#     )
+
+# # ============================================================================
+# # BATCH JOB MODEL
+# # ============================================================================
+
+# class BatchJob(Base):
+#     __tablename__ = "batch_jobs"
+
+#     id = Column(String(32), primary_key=True, index=True)
+
+#     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+
+#     status    = Column(String(20),  nullable=False, default="queued")
+#     format    = Column(String(10),  nullable=False, default="png")
+#     width     = Column(Integer,     nullable=False, default=1920)
+#     height    = Column(Integer,     nullable=False, default=1080)
+#     full_page = Column(Boolean,     nullable=False, default=False)
+
+#     total_urls = Column(Integer, nullable=False, default=0)
+
+#     completed_count = Column(Integer, nullable=True, default=0)
+#     failed_count    = Column(Integer, nullable=True, default=0)
+
+#     urls_json = Column(Text, nullable=True)
+
+#     created_at   = Column(DateTime, nullable=False, default=datetime.utcnow)
+#     completed_at = Column(DateTime, nullable=True)
+
+#     __table_args__ = (
+#         Index("idx_batch_job_user",    "user_id"),
+#         Index("idx_batch_job_created", "created_at"),
+#         Index("idx_batch_job_status",  "status"),
+#     )
+
+
+# # ============================================================================
+# # SUBSCRIPTION MODEL
+# # ============================================================================
+
+# class Subscription(Base):
+#     __tablename__ = "subscriptions"
+
+#     id      = Column(Integer, primary_key=True, index=True)
+#     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+
+#     stripe_subscription_id = Column(String(100), unique=True, nullable=False)
+#     stripe_customer_id     = Column(String(100), nullable=False)
+
+#     tier   = Column(String(20), nullable=False)
+#     status = Column(String(20), nullable=False)
+
+#     current_period_start = Column(DateTime, nullable=True)
+#     current_period_end   = Column(DateTime, nullable=True)
+#     cancel_at_period_end = Column(Boolean,  default=False, nullable=False)
+
+#     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+#     updated_at = Column(
+#         DateTime,
+#         default=datetime.utcnow,
+#         onupdate=datetime.utcnow,
+#         nullable=False,
+#     )
+
+#     __table_args__ = (
+#         Index("idx_subscription_user",   "user_id"),
+#         Index("idx_subscription_stripe", "stripe_subscription_id"),
+#     )
+
+
+# # ============================================================================
+# # TIER LIMITS CONFIGURATION
+# # ============================================================================
+# # ✅ FIX (Jul 2026): All limit values now read from environment variables.
+# #    .env is the single source of truth. Defaults match documented values.
+# #
+# #    Confirmed correct values from .env:
+# #      FREE_SCREENSHOTS_LIMIT=100    FREE_BATCH_LIMIT=0
+# #      PRO_SCREENSHOTS_LIMIT=5000    PRO_BATCH_LIMIT=50
+# #      BUSINESS_SCREENSHOTS_LIMIT=50000   BUSINESS_BATCH_LIMIT=200  ← was 500
+# #      PREMIUM_SCREENSHOTS_LIMIT=999999999  PREMIUM_BATCH_LIMIT=999999999
+# #
+# #    To change any limit: edit .env only. No code change required.
+# # ============================================================================
+
+# def _env_int(key: str, default: int) -> int:
+#     """Read an integer from env; fall back to default if missing or invalid."""
+#     try:
+#         return int(os.getenv(key, str(default)))
+#     except (TypeError, ValueError):
+#         return default
+
+
+# def _env_limit(key: str, default: int):
+#     """
+#     Read a limit from env. Returns 'unlimited' if the value is >= 999_999_999
+#     (the sentinel used in .env for Premium), otherwise returns the integer.
+#     """
+#     val = _env_int(key, default)
+#     return "unlimited" if val >= 999_999_999 else val
+
+
+# def get_tier_limits(tier: str) -> Dict[str, Any]:
+#     """
+#     Return usage limits for a subscription tier.
+#     All values are read from environment variables; the .env file is the
+#     single source of truth so limits can be changed without a code deploy.
+#     """
+#     tier = (tier or "free").lower()
+
+#     limits: Dict[str, Dict[str, Any]] = {
+#         "free": {
+#             "screenshots":    _env_int("FREE_SCREENSHOTS_LIMIT",    100),
+#             "batch_requests": _env_int("FREE_BATCH_LIMIT",          0),
+#             "api_calls":      _env_int("FREE_API_CALLS_LIMIT",      1_000),
+#             "features": ["basic_customization", "community_support"],
+#         },
+#         "pro": {
+#             "screenshots":    _env_int("PRO_SCREENSHOTS_LIMIT",     5_000),
+#             "batch_requests": _env_int("PRO_BATCH_LIMIT",           50),
+#             "api_calls":      _env_int("PRO_API_CALLS_LIMIT",       10_000),
+#             "features": ["full_customization", "batch_processing", "priority_support"],
+#         },
+#         "business": {
+#             # ✅ FIXED: env default is 200 (was hardcoded 500).
+#             # Confirmed by BUSINESS_BATCH_LIMIT=200 in .env and
+#             # TIER_BATCH_LIMITS["business"] = 200 in batch.py.
+#             "screenshots":    _env_int("BUSINESS_SCREENSHOTS_LIMIT", 50_000),
+#             "batch_requests": _env_int("BUSINESS_BATCH_LIMIT",       200),
+#             "api_calls":      _env_int("BUSINESS_API_CALLS_LIMIT",   100_000),
+#             "features": ["webhooks", "change_detection", "dedicated_support", "batch_processing"],
+#         },
+#         "premium": {
+#             "screenshots":    _env_limit("PREMIUM_SCREENSHOTS_LIMIT", 999_999_999),
+#             "batch_requests": _env_limit("PREMIUM_BATCH_LIMIT",       999_999_999),
+#             "api_calls":      _env_limit("PREMIUM_API_CALLS_LIMIT",   999_999_999),
+#             "features": ["white_label", "custom_sla", "account_manager", "webhooks", "change_detection"],
+#         },
+#     }
+
+#     return limits.get(tier, limits["free"])
+
+
+# # ============================================================================
+# # ✅ NEW (May 2026 — Phase 1): TIER_FEATURES + has_feature()
+# # ============================================================================
+
+# TIER_FEATURES: Dict[str, Dict[str, bool]] = {
+#     "free": {
+#         "custom_js":         False,
+#         "device_emulation":  False,
+#         "element_selection": False,
+#         "webhooks":          False,
+#         "white_label":       False,
+#         "pdf":               False,
+#     },
+#     "pro": {
+#         "custom_js":         True,
+#         "device_emulation":  True,
+#         "element_selection": False,
+#         "webhooks":          False,
+#         "white_label":       False,
+#         # ✅ FIX (July 2026): PDF is Pro+, not Business-only.
+#         # models.py TIER_FEATURES was out of sync with the documented tier matrix.
+#         "pdf":               True,
+#     },
+#     "business": {
+#         "custom_js":         True,
+#         "device_emulation":  True,
+#         "element_selection": True,
+#         "webhooks":          True,
+#         "white_label":       False,
+#         "pdf":               True,
+#     },
+#     "premium": {
+#         "custom_js":         True,
+#         "device_emulation":  True,
+#         "element_selection": True,
+#         "webhooks":          True,
+#         "white_label":       True,
+#         "pdf":               True,
+#     },
+# }
+
+
+# def has_feature(user: "User", feature_name: str) -> bool:
+#     """
+#     Return True if the user's subscription tier includes the named feature.
+#     This is the authoritative check — TIER_FEATURES is the only place
+#     feature-to-tier mappings live. Do not duplicate this logic elsewhere.
+#     """
+#     tier = (getattr(user, "subscription_tier", None) or "free").lower()
+#     return TIER_FEATURES.get(tier, {}).get(feature_name, False)
+
+
+# # ============================================================================
+# # USAGE RESET HELPER
+# # ============================================================================
+
+# def reset_monthly_usage(user: User, db: Session) -> None:
+#     """
+#     Reset user's monthly usage counters.
+#     Called when a Stripe billing cycle renews (via webhook_handler.py on
+#     invoice.paid events), NOT on the calendar 1st of the month.
+#     The reset_at timestamp is set to 30 days from now as a rolling fallback
+#     for users who have no active Stripe subscription.
+#     """
+#     user.usage_screenshots    = 0
+#     user.usage_batch_requests = 0
+#     user.usage_api_calls      = 0
+#     user.usage_reset_at       = datetime.utcnow() + timedelta(days=30)
+#     db.commit()
+
+
+# # ============================================================================
+# # DATABASE INITIALIZATION
+# # ============================================================================
+
+# def initialize_database() -> None:
+#     Base.metadata.create_all(bind=engine)
+#     print("✅ Database tables created successfully")
+
+
+# # ============================================================================
+# # MIGRATION HELPER
+# # ============================================================================
+
+# def add_missing_columns() -> None:
+#     """
+#     Add columns that are new in this version to existing live databases.
+#     Idempotent — safe to call on every startup.
+#     """
+#     from sqlalchemy import inspect, text
+
+#     inspector = inspect(engine)
+#     is_sqlite = _IS_SQLITE
+
+#     user_cols = [col["name"] for col in inspector.get_columns("users")]
+#     with engine.begin() as conn:
+#         if "stripe_subscription_status" not in user_cols:
+#             conn.execute(text(
+#                 "ALTER TABLE users ADD COLUMN stripe_subscription_status VARCHAR(20)"
+#             ))
+#             print("✅ Added users.stripe_subscription_status")
+
+#         if "subscription_expires_at" not in user_cols:
+#             conn.execute(text(
+#                 "ALTER TABLE users ADD COLUMN subscription_expires_at TIMESTAMP"
+#             ))
+#             print("✅ Added users.subscription_expires_at")
+
+#         if "subscription_updated_at" not in user_cols:
+#             conn.execute(text(
+#                 "ALTER TABLE users ADD COLUMN subscription_updated_at TIMESTAMP"
+#             ))
+#             print("✅ Added users.subscription_updated_at")
+
+#     try:
+#         batch_cols = [col["name"] for col in inspector.get_columns("batch_jobs")]
+#         with engine.begin() as conn:
+#             if "urls_json" not in batch_cols:
+#                 conn.execute(text("ALTER TABLE batch_jobs ADD COLUMN urls_json TEXT"))
+#                 print("✅ Added batch_jobs.urls_json")
+#     except Exception as e:
+#         print(f"ℹ️  batch_jobs migration skipped: {e}")
+
+#     try:
+#         ss_cols = [col["name"] for col in inspector.get_columns("screenshots")]
+#         with engine.begin() as conn:
+#             if "batch_job_id" not in ss_cols:
+#                 if is_sqlite:
+#                     conn.execute(text(
+#                         "ALTER TABLE screenshots ADD COLUMN batch_job_id VARCHAR(32)"
+#                     ))
+#                 else:
+#                     conn.execute(text(
+#                         "ALTER TABLE screenshots "
+#                         "ADD COLUMN batch_job_id VARCHAR(32) "
+#                         "REFERENCES batch_jobs(id) ON DELETE SET NULL"
+#                     ))
+#                 print("✅ Added screenshots.batch_job_id")
+#     except Exception as e:
+#         print(f"ℹ️  screenshots migration skipped: {e}")
+
+#     print("✅ DB migrations completed")
+
+
+# # ===== END OF models.py =================

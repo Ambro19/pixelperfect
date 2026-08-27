@@ -1116,8 +1116,12 @@ def check_usage_limit(user, tier_limits, db=None) -> bool:
 
     if db is not None:
         try:
+            # from usage_accounting import screenshots_used_this_period
+            # return screenshots_used_this_period(db, user.id) < limit
             from usage_accounting import screenshots_used_this_period
-            return screenshots_used_this_period(db, user.id) < limit
+            # Pass the User, not the id — the period boundary depends on the
+            # Stripe billing anchor.
+            return screenshots_used_this_period(db, user) < limit
         except Exception as e:
             logger.warning(
                 "check_usage_limit: usage_accounting unavailable, "
@@ -1132,7 +1136,7 @@ def check_usage_limit(user, tier_limits, db=None) -> bool:
 
     return int(user.usage_screenshots or 0) < limit
 
-# ===== END OF screenshot_service.py ========
+# ===== END OF backend\screenshot_service.py ========
 
 
 # # ============================================================================

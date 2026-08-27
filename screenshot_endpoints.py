@@ -350,10 +350,18 @@ async def batch_screenshot_endpoint(
 
     tier_limits  = get_tier_limits(tier)
     batch_limit  = tier_limits.get("batch_requests", 0)
-
-    if batch_limit != "unlimited":
-        current_batch_usage = current_user.usage_batch_requests or 0
-        if current_batch_usage >= batch_limit:
+    # ✅ FIX (Aug 2026): was reading the lifetime usage_batch_requests counter
+    # and comparing it with >= against a limit that can be the STRING
+    # "unlimited" — a TypeError for Premium, raised before the try block, so
+    # it surfaced as an unhandled 500. Now period-scoped and unlimited-safe,
+    # matching the single-capture path.
+    if batch_limit not in ("unlimited", None):
+        from usage_accounting import batch_used_this_period
+        current_batch_usage = batch_used_this_period(db, current_user)
+        if current_batch_usage >= int(batch_limit):
+    # if batch_limit != "unlimited":
+    #     current_batch_usage = current_user.usage_batch_requests or 0
+    #     if current_batch_usage >= batch_limit:
             raise HTTPException(
                 status_code=429,
                 detail=f"Batch request limit exceeded ({batch_limit}/month). Upgrade to continue.",

@@ -112,6 +112,8 @@ from usage_accounting import (
     record_screenshot_deletion,
     purge_user_deletion_records,
     first_of_next_month,
+    next_period_start,      # ✅ NEW — billing anniversary for paid tiers
+    period_basis,           # ✅ NEW — "billing_cycle" | "calendar_month"
 )
 from db_migrations import run_startup_migrations
 from auth_deps import get_current_user
@@ -1797,30 +1799,45 @@ def subscription_status(
     batch_used       = usage["batch_requests"]
     api_calls_used   = usage["api_calls"]
  
-    # ── ✅ FIX (Jul 2026): next_reset is ALWAYS present ────────────────────
-    # 1. Honor usage_reset_at only if it's a real, FUTURE datetime.
-    #    (Stale/past values are ignored rather than displayed as nonsense.)
-    # 2. Otherwise fall back to the first of next month — which is when the
-    #    period_start window above actually rolls over.
-    next_reset = getattr(current_user, "usage_reset_at", None)
-    if isinstance(next_reset, datetime):
-        if next_reset <= now:
-            next_reset = None            # stale — ignore
-    elif next_reset is not None:
-        next_reset = None                # unexpected type — ignore
+    # # ── ✅ FIX (Jul 2026): next_reset is ALWAYS present ────────────────────
+    # # 1. Honor usage_reset_at only if it's a real, FUTURE datetime.
+    # #    (Stale/past values are ignored rather than displayed as nonsense.)
+    # # 2. Otherwise fall back to the first of next month — which is when the
+    # #    period_start window above actually rolls over.
+    # next_reset = getattr(current_user, "usage_reset_at", None)
+    # if isinstance(next_reset, datetime):
+    #     if next_reset <= now:
+    #         next_reset = None            # stale — ignore
+    # elif next_reset is not None:
+    #     next_reset = None                # unexpected type — ignore
  
     # if next_reset is None:
-    #     next_reset = _first_of_next_month_utc(now)
-    if next_reset is None:
-        next_reset = first_of_next_month(now)   # was _first_of_next_month_utc(now)
+    #     next_reset = first_of_next_month(now)   # was _first_of_next_month_utc(now)
+
+    # ✅ REWRITTEN (Aug 2026 — billing-anniversary alignment).
+    #
+    # usage_reset_at is NO LONGER consulted. It is written by
+    # reset_monthly_usage() on Stripe invoice.paid and set to "now + 30 days",
+    # which is neither the calendar boundary nor the billing anniversary —
+    # a third, wrong answer that could override the correct one. The period
+    # now comes from usage_accounting, which is the same source the
+    # enforcement path reads, so display and enforcement cannot diverge.
+    next_reset  = next_period_start(current_user, now)
+    reset_basis = period_basis(current_user, now)    
  
     response = {
         "tier":   tier,
         "usage":  usage,
         "limits": tier_limits,
         "account": canonical_account(current_user),
-        "tier_concurrency_limit": _tier_limit_for_user(current_user),
+        "tier_concurrency_limit": _tier_limit_for_user(current_user), 
         "next_reset": next_reset.isoformat(),        # ✅ always present now
+
+        # ✅ NEW: which rule produced next_reset. The dashboard previously
+        # labelled this "(billing cycle)" unconditionally, which was false for
+        # every user not billed on the 1st. Label from this field instead.
+        "next_reset_basis": reset_basis,
+        "period_start": usage.get("period_start"),
     }
  
     # ── Bonus: Stripe renewal date, exposed under its own (honest) name ────
@@ -1831,10 +1848,16 @@ def subscription_status(
     if isinstance(renews, datetime):
         response["subscription_renews_at"] = renews.isoformat()
  
+    # logger.info(
+    #     "subscription_status user=%s tier=%s screenshots=%d batch=%d api=%d next_reset=%s",
+    #     current_user.id, tier, screenshots_used, batch_used, api_calls_used,
+    #     response["next_reset"],
+    # )
     logger.info(
-        "subscription_status user=%s tier=%s screenshots=%d batch=%d api=%d next_reset=%s",
+        "subscription_status user=%s tier=%s screenshots=%d batch=%d api=%d "
+        "period_start=%s next_reset=%s basis=%s",
         current_user.id, tier, screenshots_used, batch_used, api_calls_used,
-        response["next_reset"],
+        usage.get("period_start"), response["next_reset"], reset_basis,
     )
  
     return response
@@ -1885,19 +1908,6 @@ if FRONTEND_BUILD.exists():
         if index_file.exists():
             return HTMLResponse(index_file.read_text(encoding="utf-8"))
         raise HTTPException(status_code=404, detail="Frontend not built")
-
-
-    # @app.get("/{full_path:path}", include_in_schema=False)
-    # def spa_catch_all(full_path: str):
-    #     if full_path.startswith((
-    #         "api/", "health", "token", "register",
-    #         "webhook/", "screenshots/",
-    #     )):
-    #         raise HTTPException(status_code=404, detail="Not found")
-    #     index_file = FRONTEND_BUILD / "index.html"
-    #     if index_file.exists():
-    #         return HTMLResponse(index_file.read_text(encoding="utf-8"))
-    #     raise HTTPException(status_code=404, detail="Frontend not built")
 
 # =====================================================================
 # Entry point (local dev only)

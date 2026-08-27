@@ -348,6 +348,4 @@ async def _process_event(db: Session, event_type: str, obj: Dict[str, Any]) -> d
         "tier":        user.subscription_tier,
     }
 
-# ============================================================================
-# END OF webhook_handler.py
-# ============================================================================
+# ======== END OF webhook_handler.py ==========

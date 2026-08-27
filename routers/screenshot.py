@@ -118,6 +118,7 @@ from usage_accounting import (
     record_screenshot_deletion,
     current_period_start,
     first_of_next_month,
+    next_period_start,     # ✅ NEW — billing anniversary for paid tiers
 )
 
 from services.screenshot_service import screenshot_service
@@ -300,7 +301,11 @@ def check_user_screenshot_limit(
     tier_limits = get_tier_limits(user.subscription_tier or "free")
     limit = tier_limits["screenshots"]
 
-    current = screenshots_used_this_period(db, user.id)
+    # current = screenshots_used_this_period(db, user.id)
+    # ✅ CHANGED (Aug 2026): pass the User, not the id. The period boundary now
+    # depends on the user's Stripe billing anchor, and a bare id would silently
+    # count against the calendar month instead.
+    current = screenshots_used_this_period(db, user)
 
     # ✅ Unlimited is checked BEFORE any comparison. Never compare int < str.
     if is_unlimited(limit):
@@ -453,7 +458,8 @@ async def create_screenshot(
     if not can_use:
         # %-d is not portable (fails on Windows); %d is fine and dev runs on
         # Windows while production runs Linux.
-        resets_on = first_of_next_month().strftime("%B %d, %Y")
+        # resets_on = first_of_next_month().strftime("%B %d, %Y")
+        resets_on = next_period_start(current_user).strftime("%B %d, %Y")
         raise HTTPException(
             status_code=429,
             detail=(
@@ -667,8 +673,9 @@ async def create_screenshot(
                 "current":   used_now,
                 "limit":     limit,
                 "remaining": remaining_for(limit, used_now),
-                "period_start": current_period_start().isoformat(),
-                "resets_at":    first_of_next_month().isoformat(),
+                "period_start": current_period_start(current_user).isoformat(),
+                "resets_at":    next_period_start(current_user).isoformat(),
+                        
             },
         )
 
@@ -727,7 +734,8 @@ async def get_usage_stats(
     """
     tier_limits = get_tier_limits(current_user.subscription_tier or "free")
 
-    screenshots_used  = screenshots_used_this_period(db, current_user.id)
+    #screenshots_used  = screenshots_used_this_period(db, current_user.id)
+    screenshots_used  = screenshots_used_this_period(db, current_user)
     screenshots_limit = tier_limits["screenshots"]
     batch_used        = batch_used_this_period(db, current_user)
     batch_limit       = tier_limits["batch_requests"]
@@ -764,7 +772,13 @@ async def get_usage_stats(
         # It used to echo user.usage_reset_at, which is null for every Free
         # user (that field is only written by the Stripe invoice.paid path),
         # so this endpoint returned null for the majority of accounts.
-        "reset_date": first_of_next_month().isoformat(),
+        # "reset_date": first_of_next_month().isoformat(),
+        #---------------------------------------
+        # ✅ FIX (Aug 2026): reset_date is always present, and now follows the
+        # user's Stripe billing anniversary on paid tiers rather than the
+        # calendar. It used to echo user.usage_reset_at, which is null for
+        # every Free user, so this endpoint returned null for most accounts.
+        "reset_date": next_period_start(current_user).isoformat(),
         "features": {
             "custom_js":         has_feature(current_user, "custom_js"),
             "device_emulation":  has_feature(current_user, "device_emulation"),
