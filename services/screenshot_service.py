@@ -126,7 +126,23 @@ COMMIT_TIMEOUT_MS = int(os.getenv("PLAYWRIGHT_COMMIT_TIMEOUT_MS", "15000"))
 SETTLE_TIMEOUT_MS = int(os.getenv("PLAYWRIGHT_SETTLE_TIMEOUT_MS", "8000"))
 
 # Budget for auto-scrolling a full-page capture to trigger lazy-loaded content.
-LAZY_SCROLL_TIMEOUT_MS = int(os.getenv("PLAYWRIGHT_LAZY_SCROLL_TIMEOUT_MS", "6000"))
+# LAZY_SCROLL_TIMEOUT_MS = int(os.getenv("PLAYWRIGHT_LAZY_SCROLL_TIMEOUT_MS", "6000"))
+
+# ✅ NEW (Aug 2026): explicit budget for the capture itself.
+#
+# page.screenshot() and page.pdf() take no timeout argument in our calls, so
+# they inherited the page default — which the lazy-scroll finally block sets
+# to NAV_TIMEOUT_MS (25s). That is a navigation number, not a rendering one.
+# A full-page capture of a very tall document (gnu.org's GPL text renders
+# ~25,000px at 1920 wide) exceeds 25s on a 1-CPU instance, and the resulting
+# Playwright Timeout was reported to the user as "the website did not respond
+# in time" — blaming a site that had already responded perfectly.
+#
+# 60s keeps the worst case inside Render's window:
+#   nav 25 + commit 15 + settle 8 + scroll 6 + delay 10 + capture 60 = 124s
+# ...which is why CAPTURE is only reached when the earlier phases were fast.
+# In practice a page that navigates in 2s and captures in 40s totals ~50s.
+CAPTURE_TIMEOUT_MS = int(os.getenv("PLAYWRIGHT_CAPTURE_TIMEOUT_MS", "60000"))
 
 # Third-party hosts that keep the network busy indefinitely and almost never
 # affect the visual result. Set PLAYWRIGHT_BLOCK_TRACKERS=0 to disable.
@@ -869,21 +885,34 @@ class ScreenshotService:
                 )
 
             # ── 9. Capture ────────────────────────────────────────────────────
+            # ✅ NEW (Aug 2026): `phase` lets the error handler tell the user
+            # WHICH step timed out. Without it, a slow full-page render was
+            # reported as "the website did not respond in time" — false, and
+            # it sent people looking at the wrong thing.
+            phase = "capture"
+
             if target_element:
-                page.screenshot(path=str(temp_filepath), full_page=True, type="png")
+                page.screenshot(
+                    path=str(temp_filepath), full_page=True, type="png",
+                    timeout=CAPTURE_TIMEOUT_MS,
+                )
 
             elif fmt == "pdf":
-                page.pdf(path=str(filepath), format="A4", print_background=True)
+                page.pdf(
+                    path=str(filepath), format="A4", print_background=True,
+                )
 
             elif fmt == "webp":
                 page.screenshot(
-                    path=str(temp_filepath), full_page=bool(full_page), type="png"
+                    path=str(temp_filepath), full_page=bool(full_page), type="png",
+                    timeout=CAPTURE_TIMEOUT_MS,
                 )
 
             else:
                 options: Dict[str, Any] = {
                     "path": str(filepath),
                     "full_page": bool(full_page),
+                    "timeout": CAPTURE_TIMEOUT_MS,
                 }
                 if fmt in ("jpeg", "jpg"):
                     options["type"] = "jpeg"
@@ -891,6 +920,29 @@ class ScreenshotService:
                 else:
                     options["type"] = "png"
                 page.screenshot(**options)
+            
+            # if target_element:
+            #     page.screenshot(path=str(temp_filepath), full_page=True, type="png")
+
+            # elif fmt == "pdf":
+            #     page.pdf(path=str(filepath), format="A4", print_background=True)
+
+            # elif fmt == "webp":
+            #     page.screenshot(
+            #         path=str(temp_filepath), full_page=bool(full_page), type="png"
+            #     )
+
+            # else:
+            #     options: Dict[str, Any] = {
+            #         "path": str(filepath),
+            #         "full_page": bool(full_page),
+            #     }
+            #     if fmt in ("jpeg", "jpg"):
+            #         options["type"] = "jpeg"
+            #         options["quality"] = 90
+            #     else:
+            #         options["type"] = "png"
+            #     page.screenshot(**options)
 
             # ── 10. Pillow crop ───────────────────────────────────────────────
             if target_element and element_bbox is not None:
@@ -1014,14 +1066,42 @@ class ScreenshotService:
                 "element_selector": target_element,
             }
 
+        # except PlaywrightError as e:
+        #     error_msg = str(e)
+        #     logger.error("❌ Playwright error capturing %s: %s", url, error_msg)
+        #     if "Timeout" in error_msg:
+        #         url_hint = url[:50] + "..." if len(url) > 50 else url
+        #         # ✅ UPDATED (Aug 2026): the old message told users to "increase
+        #         # the delay", which added to an already-blown budget and made
+        #         # things worse. The delay is no longer the lever it implied.
+        #         raise ValueError(
+        #             f"The website ({url_hint}) did not respond in time. It may be "
+        #             f"very slow, blocking automated access, or continuously "
+        #             f"loading content. Try again, or capture a more specific page."
+        #         ) from e
+        #     raise ValueError(f"Failed to capture screenshot: {error_msg}") from e
+
         except PlaywrightError as e:
             error_msg = str(e)
-            logger.error("❌ Playwright error capturing %s: %s", url, error_msg)
+            logger.error(
+                "❌ Playwright error during %s for %s: %s",
+                locals().get("phase", "unknown"), url, error_msg,
+            )
             if "Timeout" in error_msg:
                 url_hint = url[:50] + "..." if len(url) > 50 else url
-                # ✅ UPDATED (Aug 2026): the old message told users to "increase
-                # the delay", which added to an already-blown budget and made
-                # things worse. The delay is no longer the lever it implied.
+
+                # ✅ FIX (Aug 2026): distinguish "the site was slow" from "the
+                # render was slow". The old message asserted the former for
+                # both, which was wrong for any large full-page capture and
+                # pointed users at a site that had responded fine.
+                if locals().get("phase") == "capture":
+                    raise ValueError(
+                        "The page loaded, but rendering the image took too long. "
+                        "This usually means a very tall full-page capture. Try "
+                        "unchecking 'Capture full page', reducing the width, or "
+                        "capturing a more specific section with element selection."
+                    ) from e
+
                 raise ValueError(
                     f"The website ({url_hint}) did not respond in time. It may be "
                     f"very slow, blocking automated access, or continuously "
