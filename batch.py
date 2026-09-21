@@ -32,6 +32,16 @@
 #       routers/screenshot.py. BatchSubmitRequest previously allowed width up
 #       to 7680 while the single-capture API documents 3840 as the maximum.
 #
+# ✅ FIX (Sep 2026 — 51 batch jobs accepted against a 50/period limit)
+#   _enforce_tier_limits() checked only URLs-per-batch (TIER_BATCH_LIMITS).
+#   The PERIOD quota — get_tier_limits(tier)["batch_requests"] — was checked
+#   only in screenshot_endpoints.batch_screenshot_endpoint, which never runs
+#   (see the routing note above). Both numbers are 50 on Pro, which is why the
+#   gap went unnoticed: the batch-size check looked like quota enforcement.
+#   The Dashboard was right — 51 jobs really had been accepted.
+#   _enforce_monthly_quota() now checks batch_requests AND screenshots against
+#   the same period-scoped helpers /subscription_status uses.
+#
 # ✅ NEW (Sep 2026 — trimmed captures are reported)
 #   When a page exceeds the capture budget the service trims it instead of
 #   killing Chromium. The item message now says so rather than silently
@@ -65,7 +75,7 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.orm import Session
 
 from auth_deps import get_current_user
-from models import BatchJob, Screenshot, SessionLocal, User, get_db, has_feature
+from models import BatchJob, Screenshot, SessionLocal, User, get_db, get_tier_limits, has_feature
 # ✅ FIX (Sep 2026): SCREENSHOTS_DIR comes from the service, not a local guess.
 from screenshot_service import screenshot_service, get_screenshot_url, SCREENSHOTS_DIR
 from services.storage_service import storage_service
@@ -540,6 +550,87 @@ def _enforce_capture_gates(fmt: str, width: int, user: User) -> None:
         )
 
 
+def _enforce_monthly_quota(urls: List[str], user: User, db: Session) -> None:
+    """
+    ✅ NEW (Sep 2026 — THE 51/50 BUG): enforce the PERIOD quotas.
+
+    Two different limits share the number 50 on the Pro plan, which is what hid
+    this for so long:
+
+        TIER_BATCH_LIMITS[tier]                 URLs allowed in ONE batch
+        get_tier_limits(tier)["batch_requests"] batch jobs allowed per PERIOD
+
+    _enforce_tier_limits() only ever checked the first one. The period quota was
+    checked exclusively in screenshot_endpoints.batch_screenshot_endpoint —
+    which never runs, because this router is registered first and serves
+    POST /api/v1/batch/submit. Result: the Dashboard correctly displayed
+    "51 of 50 · 0 remaining" because 51 jobs really had been accepted.
+
+    Screenshots are checked too. A batch writes one Screenshot row per URL and
+    they count against the same monthly figure the single-capture path
+    enforces, but nothing on this path ever looked at it — a 50-URL batch could
+    walk straight past the screenshot limit as well.
+
+    Both use the same period-scoped helpers as /subscription_status, so the
+    number that blocks a submission is the number the user sees.
+    """
+    from usage_accounting import batch_used_this_period, screenshots_used_this_period
+
+    tier_limits = get_tier_limits(_get_user_tier(user))
+
+    def _as_int(raw):
+        """None for 'unlimited' / unparseable — never block on a config typo."""
+        if raw in ("unlimited", None) or raw == float("inf"):
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError, OverflowError):
+            log.error("Unparseable tier limit %r — allowing batch through", raw)
+            return None
+
+    # ── Batch jobs this period ────────────────────────────────────────────────
+    batch_limit = _as_int(tier_limits.get("batch_requests"))
+    if batch_limit is not None:
+        batch_used = batch_used_this_period(db, user)
+        if batch_used >= batch_limit:
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    f"Batch request limit reached ({batch_used}/{batch_limit}) for "
+                    f"this billing period. Your usage resets at the start of the "
+                    f"next period. Upgrade your plan for a higher limit."
+                ),
+            )
+
+    # ── Screenshots this period ───────────────────────────────────────────────
+    screenshot_limit = _as_int(tier_limits.get("screenshots"))
+    if screenshot_limit is not None:
+        screenshots_used = screenshots_used_this_period(db, user)
+        remaining = screenshot_limit - screenshots_used
+
+        if remaining <= 0:
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    f"Screenshot limit reached ({screenshots_used}/{screenshot_limit}) "
+                    f"for this billing period. Upgrade your plan to continue."
+                ),
+            )
+
+        # Reject up front rather than accepting the job and failing partway
+        # through it — a half-captured batch is worse than a clear refusal.
+        if len(urls) > remaining:
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    f"This batch has {len(urls)} URLs but only {remaining} "
+                    f"screenshot(s) remain in your plan this period "
+                    f"({screenshots_used}/{screenshot_limit} used). Submit "
+                    f"{remaining} or fewer URLs, or upgrade your plan."
+                ),
+            )
+
+
 def _build_and_store_job(
     job_id:          str,
     user_id:         int,
@@ -844,6 +935,8 @@ async def submit_batch(
     # ✅ NEW (Sep 2026): PDF + width gates (this router, not the legacy path,
     # is what actually serves POST /api/v1/batch/submit).
     _enforce_capture_gates(request.format, request.width, current_user)
+    # ✅ NEW (Sep 2026 — the 51/50 bug): period quotas, not just batch size.
+    _enforce_monthly_quota(urls, current_user, db)
 
     job_id = uuid.uuid4().hex[:16]
     job    = _build_and_store_job(
@@ -928,6 +1021,7 @@ async def submit_batch_file(
         )
     _enforce_tier_limits(urls, current_user)
     _enforce_capture_gates(req.format, req.width, current_user)   # ✅ NEW
+    _enforce_monthly_quota(urls, current_user, db)                # ✅ NEW
 
     job_id = uuid.uuid4().hex[:16]
     job    = _build_and_store_job(
@@ -1075,42 +1169,53 @@ async def delete_job(
 # ====== END OF batch.py ========
 
 
-# # backend/routers/batch.py — PixelPerfect Screenshot API
-# # UPDATED: April 2026
+# # backend/batch.py — PixelPerfect Screenshot API
+# # (imported by main.py as `from batch import router as batch_router`)
+# # UPDATED: September 2026
 # #
-# # ✅ All previous fixes retained (R2 upload, DB records, tier limits, etc.)
+# # ============================================================================
+# # ✅ FIX (Sep 2026 — capture-engine errors shown as raw internals)
+# # ============================================================================
+# #   Failed items displayed the raw Playwright/greenlet text, e.g.
+# #   "Cannot switch to a different thread" and "Browser.new_context: Target
+# #   page, context or browser has been closed". Both are SERVER-side failures,
+# #   not problems with the URL being captured, and the UI truncated them to
+# #   nonsense. _friendly_error() now translates both and points at Retry Failed.
 # #
+# #   The underlying faults are fixed in screenshot_service.py (single worker
+# #   thread + browser relaunch + full-page capture budget). This is the
+# #   user-facing half.
+# #
+# # ✅ FIX (Sep 2026 — SCREENSHOTS_DIR pointed one level too high)
+# #   This module lives at backend/batch.py, so
+# #   Path(__file__).resolve().parents[1] resolved to the REPO ROOT, and the
+# #   mkdir() created a stray <repo>/screenshots directory that nothing serves.
+# #   It is now imported from screenshot_service, which is the directory main.py
+# #   actually mounts at /screenshots. One definition, no drift.
+# #
+# # ✅ NEW (Sep 2026 — PDF and width tier gates on the batch path)
+# #   main.py registers this router BEFORE the legacy
+# #   @app.post("/api/v1/batch/submit") wrapper, so FastAPI matches this router
+# #   first and screenshot_endpoints.batch_screenshot_endpoint never runs. Its
+# #   PDF gate therefore never applied to real batch traffic. Gates added here:
+# #     - PDF requires Pro+ (has_feature), matching routers/screenshot.py
+# #     - width is capped per tier, matching TIER_MAX_WIDTH in
+# #       routers/screenshot.py. BatchSubmitRequest previously allowed width up
+# #       to 7680 while the single-capture API documents 3840 as the maximum.
+# #
+# # ✅ NEW (Sep 2026 — trimmed captures are reported)
+# #   When a page exceeds the capture budget the service trims it instead of
+# #   killing Chromium. The item message now says so rather than silently
+# #   returning a shorter image.
+# #
+# # ----------------------------------------------------------------------------
+# # Earlier updates (all retained)
+# # ----------------------------------------------------------------------------
 # # ✅ FIX (Apr 2026 — Persistent batch job storage)
 # # ✅ FIX (Apr 2026 — AttributeError: 'BatchJob' has no attribute 'urls_json')
 # # ✅ FIX (Apr 2026 — User-friendly error messages for invalid URLs)
-# #
-# # ✅ NEW (Apr 2026): dark_mode / delay / remove_elements now supported in batch.
-# #
-# #   Background:
-# #     The single-screenshot endpoint (POST /api/v1/screenshot) gained these
-# #     three capture options in April 2026. The batch endpoints did not — so
-# #     a user calling the single endpoint could hide cookie banners and use
-# #     dark mode, but the same user submitting 50 URLs via batch could not.
-# #     That inconsistency made the product feel half-finished.
-# #
-# #   What's new:
-# #     - BatchSubmitRequest gains 3 optional fields:
-# #         dark_mode        (bool, default False)
-# #         delay            (int 0–10, default None/0)
-# #         remove_elements  (List[str], ≤20 items, each ≤200 chars)
-# #     - submit_batch_file accepts the same fields as Form parameters.
-# #       remove_elements is passed as a comma-separated string in multipart
-# #       forms (matches how the frontend textbox already works).
-# #     - _validate_remove_elements() shared helper silently drops bad entries.
-# #     - Values are stored on the in-memory job dict so retry_failed reuses them.
-# #     - _process_item() passes all three through to screenshot_service.
-# #     - Backward compatible: omitting any field = current behavior (no-op).
-# #
-# #   Design note on retry_failed:
-# #     Previously retry called _process_job_async(..., None) for quality.
-# #     Now it reads the stored job values so a retried batch uses the exact
-# #     same capture options as the original submission. Without this, a user
-# #     who hid banners on submit would see the banners reappear on retry.
+# # ✅ NEW (Apr 2026): dark_mode / delay / remove_elements supported in batch,
+# #    stored on the job dict so retry_failed reuses the original options.
 
 # from __future__ import annotations
 
@@ -1131,16 +1236,14 @@ async def delete_job(
 # from sqlalchemy.orm import Session
 
 # from auth_deps import get_current_user
-# from models import BatchJob, Screenshot, SessionLocal, User, get_db
-# from screenshot_service import screenshot_service, get_screenshot_url
+# from models import BatchJob, Screenshot, SessionLocal, User, get_db, has_feature
+# # ✅ FIX (Sep 2026): SCREENSHOTS_DIR comes from the service, not a local guess.
+# from screenshot_service import screenshot_service, get_screenshot_url, SCREENSHOTS_DIR
 # from services.storage_service import storage_service
 
 # log = logging.getLogger("batch_screenshots")
 
 # router = APIRouter(prefix="/batch", tags=["batch"])
-
-# SCREENSHOTS_DIR = Path(__file__).resolve().parents[1] / "screenshots"
-# SCREENSHOTS_DIR.mkdir(exist_ok=True)
 
 # TIER_BATCH_LIMITS = {
 #     "free":     0,
@@ -1148,6 +1251,16 @@ async def delete_job(
 #     "business": 200,
 #     "premium":  1000,
 # }
+
+# # ✅ NEW (Sep 2026): must match TIER_MAX_WIDTH in routers/screenshot.py.
+# # If you change one, change the other.
+# TIER_MAX_WIDTH = {
+#     "free":     1920,
+#     "pro":      3840,
+#     "business": 3840,
+#     "premium":  3840,
+# }
+# DEFAULT_MAX_WIDTH = 1920
 
 # # In-memory job store — fast path for active/recent jobs.
 # # Jobs not found here are reconstructed from DB (handles restarts).
@@ -1168,17 +1281,36 @@ async def delete_job(
 # _MAX_REMOVE_ELEMENT_SELECTOR = 200
 
 
-# # ── ✅ User-friendly error translation ─────────────────────────────────────────
+# # ── User-friendly error translation ───────────────────────────────────────────
 
 # def _friendly_error(msg: str) -> str:
 #     """
-#     Translate raw Playwright / network error codes into plain English.
-#     Same semantics as ScreenshotPage.js friendlyError() on the frontend.
+#     Translate raw Playwright / network / engine errors into plain English.
+#     Same semantics as friendlyItemError() in BatchJobs.js on the frontend.
 #     """
 #     if not msg:
 #         return "Screenshot capture failed. Please try again."
 
 #     m = msg.lower()
+
+#     # ✅ NEW (Sep 2026): capture-engine failures. These are OUR problem, not the
+#     # listed website's, and saying so stops users from debugging a healthy URL.
+#     if "cannot switch to a different thread" in m:
+#         return (
+#             "Capture engine error (not caused by this website). "
+#             "Use Retry Failed to recapture."
+#         )
+
+#     if any(k in m for k in (
+#         "target page, context or browser has been closed",
+#         "browser has been closed",
+#         "target closed",
+#         "browser has disconnected",
+#     )):
+#         return (
+#             "The capture engine restarted, usually because a page was too large "
+#             "to render at this size. Use Retry Failed to recapture."
+#         )
 
 #     if any(k in m for k in (
 #         "err_name_not_resolved",
@@ -1197,6 +1329,9 @@ async def delete_job(
 #             "The website refused the connection. "
 #             "The server may be down or blocking automated requests."
 #         )
+
+#     if "rendering the image took too long" in m or "rendering the screenshot took longer" in m:
+#         return msg  # already a clear, capture-phase message from the service
 
 #     if any(k in m for k in (
 #         "err_connection_timed_out",
@@ -1237,18 +1372,12 @@ async def delete_job(
 #     return msg
 
 
-# # ── ✅ NEW helper: validate remove_elements consistently with single endpoint ──
+# # ── remove_elements helpers ───────────────────────────────────────────────────
 
 # def _validate_remove_elements(value: Optional[List[str]]) -> Optional[List[str]]:
 #     """
-#     Clean remove_elements list — silently drop bad entries rather than
-#     rejecting the whole request. Matches screenshot_endpoints.py behavior.
-
-#     - None or non-list → None
-#     - Non-string entries → dropped
-#     - Empty strings → dropped
-#     - Each selector capped at _MAX_REMOVE_ELEMENT_SELECTOR chars
-#     - Array capped at _MAX_REMOVE_ELEMENTS_COUNT entries
+#     Clean remove_elements — silently drop bad entries rather than rejecting the
+#     whole request. Matches screenshot_endpoints.py behavior.
 #     """
 #     if value is None or not isinstance(value, list):
 #         return None
@@ -1273,11 +1402,7 @@ async def delete_job(
 #     """
 #     Parse remove_elements from a multipart form field.
 
-#     Multipart forms don't natively support arrays. The convention here
-#     matches how the frontend's text input already works:
 #       ".cookie-banner, #popup, .ads"  →  [".cookie-banner", "#popup", ".ads"]
-
-#     Also accepts a JSON array string for programmatic clients:
 #       '[".cookie-banner", "#popup"]'  →  [".cookie-banner", "#popup"]
 #     """
 #     if not raw:
@@ -1287,7 +1412,6 @@ async def delete_job(
 #     if not stripped:
 #         return None
 
-#     # Try JSON array first (for programmatic clients passing structured data)
 #     if stripped.startswith("["):
 #         try:
 #             parsed = json.loads(stripped)
@@ -1296,7 +1420,6 @@ async def delete_job(
 #         except Exception:
 #             pass  # Fall through to comma-split
 
-#     # Comma-separated (matches frontend textbox behavior)
 #     selectors = [s.strip() for s in stripped.split(",") if s.strip()]
 #     return _validate_remove_elements(selectors)
 
@@ -1307,12 +1430,14 @@ async def delete_job(
 #     urls:     Optional[List[str]] = Field(default=None)
 #     csv_text: Optional[str]       = Field(default=None)
 #     format:   str                 = Field(default="png")
-#     width:    int                 = Field(default=1920, ge=320, le=7680)
-#     height:   int                 = Field(default=1080, ge=240, le=4320)
+#     # ✅ CHANGED (Sep 2026): 7680/4320 → 3840/2160, matching ScreenshotRequest
+#     # in routers/screenshot.py. The old ceiling let a batch request a viewport
+#     # the single-capture API rejects.
+#     width:    int                 = Field(default=1920, ge=320, le=3840)
+#     height:   int                 = Field(default=1080, ge=240, le=2160)
 #     full_page: bool               = Field(default=False)
 #     quality:  Optional[int]       = Field(default=None, ge=1, le=100)
 
-#     # ✅ NEW (Apr 2026): match single-screenshot endpoint capabilities
 #     dark_mode: bool = Field(
 #         default=False,
 #         description="Render with dark color scheme (prefers-color-scheme: dark)",
@@ -1503,8 +1628,7 @@ async def delete_job(
 #         "width":      db_job.width,
 #         "height":     db_job.height,
 #         "full_page":  db_job.full_page,
-#         # ✅ NEW: reconstructed jobs default these to safe values.
-#         # Retry_failed will use whatever is stored here.
+#         # Reconstructed jobs default these — retry_failed uses whatever is here.
 #         "dark_mode":       False,
 #         "delay":           None,
 #         "remove_elements": None,
@@ -1539,10 +1663,6 @@ async def delete_job(
 
 # def _job_to_out(job: Dict[str, Any]) -> BatchJobOut:
 #     # Strip internal fields that aren't part of the public BatchJobOut schema.
-#     # We also strip the new options (dark_mode/delay/remove_elements) here
-#     # because they're stored for internal retry_failed re-use but aren't
-#     # exposed on the job response model. They will be added to the response
-#     # once the frontend starts displaying them per-job.
 #     _INTERNAL_KEYS = {
 #         "user_id", "_from_db",
 #         "width", "height", "full_page",
@@ -1568,6 +1688,29 @@ async def delete_job(
 #         )
 
 
+# # ✅ NEW (Sep 2026): format and width gates, matching routers/screenshot.py.
+# def _enforce_capture_gates(fmt: str, width: int, user: User) -> None:
+#     if (fmt or "").lower() == "pdf" and not has_feature(user, "pdf"):
+#         raise HTTPException(
+#             status_code=403,
+#             detail="PDF generation requires Pro tier or higher. Please upgrade.",
+#         )
+
+#     max_width = TIER_MAX_WIDTH.get(_get_user_tier(user), DEFAULT_MAX_WIDTH)
+#     if int(width) > max_width:
+#         raise HTTPException(
+#             status_code=400,
+#             detail=(
+#                 f"Width {width}px exceeds the {max_width}px limit for your plan. "
+#                 + (
+#                     "Upgrade to Pro or higher for widths up to 3840px."
+#                     if max_width < 3840
+#                     else "The maximum supported width is 3840px."
+#                 )
+#             ),
+#         )
+
+
 # def _build_and_store_job(
 #     job_id:          str,
 #     user_id:         int,
@@ -1578,9 +1721,9 @@ async def delete_job(
 #     full_page:       bool,
 #     db:              Session,
 #     *,
-#     dark_mode:       bool               = False,                # ✅ NEW
-#     delay:           Optional[int]      = None,                 # ✅ NEW
-#     remove_elements: Optional[List[str]] = None,                # ✅ NEW
+#     dark_mode:       bool               = False,
+#     delay:           Optional[int]      = None,
+#     remove_elements: Optional[List[str]] = None,
 # ) -> Dict[str, Any]:
 #     now    = datetime.utcnow().isoformat()
 #     items  = [_create_initial_item(i, url) for i, url in enumerate(urls)]
@@ -1595,7 +1738,7 @@ async def delete_job(
 #         "width":           width,
 #         "height":          height,
 #         "full_page":       full_page,
-#         # ✅ NEW: stored on the job dict so retry_failed reuses the same options.
+#         # Stored on the job dict so retry_failed reuses the same options.
 #         "dark_mode":       bool(dark_mode),
 #         "delay":           delay,
 #         "remove_elements": remove_elements,
@@ -1649,9 +1792,9 @@ async def delete_job(
 #     user:            User,
 #     db:              Session,
 #     *,
-#     dark_mode:       bool                  = False,             # ✅ NEW
-#     delay:           Optional[int]         = None,              # ✅ NEW
-#     remove_elements: Optional[List[str]]   = None,              # ✅ NEW
+#     dark_mode:       bool                  = False,
+#     delay:           Optional[int]         = None,
+#     remove_elements: Optional[List[str]]   = None,
 # ) -> Dict[str, Any]:
 #     url     = item["url"]
 #     started = time.time()
@@ -1666,9 +1809,9 @@ async def delete_job(
 #             height=height,
 #             format=fmt,
 #             full_page=full_page,
-#             dark_mode=dark_mode,                 # ✅ NEW
-#             delay=delay,                         # ✅ NEW
-#             remove_elements=remove_elements,     # ✅ NEW
+#             dark_mode=dark_mode,
+#             delay=delay,
+#             remove_elements=remove_elements,
 #         )
 
 #         if not result:
@@ -1706,8 +1849,21 @@ async def delete_job(
 
 #         processing_time = round(time.time() - started, 2)
 
+#         # ✅ NEW (Sep 2026): say so when the capture was trimmed to fit the
+#         # capture budget, instead of returning a short image with no
+#         # explanation.
+#         if result.get("truncated"):
+#             doc_h = result.get("document_height") or 0
+#             message = (
+#                 f"Captured — page was {doc_h}px tall and was trimmed to fit the "
+#                 f"capture limit. Reduce the width or turn off full page for the "
+#                 f"whole page."
+#             )
+#         else:
+#             message = "Screenshot captured successfully"
+
 #         item["status"]          = "completed"
-#         item["message"]         = "Screenshot captured successfully"
+#         item["message"]         = message
 #         item["screenshot_url"]  = screenshot_url
 #         item["file_size"]       = file_size
 #         item["processing_time"] = processing_time
@@ -1720,8 +1876,8 @@ async def delete_job(
 #                 screenshot_path=str(screenshot_path or ""),
 #                 storage_url=screenshot_url,
 #                 format=fmt,
-#                 width=width,
-#                 height=height,
+#                 width=int(result.get("width")  or width),
+#                 height=int(result.get("height") or height),
 #                 full_page=full_page,
 #                 size_bytes=file_size,
 #                 processing_time_ms=processing_time * 1000,
@@ -1769,9 +1925,9 @@ async def delete_job(
 #     full_page:       bool,
 #     quality:         Optional[int],
 #     *,
-#     dark_mode:       bool                  = False,             # ✅ NEW
-#     delay:           Optional[int]         = None,              # ✅ NEW
-#     remove_elements: Optional[List[str]]   = None,              # ✅ NEW
+#     dark_mode:       bool                  = False,
+#     delay:           Optional[int]         = None,
+#     remove_elements: Optional[List[str]]   = None,
 # ) -> None:
 #     job = JOBS.get(job_id)
 #     if not job:
@@ -1856,13 +2012,17 @@ async def delete_job(
 #     if not urls:
 #         raise HTTPException(status_code=400, detail="No valid URLs found in request")
 #     _enforce_tier_limits(urls, current_user)
+#     # ✅ NEW (Sep 2026): PDF + width gates (this router, not the legacy path,
+#     # is what actually serves POST /api/v1/batch/submit).
+#     _enforce_capture_gates(request.format, request.width, current_user)
+
 #     job_id = uuid.uuid4().hex[:16]
 #     job    = _build_and_store_job(
 #         job_id, current_user.id, urls,
 #         request.format, request.width, request.height, request.full_page, db,
-#         dark_mode=request.dark_mode,              # ✅ NEW
-#         delay=request.delay,                      # ✅ NEW
-#         remove_elements=request.remove_elements,  # ✅ NEW
+#         dark_mode=request.dark_mode,
+#         delay=request.delay,
+#         remove_elements=request.remove_elements,
 #     )
 #     log.info(
 #         "📸 Created batch job %s with %s URLs for user %s (dark=%s delay=%s remove=%d)",
@@ -1891,7 +2051,6 @@ async def delete_job(
 #     height:          int              = Form(default=1080),
 #     full_page:       bool             = Form(default=False),
 #     quality:         Optional[int]    = Form(default=None),
-#     # ✅ NEW (Apr 2026): match single-screenshot endpoint capabilities
 #     dark_mode:       bool             = Form(default=False),
 #     delay:           Optional[int]    = Form(default=None),
 #     remove_elements: Optional[str]    = Form(
@@ -1916,7 +2075,6 @@ async def delete_job(
 #     except Exception as exc:
 #         raise HTTPException(status_code=400, detail=f"Failed to read file: {exc}")
 
-#     # ✅ Parse remove_elements from form string → list
 #     parsed_remove = _parse_remove_elements_form(remove_elements)
 
 #     # Validate delay range manually since Form() doesn't support ge/le
@@ -1940,10 +2098,12 @@ async def delete_job(
 #             status_code=400, detail="No valid URLs found in uploaded file",
 #         )
 #     _enforce_tier_limits(urls, current_user)
+#     _enforce_capture_gates(req.format, req.width, current_user)   # ✅ NEW
+
 #     job_id = uuid.uuid4().hex[:16]
 #     job    = _build_and_store_job(
 #         job_id, current_user.id, urls,
-#         format, width, height, full_page, db,
+#         req.format, req.width, req.height, req.full_page, db,
 #         dark_mode=dark_mode,
 #         delay=delay,
 #         remove_elements=parsed_remove,
@@ -1956,7 +2116,7 @@ async def delete_job(
 #     bg.add_task(
 #         _process_job_async,
 #         job_id, current_user.id,
-#         format, width, height, full_page, quality,
+#         req.format, req.width, req.height, req.full_page, quality,
 #         dark_mode=dark_mode,
 #         delay=delay,
 #         remove_elements=parsed_remove,
@@ -2018,9 +2178,8 @@ async def delete_job(
 #     if changed:
 #         job.update(_calc_counts(job["items"]))
 #         job["status"] = "queued"
-#         # ✅ FIX (Apr 2026): pass stored capture options so retried items
-#         # use the same settings as the original submission. Previously
-#         # dark_mode / delay / remove_elements would have been lost on retry.
+#         # Pass the stored capture options so retried items use the same
+#         # settings as the original submission.
 #         bg.add_task(
 #             _process_job_async,
 #             job_id, current_user.id,
