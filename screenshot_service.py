@@ -12,7 +12,8 @@
 # A fix applied to one is NOT applied to the other. RULE: patch BOTH, or
 # neither. Never one.
 #
-# ⚠️ THE SEP 2026 FIXES BELOW ARE NOT YET APPLIED TO services/screenshot_service.py.
+# ✅ Sep 2026: every fix below is applied to BOTH modules. If you change one,
+#    change the other in the same commit.
 
 # ============================================================================
 # SCREENSHOT SERVICE - PixelPerfect API (PRODUCTION READY)
