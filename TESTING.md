@@ -74,7 +74,7 @@ All of these were reproduced against the current code. Each automated one has a 
 | F-02 | **High** | `POST /api/v1/batch/submit/` (trailing slash) is served by the old wrapper in `main.py`. It does no screenshot-quota check, writes no `BatchJob` row (so the batch count is never used up) and runs up to 50 captures inside one request. | `main.py:1430` |
 | F-03 | **High** | SSRF. Capture URLs, batch URLs and `webhook_url` accept `127.0.0.1`, `localhost`, `169.254.169.254`, `10.x`, `192.168.x` and `[::1]`, and the internal page comes back as an image. A real fix must also block hostnames that resolve to private IPs, redirects to them and sub-requests, so the check belongs inside the browser (`page.route`), not only on the input URL. | `routers/screenshot.py`, `batch.py`, both services |
 | F-15 | **High** | Stripe sync **adopts any Stripe customer with the same email**, and emails are never verified. Registering with someone's email and calling `/subscription_status?sync=1` can hand over their paid subscription and open the billing portal on their card. Fix: adopt only when `customer.metadata.app_user_id` matches (`ensure_stripe_customer_for_user` already writes it). | `subscription_sync.py:445, 470` |
-| F-16 | **High** | Account deletion cancels only `active` subscriptions (`trialing` and `past_due` keep billing). It skips Stripe entirely when the local tier says free, even if Stripe still has a live subscription. | `main.py:1193` |
+| F-16 | ~~High~~ **Fixed** | **Fixed in the billing-safe deletion release (Oct 2026).** Deletion used to cancel only `active` subscriptions, and skipped Stripe when the local tier said free. It now cancels every subscription that can still bill, whatever the local tier says. | `main.py` `_cancel_all_billing` |
 | F-17 | **High** | An API key alone can change the account email, then reset the password: a full takeover. It can also delete the account. API keys end up in CI systems and logs, so account-level actions should need the JWT plus the password. | `main.py:1113, 1183` |
 | F-05 | Med | A password-reset link can be reused within its hour, and still works after the password has changed. | `main.py:1064` |
 | F-06 | Med | Tokens are keyed on the username. After a rename or account deletion, an old token logs in as whoever takes the name next, and tokens survive a password change for 24 h. Fix: put the user id (and a token version) in the JWT. | `auth_deps.py`, `main.py:524` |
@@ -103,10 +103,17 @@ Reported by the review but not pinned as tests (design or infrastructure):
 - The in-memory `JOBS` dict never shrinks.
 - The main cancel path returns `cancel_at: null` on new Stripe API versions, because the period end now lives on the subscription item.
 
-## Decisions for you
+## Decisions made
 
-1. **Deleting an account when Stripe is unreachable.** Today erasure wins: the account is deleted anyway and a subscription may keep billing. `test_stripe_failure_does_not_block_erasure` pins that choice. The alternative is to refuse with a "try again" until Stripe confirms the cancellation.
-2. **Order of fixes.** F-01 and F-14 must ship together: a single worker thread with no evaluate timeouts turns one hostile page into a full outage. F-01 also makes captures run one at a time, so the per-tier concurrency numbers become queue positions, not parallel work.
+1. **Deleting an account when Stripe is unreachable** (decided Oct 2026): **refuse until Stripe confirms.**
+   - Before any data is deleted, every subscription that can still bill (active, trialing, past_due, unpaid, incomplete, paused) is cancelled. This covers the stored Stripe customer and any other customer tagged with this account's id (`metadata.app_user_id`). A customer that merely shares the email is never touched, because emails are not verified.
+   - Stripe unreachable (outage, timeout, rate limit) → **503** "your account was not deleted, try again in a minute". The account stays intact, and retrying is safe.
+   - Stripe unusable from the server (missing, mistyped or revoked key) → **503** "problem on our side", logged as CRITICAL, with no invitation to retry.
+   - A customer that no longer exists in Stripe has nothing to bill, so the deletion proceeds.
+   - Stripe is called off the event loop, so a slow Stripe never freezes other requests.
+   - Pinned by `tests/suite/api/test_account_deletion.py` and mutations M19, M33, M35–M37 and M43–M46.
+   - Not covered: open invoices on cancelled `past_due` subscriptions are not voided, and the Stripe customer itself is kept (deleting it would also stop a checkout completed in another tab after deletion, but would remove the customer record from Stripe). Those are product decisions for a later release.
+2. **Order of fixes:** F-01 and F-14 ship together, in the capture-engine release. A single worker thread with no evaluate timeouts would turn one hostile page into a full outage.
 
 ## Limits of this suite
 

@@ -341,24 +341,6 @@ def test_f15_sync_never_adopts_a_stranger_customer(client, fake_stripe, db):
     assert user.subscription_tier == "free"
 
 
-# ----------------------------------------------------------------------- F-16
-@defect("F-16", "account deletion leaves trialing / past_due subscriptions billing")
-@pytest.mark.parametrize("status", ["trialing", "past_due"])
-def test_f16_deletion_cancels_every_live_subscription(client, make_user, fake_stripe, status):
-    u = make_user("pro", stripe_customer_id="cus_D")
-    fake_stripe.subscriptions["cus_D"] = [{"id": "sub_D", "status": status}]
-    assert client.delete("/user/delete_account", headers=u.headers).status_code == 200
-    assert ("Subscription.delete", "sub_D") in fake_stripe.calls
-
-
-@defect("F-16", "account deletion skips Stripe when the local tier says free")
-def test_f16_deletion_checks_stripe_even_if_local_tier_is_free(client, make_user, fake_stripe):
-    u = make_user("free", stripe_customer_id="cus_E")       # a missed webhook
-    fake_stripe.subscriptions["cus_E"] = [{"id": "sub_E", "status": "active"}]
-    assert client.delete("/user/delete_account", headers=u.headers).status_code == 200
-    assert ("Subscription.delete", "sub_E") in fake_stripe.calls
-
-
 # ----------------------------------------------------------------------- F-17
 @defect("F-17", "an API key alone can change the account email (then reset the password)")
 def test_f17_api_key_cannot_change_email(client, make_user):

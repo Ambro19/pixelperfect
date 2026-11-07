@@ -65,7 +65,7 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, Any, AsyncGenerator
+from typing import Optional, Dict, Any, AsyncGenerator, List
 
 from dotenv import load_dotenv, find_dotenv
 load_dotenv()
@@ -78,6 +78,7 @@ from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.responses import ORJSONResponse, HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.concurrency import run_in_threadpool
 from starlette.types import ASGIApp
 
 from sqlalchemy.orm import Session
@@ -1175,6 +1176,96 @@ async def update_profile_endpoint(
             detail="Failed to update profile. Please try again.",
         )
 
+# Stripe subscription statuses that are finished and can never bill again.
+# Everything else (active, trialing, past_due, unpaid, incomplete, paused)
+# is cancelled before an account is deleted.
+_STRIPE_FINISHED_STATUSES = {"canceled", "incomplete_expired"}
+
+
+class BillingConfigError(RuntimeError):
+    """Stripe cannot be used from this server (missing, mistyped or revoked
+    key). Not a passing outage: retrying will not help until it is fixed."""
+
+
+def _stripe_error_kind(e: Exception) -> str:
+    """Classify a Stripe exception without importing stripe's error classes."""
+    name = type(e).__name__
+    if name in ("AuthenticationError", "PermissionError"):
+        return "config"
+    if getattr(e, "code", None) == "resource_missing":
+        return "missing"
+    return "transient"
+
+
+def _customers_owned_by(user: User) -> List[str]:
+    """
+    Every Stripe customer that provably belongs to this account:
+      - the stored stripe_customer_id, and
+      - any customer with the same email whose metadata.app_user_id is this
+        user's id (duplicates happen: see subscription_sync step 3).
+    A customer that merely shares the email is NOT included: emails are not
+    verified, so a stranger could register with someone else's address.
+    """
+    ids: List[str] = []
+    stored = (getattr(user, "stripe_customer_id", None) or "").strip()
+    if stored:
+        ids.append(stored)
+    email = (getattr(user, "email", None) or "").strip().lower()
+    if email:
+        for cust in stripe.Customer.list(email=email, limit=100).auto_paging_iter():
+            cid = cust.get("id")
+            meta = cust.get("metadata") or {}
+            if cid and cid not in ids and str(meta.get("app_user_id") or "") == str(user.id):
+                ids.append(cid)
+    return ids
+
+
+def _cancel_all_billing(user: User) -> int:
+    """
+    Cancel, immediately, every Stripe subscription that could still bill this
+    account, on every customer it owns. Returns how many were cancelled.
+
+    Blocking (Stripe's client is synchronous): call it via run_in_threadpool.
+
+    Raises BillingConfigError when Stripe is not usable from this server, and
+    re-raises any other Stripe/network error, so the caller can refuse the
+    deletion instead of deleting an account that is still being billed.
+    A customer that no longer exists in Stripe has nothing to bill and is
+    skipped (otherwise such a user could never delete their account).
+
+    Time: one customer search, plus one list call per customer and one
+    cancel call per live subscription.
+    """
+    if not stripe or not os.getenv("STRIPE_SECRET_KEY"):
+        raise BillingConfigError("Stripe is not configured on this server")
+    try:
+        cancelled = 0
+        for customer_id in _customers_owned_by(user):
+            try:
+                subscriptions = stripe.Subscription.list(
+                    customer=customer_id, status="all", limit=100
+                )
+                for sub in subscriptions.auto_paging_iter():
+                    status = (sub.get("status") or "").lower()
+                    if status in _STRIPE_FINISHED_STATUSES:
+                        continue
+                    stripe.Subscription.delete(sub["id"])
+                    cancelled += 1
+                    logger.info("✅ Cancelled Stripe subscription %s (was %s)", sub["id"], status)
+            except Exception as e:
+                if _stripe_error_kind(e) == "missing":
+                    logger.warning(
+                        "Stripe customer %s no longer exists — nothing to bill there", customer_id
+                    )
+                    continue
+                raise
+        return cancelled
+    except Exception as e:
+        if _stripe_error_kind(e) == "config":
+            raise BillingConfigError(str(e)) from e
+        raise
+
+
 # =====================================================================
 # DELETE /user/delete_account (v8)
 # Permanently deletes the user's account and all associated data.
@@ -1189,20 +1280,57 @@ async def delete_account_endpoint(
     user_tier = (getattr(current_user, "subscription_tier", "free") or "free").lower()
     logger.info("🗑️ Account deletion requested for user %s (tier=%s)", user_id, user_tier)
 
-    # 1. Cancel active Stripe subscription immediately (non-fatal)
-    if stripe and getattr(current_user, "stripe_customer_id", None) and user_tier != "free":
+    # 1. Cancel every Stripe subscription that could still bill (REQUIRED)
+    #
+    # ✅ FIX (Oct 2026 — F-16 + billing-safe deletion decision):
+    #   Previously this step was "non-fatal" and only looked at status=active,
+    #   and only when the LOCAL tier was paid. Three ways that left a deleted
+    #   user being charged with no account left to cancel from:
+    #     - trialing / past_due / unpaid subscriptions were never cancelled;
+    #     - a missed webhook left the local tier at "free" while Stripe still
+    #       billed, so Stripe was never asked;
+    #     - any Stripe error (outage, timeout, rate limit, missing or rotated
+    #       STRIPE_SECRET_KEY) was logged and the deletion went ahead anyway.
+    #   Decision: billing must be confirmed cancelled BEFORE any data is
+    #   deleted. If Stripe cannot confirm, we refuse with 503 and delete
+    #   nothing; the user simply tries again. Retrying is safe: subscriptions
+    #   already cancelled on a previous attempt are skipped.
+    has_customer = bool((getattr(current_user, "stripe_customer_id", None) or "").strip())
+    stripe_ready = bool(stripe and os.getenv("STRIPE_SECRET_KEY"))
+    if has_customer or stripe_ready:
         try:
-            subscriptions = stripe.Subscription.list(
-                customer=current_user.stripe_customer_id,
-                status="active",
-                limit=5,
+            # Off the event loop: a slow Stripe call must not freeze the API.
+            cancelled = await run_in_threadpool(_cancel_all_billing, current_user)
+            logger.info(
+                "✅ Billing cleared for user %s before deletion (%d subscription(s) cancelled)",
+                user_id, cancelled,
             )
-            for sub in subscriptions.auto_paging_iter():
-                stripe.Subscription.delete(sub["id"])
-                logger.info("✅ Cancelled Stripe subscription %s for deleted user %s", sub["id"], user_id)
+        except BillingConfigError as e:
+            logger.critical(
+                "🚨 Account deletion REFUSED for user %s: Stripe is not usable from this "
+                "server (%s). Check STRIPE_SECRET_KEY on Render.", user_id, e,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Account deletion is temporarily unavailable because of a problem on "
+                    "our side. Your account was not deleted. Please try again later or "
+                    "contact support at onetechly@gmail.com."
+                ),
+            )
         except Exception as e:
-            logger.warning(
-                "⚠️ Stripe subscription cancel failed during account deletion (non-fatal): %s", e
+            logger.error(
+                "❌ Account deletion REFUSED for user %s: could not confirm Stripe "
+                "cancellation: %s", user_id, e,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "We couldn't reach our billing provider to cancel your subscription, "
+                    "so your account was not deleted. Please try again in a minute. If "
+                    "this keeps happening, contact support at onetechly@gmail.com."
+                ),
+                headers={"Retry-After": "60"},
             )
 
     # 2. Delete screenshots from file system (non-fatal per file)

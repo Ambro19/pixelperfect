@@ -271,10 +271,27 @@ class StripeObj(dict):
             raise AttributeError(item) from e
 
     def auto_paging_iter(self):
-        return iter(self.get("data") or [])
+        # Like the real library: walks EVERY page, not just the first one.
+        return iter(self.get("_all", self.get("data")) or [])
 
 
 class FakeStripeError(Exception):
+    """Base Stripe error. `code` mirrors the real errors (e.g. resource_missing)."""
+
+    def __init__(self, message="", code=None):
+        super().__init__(message)
+        self.code = code
+
+
+class InvalidRequestError(FakeStripeError):
+    pass
+
+
+class AuthenticationError(FakeStripeError):
+    pass
+
+
+class RateLimitError(FakeStripeError):
     pass
 
 
@@ -292,6 +309,8 @@ class FakeStripe:
         self.subscriptions: Dict[str, List[Dict[str, Any]]] = {}
         self.fail_subscription_list = False
         self.fail_customer_list = False
+        self.missing_customers: set = set()        # "No such customer" like Stripe
+        self.auth_error = False                    # mistyped / revoked secret key
         self.webhook_event: Optional[Dict[str, Any]] = None
         self.webhook_raises: Optional[Exception] = None
         self.products: Dict[str, Dict[str, Any]] = {}
@@ -299,7 +318,9 @@ class FakeStripe:
         outer = self
 
         class _error:
-            InvalidRequestError = FakeStripeError
+            InvalidRequestError = InvalidRequestError
+            AuthenticationError = AuthenticationError
+            RateLimitError = RateLimitError
             StripeError = FakeStripeError
 
         self.error = _error
@@ -308,11 +329,12 @@ class FakeStripe:
             @staticmethod
             def list(email=None, limit=10):
                 outer.calls.append(("Customer.list", email))
+                outer._check_auth()
                 if outer.fail_customer_list:
                     raise FakeStripeError("customer list down")
                 data = [StripeObj(c) for c in outer.customers
                         if email is None or c.get("email") == email]
-                return StripeObj(data=data[:limit])
+                return StripeObj(data=data[:limit], _all=data)
 
             @staticmethod
             def create(**kw):
@@ -330,15 +352,20 @@ class FakeStripe:
             @staticmethod
             def list(customer=None, status=None, limit=5, expand=None):
                 outer.calls.append(("Subscription.list", customer, status))
+                outer._check_auth()
                 if outer.fail_subscription_list:
                     raise FakeStripeError("subscription list down")
+                if customer in outer.missing_customers:
+                    raise InvalidRequestError(f"No such customer: '{customer}'",
+                                              code="resource_missing")
                 subs = outer.subscriptions.get(customer, [])
                 if status and status != "all":
                     subs = [s for s in subs if s.get("status") == status]
                 elif status is None:
                     # Real Stripe omits canceled subscriptions unless asked.
                     subs = [s for s in subs if s.get("status") != "canceled"]
-                return StripeObj(data=[StripeObj(s) for s in subs[:limit]])
+                every = [StripeObj(s) for s in subs]
+                return StripeObj(data=every[:limit], _all=every)
 
             @staticmethod
             def modify(sid, **kw):
@@ -353,6 +380,10 @@ class FakeStripe:
             @staticmethod
             def delete(sid):
                 outer.calls.append(("Subscription.delete", sid))
+                for subs in outer.subscriptions.values():   # really cancel it
+                    for s in subs:
+                        if s["id"] == sid:
+                            s["status"] = "canceled"
                 return StripeObj(id=sid, status="canceled")
 
         class Product:
@@ -390,6 +421,9 @@ class FakeStripe:
                 return outer.webhook_event
 
         self.Customer = Customer
+        self._check_auth = lambda: (_ for _ in ()).throw(
+            AuthenticationError("Invalid API Key provided: sk_live_****abcd")
+        ) if self.auth_error else None
         self.Subscription = Subscription
         self.Product = Product
         self.Price = Price
