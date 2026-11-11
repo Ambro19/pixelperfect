@@ -99,13 +99,24 @@ def test_calc_counts_treats_cancelled_as_failed():
 @pytest.mark.parametrize("raw", [
     "Cannot switch to a different thread",
     "Browser.new_context: Target page, context or browser has been closed",
+    "Capture abandoned: the capture engine was restarted.",
+    "Page.goto: Connection closed while reading from the driver",
+    "The capture engine is busy: this capture waited 300 seconds without starting.",
 ])
 def test_engine_errors_are_not_shown_raw(raw):
     msg = batch._friendly_error(raw)
     assert "greenlet" not in msg.lower()
     assert msg != raw
+    assert "Retry Failed" in msg
 
 
 def test_friendly_error_never_empty():
     assert batch._friendly_error("")
     assert batch._friendly_error("something nobody anticipated")
+
+
+def test_page_timeout_is_explained_without_blaming_the_engine():
+    msg = batch._friendly_error("The page did not finish rendering within 180 seconds, so "
+                                "the capture was stopped.")
+    assert "did not finish rendering in time" in msg
+    assert "Retry Failed" not in msg

@@ -95,6 +95,24 @@ from concurrent.futures import ThreadPoolExecutor
 
 from playwright.sync_api import sync_playwright, Browser, Error as PlaywrightError
 
+# ✅ NEW (Oct 2026 — F-14): shared time limits for page scripts and captures.
+from services.capture_guard import (
+    CAPTURE_HARD_TIMEOUT_S,
+    CUSTOM_JS_RUNNER,
+    PRISTINE_TIMERS_JS,
+    SCRIPT_TIMEOUT_MS,
+    CUSTOM_JS_TIMEOUT_MS,
+    CaptureTimeout,
+    EngineBusy,
+    Guarded,
+    JobClock,
+    timed_job,
+    wait_with_limits,
+    bounded_js,
+    forget_dead_driver,
+    kill_driver,
+)
+
 logger = logging.getLogger("pixelperfect")
 
 # ----------------------------------------------------------------------------
@@ -169,17 +187,18 @@ _TRACKER_PATTERNS = (
 
 _LAZY_SCROLL_JS = """
 async () => {
+  const T = window.__ppTimers || window;   // timers the page cannot replace
   await new Promise((resolve) => {
     let total = 0;
     const step = Math.max(200, Math.floor(window.innerHeight * 0.85));
-    const timer = setInterval(() => {
+    const timer = T.setInterval(() => {
       const height = document.body.scrollHeight;
       window.scrollBy(0, step);
       total += step;
       // Stop at the bottom, or after 50 steps as a hard guard against
       // infinite-scroll pages that grow faster than we scroll.
       if (total >= height || total > step * 50) {
-        clearInterval(timer);
+        T.clearInterval(timer);
         window.scrollTo(0, 0);
         resolve();
       }
@@ -229,7 +248,15 @@ except Exception:
     SUPPORTED_FORMATS = ["png", "jpeg", "jpg", "pdf"]
     logger.warning("⚠️ Pillow not available - WebP format disabled")
 
-_executor  = ThreadPoolExecutor(max_workers=3, thread_name_prefix="playwright")
+# ✅ FIX (Oct 2026 — F-01): ONE worker thread, as in the root
+# screenshot_service.py since Sep 2026. Playwright's sync API is thread-affine:
+# the browser belongs to the thread that launched it, and with 3 workers about
+# two in three captures landed on a foreign thread and failed with
+# "Cannot switch to a different thread". Captures were already serialised in
+# practice (one shared browser), so this costs no real throughput. The per-tier
+# concurrency limits in main.py still cap how many requests a user may have
+# waiting.
+_executor  = ThreadPoolExecutor(max_workers=1, thread_name_prefix="playwright")
 _init_lock = threading.Lock()
 
 logger.info(
@@ -336,6 +363,13 @@ class ScreenshotService:
         self.playwright = None
         self._initialized = False
         self._init_error: Optional[str] = None
+        # ✅ NEW (Oct 2026 — F-14): set when a stuck capture forced the driver
+        # down; the next initialize() starts a fresh Playwright + browser.
+        self._needs_restart = False
+        # Bumped on every forced restart; captures compare it (see Guarded).
+        self._epoch = 0
+        # Set if a stuck capture could not be killed (see _force_restart).
+        self._wedged = False
 
     def is_ready(self) -> bool:
         return bool(self._initialized and self.browser and not self._init_error)
@@ -386,15 +420,30 @@ class ScreenshotService:
             with _init_lock:
                 if self.is_ready():
                     return
+                if self._needs_restart:
+                    self._sync_restart()
+                    return
                 self._sync_initialize()
                 self._initialized = True
                 self._init_error = None
 
         try:
-            await loop.run_in_executor(_executor, guarded_init)
+            # ✅ CHANGED (Oct 2026 — F-14): time-limited like a capture, so a
+            # request never waits forever behind a stuck engine.
+            clock  = JobClock()
+            future = loop.run_in_executor(_executor, timed_job(clock, guarded_init))
+            await wait_with_limits(future, clock, CAPTURE_HARD_TIMEOUT_S,
+                                   self._force_restart, "engine start")
             logger.info("✅ Playwright browser initialized (services, sync mode)")
+        except (CaptureTimeout, EngineBusy):
+            raise
         except Exception as e:
             msg = _friendly_playwright_init_error(e)
+            if self._needs_restart:
+                # A restart after a forced stop failed (e.g. Chromium could not
+                # launch for a moment). Not permanent: the next request retries.
+                logger.error("❌ Capture engine restart failed, will retry: %s", msg)
+                raise RuntimeError(msg) from e
             self._init_error = msg
             self._initialized = False
             logger.error("❌ Failed to initialize Playwright: %s", msg)
@@ -430,6 +479,17 @@ class ScreenshotService:
             logger.info("🔒 Playwright browser closed (services)")
         except Exception:
             logger.exception("❌ Failed while closing Playwright (non-fatal)")
+
+    def _sync_restart(self) -> None:
+        """Start a fresh Playwright + browser after a forced stop. Worker
+        thread only. The dead instance is dropped, never called."""
+        logger.warning("♻️ Restarting the capture engine after a forced stop")
+        self.browser, self.playwright = None, None
+        forget_dead_driver()
+        self._sync_initialize()
+        self._needs_restart = False      # only once the new engine is up
+        self._initialized = True
+        self._init_error = None
 
     def _sync_close(self) -> None:
         try:
@@ -504,6 +564,8 @@ class ScreenshotService:
                 "Element selection requires Pillow. Install with: pip install Pillow."
             )
 
+        if self._wedged:
+            raise EngineBusy(0, wedged=True)
         if not self.is_ready():
             await self.initialize()
 
@@ -524,9 +586,14 @@ class ScreenshotService:
 
         # NOTE: wait_until / timeout are deliberately NOT forwarded — the
         # worker no longer accepts them.
-        return await loop.run_in_executor(
+        #
+        # ✅ NEW (Oct 2026 — F-14): hard time limit. If the page traps the
+        # worker thread (e.g. a synchronous infinite loop), stop waiting,
+        # kill the driver so the thread is freed, and restart next time.
+        clock  = JobClock()
+        future = loop.run_in_executor(
             _executor,
-            self._sync_capture_screenshot,
+            timed_job(clock, self._sync_capture_screenshot),
             url,
             width,
             height,
@@ -540,6 +607,22 @@ class ScreenshotService:
             wait_for_selector,
             target_element,
         )
+        return await wait_with_limits(
+            future, clock, CAPTURE_HARD_TIMEOUT_S, self._force_restart, f"capture of {url}"
+        )
+
+    def _force_restart(self, reason: str) -> None:
+        """Called from the event loop when a capture is stuck. Thread-safe."""
+        logger.error("⛔ Capture engine stuck (%s) — forcing a restart", reason)
+        # Order matters: _needs_restart BEFORE _epoch, so a capture freed by the
+        # epoch change can never start on the browser that is about to die.
+        self._needs_restart = True
+        self._initialized = False
+        self._epoch += 1
+        if self.playwright is not None and not kill_driver(self.playwright):
+            # The worker thread cannot be freed. Fail fast from now on rather
+            # than queue requests behind it (EngineBusy -> 503).
+            self._wedged = True
 
     # ── Synchronous Playwright worker ────────────────────────────────────────
 
@@ -577,6 +660,12 @@ class ScreenshotService:
          11. WebP re-encode (non-element pipeline)
          12. size validation, dimension probe, temp cleanup
         """
+        # ✅ NEW (Oct 2026 — F-14): a forced restart happened while this
+        # capture was queued — start the fresh engine here, on this thread.
+        if self._needs_restart:
+            self._sync_restart()
+        epoch = self._epoch
+
         if not self.browser:
             raise RuntimeError("Playwright browser is not initialized")
 
@@ -669,8 +758,19 @@ class ScreenshotService:
                 ),
             }
 
-        context = self.browser.new_context(**context_kwargs)
-        page    = context.new_page()
+        if custom_js:
+            # Lets CUSTOM_JS_RUNNER evaluate the customer's code on pages whose
+            # Content-Security-Policy forbids eval (page.evaluate did not need it).
+            context_kwargs["bypass_csp"] = True
+
+        # ✅ NEW (Oct 2026 — F-14): every browser call of this capture goes
+        # through Guarded, so a capture abandoned by the time limit stops at
+        # its next call instead of hanging on the dead driver.
+        context = Guarded(self.browser, self, epoch).new_context(**context_kwargs)
+        context = Guarded(context, self, epoch)
+        # Give our scripts timers the page cannot replace.
+        context.add_init_script(PRISTINE_TIMERS_JS)
+        page    = Guarded(context.new_page(), self, epoch)
 
         try:
             logger.info(
@@ -771,7 +871,7 @@ class ScreenshotService:
             # ── 4. Remove elements (non-fatal per selector) ───────────────────
             if remove_elements:
                 try:
-                    summary      = page.evaluate(_REMOVE_ELEMENTS_JS, remove_elements)
+                    summary      = page.evaluate(bounded_js(_REMOVE_ELEMENTS_JS), remove_elements)
                     total_hidden = sum(
                         s.get("hidden", 0) for s in (summary or []) if s.get("ok")
                     )
@@ -790,7 +890,9 @@ class ScreenshotService:
             # ── 5. Custom JavaScript (non-fatal) ──────────────────────────────
             if custom_js:
                 try:
-                    page.evaluate(custom_js)
+                    # ✅ CHANGED (Oct 2026 — F-14): time-limited; the code is
+                    # passed as data, never pasted into the script.
+                    page.evaluate(CUSTOM_JS_RUNNER, [custom_js, CUSTOM_JS_TIMEOUT_MS])
                     logger.info("✅ Custom JavaScript executed successfully")
                 except PlaywrightError as js_err:
                     js_warning = str(js_err)
@@ -834,7 +936,7 @@ class ScreenshotService:
             if full_page or target_element:
                 try:
                     page.set_default_timeout(LAZY_SCROLL_TIMEOUT_MS)
-                    page.evaluate(_LAZY_SCROLL_JS)
+                    page.evaluate(bounded_js(_LAZY_SCROLL_JS, LAZY_SCROLL_TIMEOUT_MS))
                     page.wait_for_timeout(600)   # let triggered images arrive
                     logger.info("📜 Lazy-load scroll pass complete")
                 except Exception as scroll_err:

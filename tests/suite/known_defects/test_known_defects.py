@@ -38,26 +38,6 @@ def defect(fid: str, summary: str):
 URL = "https://example.com/"
 
 
-# ----------------------------------------------------------------------- F-01
-@defect("F-01", "services/screenshot_service.py runs Playwright sync API on 3 threads")
-def test_f01_hot_path_executor_is_single_threaded():
-    # Playwright's sync API is thread-affine. The root screenshot_service.py
-    # fixed this in Sep 2026 (max_workers=1); the services/ copy, which serves
-    # every single capture, still has 3. Proven with real Chromium in
-    # integration/test_real_browser.py (5 of 6 overlapping captures fail).
-    from concurrent.futures import ThreadPoolExecutor
-    import services.screenshot_service as hot
-    import screenshot_service as legacy
-
-    def pools(mod):
-        return [v for v in vars(mod).values() if isinstance(v, ThreadPoolExecutor)]
-
-    for mod in (legacy, hot):
-        found = pools(mod)
-        assert found, f"{mod.__name__}: no module-level executor found - update this test"
-        assert all(ex._max_workers == 1 for ex in found), mod.__name__
-
-
 # ----------------------------------------------------------------------- F-02
 @defect("F-02", "POST /api/v1/batch/submit/ (trailing slash) skips the screenshot quota")
 def test_f02_trailing_slash_batch_enforces_quota(client, make_user, add_screenshots,
@@ -307,11 +287,8 @@ def test_f13_retry_respects_quota(client, make_user, fake_shots, monkeypatch, ad
     assert used <= 3
 
 
-# ----------------------------------------------------------------------- F-14
-# A hostile page or never-resolving custom_js freezes the capture worker
-# (page.evaluate has no timeout). Reproduced with real Chromium by
-# tests/manual/repro_f14_capture_hang.py. Not automated: a stuck worker thread
-# cannot be freed and would stop pytest from exiting.
+# F-01 and F-14 are fixed (capture-engine release); their tests now live in
+# unit/test_capture_guard.py and integration/test_real_browser.py.
 
 
 # ----------------------------------------------------------------------- F-15

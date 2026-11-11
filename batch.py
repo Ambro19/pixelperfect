@@ -145,6 +145,10 @@ def _friendly_error(msg: str) -> str:
         "browser has been closed",
         "target closed",
         "browser has disconnected",
+        "capture engine was restarted",                    # ✅ Oct 2026 (F-14)
+        "connection closed while reading from the driver", # ✅ Oct 2026 (F-14)
+        "capture engine is busy",                          # ✅ Oct 2026 (F-14)
+        "capture abandoned",                               # ✅ Oct 2026 (F-14)
     )):
         return (
             "The capture engine restarted, usually because a page was too large "
@@ -167,6 +171,12 @@ def _friendly_error(msg: str) -> str:
         return (
             "The website refused the connection. "
             "The server may be down or blocking automated requests."
+        )
+
+    if "did not finish rendering" in m:                    # ✅ Oct 2026 (F-14)
+        return (
+            "The page did not finish rendering in time and was skipped. It may be "
+            "blocking automated capture."
         )
 
     if "rendering the image took too long" in m or "rendering the screenshot took longer" in m:

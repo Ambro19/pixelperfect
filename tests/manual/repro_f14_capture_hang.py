@@ -13,8 +13,10 @@
 #     python tests/manual/repro_f14_capture_hang.py
 # Optional: set PP_CHROMIUM_EXECUTABLE if Playwright cannot find Chromium.
 #
-# Expected today:  "STILL RUNNING after 30s" for the first two cases.
-# Expected fixed:  every case finishes (or fails cleanly) well within 30 s.
+# Before the capture-engine release: "STILL RUNNING after 30s".
+# Since the fix (Oct 2026): every case finishes or fails cleanly within
+# seconds. The automated equivalents are in tests/suite/integration
+# (run with --browser); this script remains as a quick manual check.
 # =============================================================================
 import asyncio
 import os

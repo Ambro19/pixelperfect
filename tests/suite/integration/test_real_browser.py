@@ -27,16 +27,47 @@ PAGE = b"""<!doctype html><html><head><style>
 </style></head><body><div id="banner"></div><div class="tall"></div></body></html>"""
 
 
+# A page that sabotages the timers our lazy-load scroll relies on.
+HOSTILE = (b"<!doctype html><html><body style='margin:0;height:3000px;background:#fff'>"
+           b"<script>window.setInterval=function(){return 0};"
+           b"window.setTimeout=function(){return 0}</script>hi</body></html>")
+# Pages that sabotage what our in-page time limit relies on.
+RACE_SABOTAGE = (b"<!doctype html><html><body style='margin:0;height:3000px;background:#fff'>"
+                 b"<script>Promise.race=()=>new Promise(()=>{});"
+                 b"window.Promise=function(){};</script>race</body></html>")
+THEN_SABOTAGE = (b"<!doctype html><html><body style='margin:0;height:3000px;background:#fff'>"
+                 b"<script>Promise.prototype.then=function(){return this};</script>then</body></html>")
+# A page that freezes itself with a synchronous loop shortly after loading.
+SELF_LOOP = (b"<!doctype html><html><body style='margin:0;height:3000px;background:#fff'>"
+             b"<script>setTimeout(()=>{while(true){}}, 300)</script>loop</body></html>")
+# A page whose Content-Security-Policy forbids eval.
+CSP_PAGE = b"<!doctype html><html><body style='margin:0;background:#ff0000'>csp</body></html>"
+
+
 class _Handler(BaseHTTPRequestHandler):
     def do_GET(self):
+        if self.path.startswith("/hostile"):
+            body, headers = HOSTILE, {}
+        elif self.path.startswith("/race"):
+            body, headers = RACE_SABOTAGE, {}
+        elif self.path.startswith("/then"):
+            body, headers = THEN_SABOTAGE, {}
+        elif self.path.startswith("/selfloop"):
+            body, headers = SELF_LOOP, {}
+        elif self.path.startswith("/csp"):
+            body, headers = CSP_PAGE, {"Content-Security-Policy": "script-src 'none'"}
+        else:
+            body, headers = PAGE, {}
         if self.path.startswith("/slow"):
             # Holds each capture open long enough that several overlap.
             import time
             time.sleep(0.5)
         self.send_response(200)
         self.send_header("Content-Type", "text/html")
+        for k, v in headers.items():
+            self.send_header(k, v)
         self.end_headers()
-        self.wfile.write(PAGE)
+        self.wfile.write(body)
 
     def log_message(self, *a):
         pass
@@ -75,22 +106,12 @@ def _services():
     return {"services (single captures)": hot, "root (batch)": legacy}
 
 
-# KNOWN DEFECT (see tests/suite/known_defects and TESTING.md, finding F-01):
-# services/screenshot_service.py runs Playwright's sync API on a 3-thread
-# pool. The browser belongs to one thread; any capture handed to another
-# thread fails with "Cannot switch to a different thread". Sequential tests
-# pass or fail by luck, so they are marked non-strict on that module; the
-# overlap test below is strict. Delete these markers once _executor has
-# max_workers=1 (all 18 pass with that one-line change).
-_F01 = "F-01: services/screenshot_service.py uses a 3-thread executor"
+# Both modules are tested: services/ serves single captures, root serves batch.
 HOT = "services (single captures)"
 LEGACY = "root (batch)"
 
 
-@pytest.fixture(params=[
-    pytest.param(HOT, marks=pytest.mark.xfail(reason=_F01, strict=False)),
-    LEGACY,
-])
+@pytest.fixture(params=[HOT, LEGACY])
 def svc_module(request):
     return _services()[request.param]
 
@@ -174,10 +195,6 @@ async def test_unknown_device_is_value_error(svc, site):
         await svc.capture_screenshot(url=site, device="nokia_3310")
 
 
-@pytest.mark.parametrize("svc_module", [
-    pytest.param(HOT, marks=pytest.mark.xfail(reason=_F01, strict=True)),
-    LEGACY,
-], indirect=True)
 async def test_concurrent_captures_all_succeed(svc, site):
     # Several captures in flight at once: what the per-user concurrency
     # limit allows (2-5) and what several users at once produce. The /slow
@@ -188,3 +205,111 @@ async def test_concurrent_captures_all_succeed(svc, site):
     )
     errors = [repr(r) for r in results if isinstance(r, BaseException)]
     assert errors == [], errors
+
+
+# ---------------------------------------------------------------------------
+# F-14: a page or custom_js must never be able to freeze the capture engine.
+# ---------------------------------------------------------------------------
+import time as _time
+
+
+async def test_hostile_page_cannot_stall_full_page_capture(svc, site):
+    t0 = _time.monotonic()
+    r = await svc.capture_screenshot(url=site + "hostile", width=800, height=600, full_page=True)
+    assert r["filepath"]
+    assert _time.monotonic() - t0 < 40          # used to wait forever
+
+
+async def test_never_resolving_custom_js_is_skipped_with_a_warning(svc, site):
+    t0 = _time.monotonic()
+    r = await svc.capture_screenshot(url=site, width=800, height=600,
+                                     custom_js="() => new Promise(() => {})")
+    assert "did not finish" in (r.get("js_warning") or "")
+    assert _time.monotonic() - t0 < 30
+
+
+@pytest.mark.parametrize("js", [
+    "document.body.style.background = 'rgb(0, 0, 255)';",                    # statements
+    "() => { document.body.style.background = 'rgb(0, 0, 255)'; }",          # arrow
+    "async () => { document.body.style.background = 'rgb(0, 0, 255)'; }",    # async arrow
+    "function () { document.body.style.background = 'rgb(0, 0, 255)'; }",    # anonymous
+    "async function () { document.body.style.background = 'rgb(0, 0, 255)'; }",
+    "function paint() { document.body.style.background = 'rgb(0, 0, 255)'; }",  # named
+    "  /* comment */ document.body.style.background = 'rgb(0, 0, 255)'",     # comment first
+])
+async def test_custom_js_forms_still_run(svc, site, js):
+    r = await svc.capture_screenshot(url=site, width=800, height=600, custom_js=js,
+                                     remove_elements=["#banner"])
+    assert r.get("js_warning") is None
+    assert _pixel(r["filepath"], (400, 400)) == (0, 0, 255)
+
+
+async def test_custom_js_syntax_error_is_a_warning_not_a_failure(svc, site):
+    r = await svc.capture_screenshot(url=site, width=800, height=600,
+                                     custom_js="this is not valid javascript !!@#$")
+    assert r["filepath"] and "SyntaxError" in (r.get("js_warning") or "")
+
+
+async def test_custom_js_runs_on_a_page_whose_csp_forbids_eval(svc, site):
+    r = await svc.capture_screenshot(url=site + "csp", width=800, height=600,
+                                     custom_js="document.body.style.background = 'rgb(0, 0, 255)';")
+    assert r.get("js_warning") is None
+    assert _pixel(r["filepath"], (400, 300)) == (0, 0, 255)
+
+
+async def test_infinite_loop_is_stopped_and_engine_recovers(svc, svc_module, site, monkeypatch):
+    # A synchronous infinite loop cannot be interrupted from JavaScript. The
+    # hard limit stops it, the capture queued behind it still succeeds, and the
+    # engine keeps working afterwards.
+    import asyncio
+    from services.capture_guard import CaptureTimeout
+    monkeypatch.setattr(svc_module, "CAPTURE_HARD_TIMEOUT_S", 8)
+    t0 = _time.monotonic()
+    stuck = asyncio.create_task(svc.capture_screenshot(
+        url=site, width=800, height=600, custom_js="() => { while (true) {} }"))
+    await asyncio.sleep(1)
+    queued = asyncio.create_task(svc.capture_screenshot(url=site, width=800, height=600))
+    with pytest.raises(CaptureTimeout):
+        await stuck
+    assert _time.monotonic() - t0 < 20
+    r = await queued
+    assert _pixel(r["filepath"], (400, 400)) == (255, 0, 0)
+    r = await svc.capture_screenshot(url=site, width=800, height=600)
+    assert _pixel(r["filepath"], (400, 400)) == (255, 0, 0)
+
+
+async def test_sabotaged_promise_race_cannot_stall_the_capture(svc, site):
+    # Our in-page limit uses the Promise functions captured before the page ran.
+    t0 = _time.monotonic()
+    r = await svc.capture_screenshot(url=site + "race", width=800, height=600, full_page=True)
+    assert r["filepath"] and _time.monotonic() - t0 < 40
+
+
+async def test_page_that_defeats_in_page_limits_is_stopped_within_the_script_budget(
+        svc, site, monkeypatch):
+    # Promise.prototype.then tampering defeats in-page racing; layer 2 (the
+    # per-evaluate budget) must stop it within seconds, not the 180 s limit,
+    # and the engine must keep working.
+    from services import capture_guard as cg
+    monkeypatch.setattr(cg, "EVALUATE_BUDGET_S", 6)
+    t0 = _time.monotonic()
+    try:
+        await svc.capture_screenshot(url=site + "then", width=800, height=600, full_page=True)
+    except cg.CaptureTimeout:
+        pass                                      # stopped: fine
+    assert _time.monotonic() - t0 < 30
+    r = await svc.capture_screenshot(url=site, width=800, height=600)
+    assert _pixel(r["filepath"], (400, 400)) == (255, 0, 0)
+
+
+async def test_page_that_freezes_itself_is_stopped_and_engine_recovers(svc, site, monkeypatch):
+    # No custom_js: the page's own script loops forever (what any free user
+    # could submit, including through batch).
+    from services import capture_guard as cg
+    monkeypatch.setattr(cg, "EVALUATE_BUDGET_S", 6)
+    t0 = _time.monotonic()
+    with pytest.raises(Exception):
+        await svc.capture_screenshot(url=site + "selfloop", width=800, height=600, full_page=True)
+    assert _time.monotonic() - t0 < 60
+    r = await svc.capture_screenshot(url=site, width=800, height=600)
+    assert _pixel(r["filepath"], (400, 400)) == (255, 0, 0)

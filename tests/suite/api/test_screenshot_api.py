@@ -208,6 +208,32 @@ def test_engine_thread_error_is_503_not_500(client, make_user, fake_shots, db):
     assert db.query(models.Screenshot).count() == 0
 
 
+@pytest.mark.parametrize("exc_name", ["EngineBusy", "CaptureAbandoned"])
+def test_capture_engine_faults_are_503_retry(client, make_user, fake_shots, db, exc_name):
+    # F-14: a full queue, or a capture abandoned by a forced restart, is an
+    # infrastructure fault: retryable 503.
+    from services import capture_guard as cg
+    exc = {"EngineBusy": cg.EngineBusy(300),
+           "CaptureAbandoned": cg.CaptureAbandoned("Capture abandoned: the capture engine was restarted.")}[exc_name]
+    fake_shots.raise_exc = exc
+    r = _shoot(client, make_user("free"))
+    assert r.status_code == 503, r.text
+    assert r.headers.get("retry-after") == "5"
+    assert db.query(models.Screenshot).count() == 0
+
+
+def test_page_that_never_finishes_is_504_without_retry(client, make_user, fake_shots, db):
+    # The PAGE kept the capture past a limit: say so, and do not invite an
+    # immediate identical retry (which would tie up the engine again).
+    from services import capture_guard as cg
+    fake_shots.raise_exc = cg.CaptureTimeout(180)
+    r = _shoot(client, make_user("free"))
+    assert r.status_code == 504, r.text
+    assert "retry-after" not in r.headers
+    assert "did not finish rendering" in r.json()["detail"]
+    assert db.query(models.Screenshot).count() == 0
+
+
 def test_service_value_error_is_400(client, make_user, fake_shots):
     fake_shots.raise_exc = ValueError("Selector '#nope' matched no element")
     r = _shoot(client, make_user("business"), target_element="#nope")

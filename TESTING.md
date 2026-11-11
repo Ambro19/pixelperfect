@@ -61,7 +61,7 @@ The three older files in `tests/` (`test_api.py`, `test_screenshot.py`, `load_te
 | Routing contract | Which module serves each public path (this catches a reordered `include_router`), security headers, CORS, health, OpenAPI. |
 | Real browser | Real PNG at the requested size, pixel colours, `remove_elements`, dark mode, full page, JPEG, WebP and PDF, overlapping captures. Run with `--browser`, on both screenshot-service modules. |
 
-Bug injection: 34 realistic bugs were injected one at a time, on top of a green baseline run, and **all 34 were caught by a failing test**. The first version caught 25 of 30; the 5 it missed (found by the independent review) now have tests. One proposed mutation was dropped because no tier can reach that code through the API, so it cannot change behaviour.
+Bug injection: **50 realistic bugs**, each injected on its own on top of a green baseline run, were **all caught by a failing test**. 34 were in the original suite, 9 came with Release A (billing-safe deletion) and 7 with Release B (capture engine). One proposed mutation in each round was replaced because it could not change behaviour (an equivalent mutation).
 
 ## Findings
 
@@ -69,8 +69,8 @@ All of these were reproduced against the current code. Each automated one has a 
 
 | ID | Sev. | Finding | Where |
 |---|---|---|---|
-| F-01 | **High** | The hot path (every single capture) runs Playwright's sync API on a **3-thread pool**. The browser belongs to one thread, so captures sent to another thread fail with "Cannot switch to a different thread". With real Chromium, 5 of 6 overlapping captures failed. `root screenshot_service.py` was fixed in September; this copy was not. Setting `max_workers=1` made all 18 browser tests pass, three runs in a row. | `services/screenshot_service.py:232` |
-| F-14 | **High** | No timeout on `page.evaluate()` (`_JS_TIMEOUT_MS` is defined but never used). A hostile page on a Free full-page capture, or a `custom_js` that never resolves, freezes the capture thread for good. **Fix together with F-01**: with one worker thread, a single stuck capture stops every capture. Manual repro: `python tests/manual/repro_f14_capture_hang.py`. | `services/screenshot_service.py:793, 837`; same in root module |
+| F-01 | ~~High~~ **Fixed** | **Fixed in the capture-engine release (Oct 2026).** The hot path ran Playwright's sync API on a 3-thread pool, so captures landing on a thread that did not own the browser failed with "Cannot switch to a different thread". It now uses one worker thread, like the batch module. | `services/screenshot_service.py` |
+| F-14 | ~~High~~ **Fixed** | **Fixed in the capture-engine release (Oct 2026).** `page.evaluate()` had no timeout, so a hostile page or a never-resolving `custom_js` froze the capture thread for good. Now there are three layers (`services/capture_guard.py`, used by both modules): in-page time limits that use timers and Promise functions the page cannot replace; a 20 s budget per page script, enforced from outside the page; and a 180 s limit per capture (running time only). If a limit is exceeded, the driver is killed and the engine restarts. Captures queued behind it still succeed. | `services/capture_guard.py` |
 | F-02 | **High** | `POST /api/v1/batch/submit/` (trailing slash) is served by the old wrapper in `main.py`. It does no screenshot-quota check, writes no `BatchJob` row (so the batch count is never used up) and runs up to 50 captures inside one request. | `main.py:1430` |
 | F-03 | **High** | SSRF. Capture URLs, batch URLs and `webhook_url` accept `127.0.0.1`, `localhost`, `169.254.169.254`, `10.x`, `192.168.x` and `[::1]`, and the internal page comes back as an image. A real fix must also block hostnames that resolve to private IPs, redirects to them and sub-requests, so the check belongs inside the browser (`page.route`), not only on the input URL. | `routers/screenshot.py`, `batch.py`, both services |
 | F-15 | **High** | Stripe sync **adopts any Stripe customer with the same email**, and emails are never verified. Registering with someone's email and calling `/subscription_status?sync=1` can hand over their paid subscription and open the billing portal on their card. Fix: adopt only when `customer.metadata.app_user_id` matches (`ensure_stripe_customer_for_user` already writes it). | `subscription_sync.py:445, 470` |
@@ -113,10 +113,23 @@ Reported by the review but not pinned as tests (design or infrastructure):
    - Stripe is called off the event loop, so a slow Stripe never freezes other requests.
    - Pinned by `tests/suite/api/test_account_deletion.py` and mutations M19, M33, M35–M37 and M43–M46.
    - Not covered: open invoices on cancelled `past_due` subscriptions are not voided, and the Stripe customer itself is kept (deleting it would also stop a checkout completed in another tab after deletion, but would remove the customer record from Stripe). Those are product decisions for a later release.
-2. **Order of fixes:** F-01 and F-14 ship together, in the capture-engine release. A single worker thread with no evaluate timeouts would turn one hostile page into a full outage.
+2. **Order of fixes:** F-01 and F-14 shipped together in the capture-engine release, after Release A.
+
+## Capture-engine behaviour customers may notice
+
+- `custom_js` now has a **10 s** limit (`CUSTOM_JS_TIMEOUT_MS`). A script that runs longer is skipped with a `js_warning`, and the capture still completes. Before, there was no limit. Every form that worked before still works: statements, arrow functions, `function () {}`, `async function () {}` and named functions. All of them are tested in a real browser.
+- When `custom_js` is used, the page's Content-Security-Policy is bypassed so the script can run. Resources that CSP would block may then load.
+- A page that keeps a capture running past a limit returns **504** "did not finish rendering", with no retry hint. A capture caught up in a restart, or one that waits too long in the queue, returns **503** with `Retry-After`.
+- All limits can be changed with environment variables: `CAPTURE_HARD_TIMEOUT_S`, `CAPTURE_EVALUATE_BUDGET_S`, `CAPTURE_QUEUE_TIMEOUT_S`, `CUSTOM_JS_TIMEOUT_MS` and `CAPTURE_SCRIPT_TIMEOUT_MS`.
+
+Known limits that remain:
+
+- Captures run one at a time per module. A page that freezes itself costs about 20 s of engine time per request. Per-user concurrency limits and quotas bound how often any one account can cause that.
+- Each forced restart leaves about 14 file descriptors open. Restarts are rare, and every deploy replaces the process.
+- `kill_driver` relies on private Playwright attributes (pinned 1.49.1). `test_kill_driver_unblocks_a_real_driver` fails if an upgrade moves them.
+- Killing the driver was verified on Linux, which is what Render runs. Whether Chromium child processes exit when the driver is killed on Windows is unverified, and that only affects local development.
 
 ## Limits of this suite
 
 - The default run uses fakes for Playwright, R2 and Stripe. Fakes can't show behaviour the real service has and the fake lacks. That is why the real-browser tests exist and why F-14 needed real Chromium.
-- In the real-browser tests, the hot-path module is marked non-strict `xfail` because of F-01: it passes or fails by luck. Remove those markers once F-01 is fixed.
 - SQLite stands in for PostgreSQL, so row locking (F-12) and timezone storage differences aren't tested.

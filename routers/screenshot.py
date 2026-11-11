@@ -110,6 +110,7 @@ from usage_accounting import (
 # where main.py actually serves from.
 from services.screenshot_service import screenshot_service, SCREENSHOTS_DIR
 from services.storage_service import storage_service
+from services.capture_guard import PAGE_TIMEOUT_MARKER
 
 logger = logging.getLogger("pixelperfect")
 
@@ -176,6 +177,12 @@ _ENGINE_FAILURE_MARKERS = (
     "target closed",
     "browser has disconnected",
     "playwright browser is not initialized",
+    # ✅ NEW (Oct 2026 — F-14): a capture stopped by the hard time limit, and
+    # requests that were queued behind it when the driver was restarted.
+    "capture engine was restarted",
+    "connection closed while reading from the driver",
+    "capture engine is busy",
+    "capture abandoned",
 )
 
 
@@ -693,6 +700,12 @@ async def create_screenshot(
         logger.error("Capture validation error: %s", exc)
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
+        # ✅ NEW (Oct 2026 — F-14): the PAGE kept the capture running past a
+        # time limit. Not an engine fault and not worth an instant retry: 504.
+        if PAGE_TIMEOUT_MARKER in str(exc).lower():
+            logger.error("⏱ Capture stopped for %s: %s", request.url, exc)
+            db.rollback()
+            raise HTTPException(status_code=504, detail=str(exc))
         # ✅ NEW (Sep 2026): greenlet.error and a dead browser arrive here.
         # They are retryable infrastructure faults, not 500s with internals.
         if _is_engine_failure(exc):
