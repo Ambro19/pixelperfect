@@ -1,12 +1,13 @@
 # backend/delete_user.py
 from models import SessionLocal, User, DATABASE_URL
+from log_safety import mask_db_url
 
 def main(username: str = "SarahSteward"):
     db = SessionLocal()
     try:
         u = db.query(User).filter(User.username == username).first()
         if not u:
-            print(f"No such user: {username} (DB={DATABASE_URL})")
+            print(f"No such user: {username} (DB={mask_db_url(DATABASE_URL)})")
             return
         db.delete(u)
         db.commit()

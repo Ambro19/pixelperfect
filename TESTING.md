@@ -61,7 +61,7 @@ The three older files in `tests/` (`test_api.py`, `test_screenshot.py`, `load_te
 | Routing contract | Which module serves each public path (this catches a reordered `include_router`), security headers, CORS, health, OpenAPI. |
 | Real browser | Real PNG at the requested size, pixel colours, `remove_elements`, dark mode, full page, JPEG, WebP and PDF, overlapping captures. Run with `--browser`, on both screenshot-service modules. |
 
-Bug injection: **50 realistic bugs**, each injected on its own on top of a green baseline run, were **all caught by a failing test**. 34 were in the original suite, 9 came with Release A (billing-safe deletion) and 7 with Release B (capture engine). One proposed mutation in each round was replaced because it could not change behaviour (an equivalent mutation).
+Bug injection: **52 realistic bugs**, each injected on its own on top of a green baseline run, were **all caught by a failing test**. 34 were in the original suite, 9 came with Release A (billing-safe deletion) 7 with Release B (capture engine) and 2 with Release C (log safety). One proposed mutation in each round was replaced because it could not change behaviour (an equivalent mutation).
 
 ## Findings
 
@@ -84,6 +84,7 @@ All of these were reproduced against the current code. Each automated one has a 
 | F-19 | Med | 500 responses echo the raw exception text, which can include database or host details. | `routers/screenshot.py:706`, `screenshot_endpoints.py:496`, billing errors |
 | F-20 | Med | No rate limit on forgot-password, forgot-username or `/contact`. They all send through one Gmail account, so its daily cap can be used up and password resets stop for everyone. | `main.py` |
 | F-22 | Med | Checkout is allowed while already subscribed, which creates a second, double-billed subscription. | `main.py:1500` |
+| F-23 | ~~High~~ **Fixed** | **Fixed in Release C (Nov 2026).** Found in the production logs, not by the suite: the startup banner logged `DATABASE_URL` in full, password included. It now goes through `mask_db_url()`, which prints `***` in place of the password (also in `delete_user.py`). A source-level test fails if any log or print call is handed the raw `DATABASE_URL` again. The production database credential was rotated on Render the same week. | `log_safety.py`, `main.py` |
 | F-04 | Low | Deleting a batch job gives back the period batch count. Screenshot quota still applies. | `batch.py:1152` |
 | F-08 | Low | Register and reset accept any password (even empty), while change-password requires 8 characters. Register accepts an invalid email and a blank username. | `main.py:559, 580` |
 | F-09 | Low | Forgot-password matches the email case-sensitively, so a capitalised entry gets no mail (and a half-fix gives a broken link). | `main.py:955` |

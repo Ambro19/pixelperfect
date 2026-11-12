@@ -194,6 +194,8 @@ if not SECRET_KEY:
 RESET_TOKEN_TTL_SECONDS = int(os.getenv("RESET_TOKEN_TTL_SECONDS", "3600"))
 serializer = URLSafeTimedSerializer(SECRET_KEY)
 
+from log_safety import mask_db_url  # keeps the DB password out of logs
+
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./pixelperfect.db")
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg2://", 1)
@@ -785,7 +787,8 @@ async def on_startup():
 
     smtp_configured = bool(os.getenv("SMTP_USERNAME") and os.getenv("SMTP_PASSWORD"))
     logger.info("=" * 60)
-    logger.info("PixelPerfect starting - ENV=%s DB=%s", ENVIRONMENT, DATABASE_URL)
+    # Never log DATABASE_URL itself: it carries the database password.
+    logger.info("PixelPerfect starting - ENV=%s DB=%s", ENVIRONMENT, mask_db_url(DATABASE_URL))
     logger.info("Frontend URL:       %s", FRONTEND_URL)
     logger.info("Backend URL:        %s", BACKEND_URL)
     logger.info("Custom API Domain:  %s", CUSTOM_API_DOMAIN)
