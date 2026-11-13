@@ -210,6 +210,9 @@ ENVIRONMENT = os.getenv("ENVIRONMENT", "development").lower()
 IS_PROD = ENVIRONMENT == "production"
 
 FRONTEND_URL  = (os.getenv("FRONTEND_URL",  "http://localhost:3000") or "").rstrip("/")
+# The address customers are told to write to. It is a Cloudflare Email Routing
+# address that forwards to the OneTechly inbox. Never show the Gmail address.
+SUPPORT_EMAIL = os.getenv("SUPPORT_EMAIL", "support@pixelperfectapi.net")
 BACKEND_URL   = (os.getenv("BACKEND_URL",   "http://localhost:8000") or "").rstrip("/")
 CUSTOM_API_DOMAIN = (os.getenv("CUSTOM_API_DOMAIN", "https://api.pixelperfectapi.net") or "").rstrip("/")
 
@@ -629,6 +632,10 @@ def _send_email_sync(
     smtp_port     = int(os.getenv("SMTP_PORT",  "587"))
     smtp_user     = os.getenv("SMTP_USERNAME",  "")
     smtp_password = os.getenv("SMTP_PASSWORD",  "")
+    # Deliberately the Gmail inbox itself, not support@: the form is sent FROM
+    # that Gmail account, and Gmail hides a message it sent that is forwarded
+    # back to it (it stays in Sent only), so routing it via support@ would
+    # make contact-form messages invisible in the inbox.
     recipient     = os.getenv("CONTACT_RECIPIENT", "onetechly@gmail.com")
 
     if not smtp_user or not smtp_password:
@@ -710,7 +717,7 @@ async def contact_form(payload: ContactFormRequest):
             status_code=503,
             detail=(
                 "We couldn't deliver your message right now. "
-                "Please email us directly at onetechly@gmail.com."
+                f"Please email us directly at {SUPPORT_EMAIL}."
             ),
         )
 
@@ -1318,7 +1325,7 @@ async def delete_account_endpoint(
                 detail=(
                     "Account deletion is temporarily unavailable because of a problem on "
                     "our side. Your account was not deleted. Please try again later or "
-                    "contact support at onetechly@gmail.com."
+                    f"contact support at {SUPPORT_EMAIL}."
                 ),
             )
         except Exception as e:
@@ -1331,7 +1338,7 @@ async def delete_account_endpoint(
                 detail=(
                     "We couldn't reach our billing provider to cancel your subscription, "
                     "so your account was not deleted. Please try again in a minute. If "
-                    "this keeps happening, contact support at onetechly@gmail.com."
+                    f"this keeps happening, contact support at {SUPPORT_EMAIL}."
                 ),
                 headers={"Retry-After": "60"},
             )
@@ -1815,7 +1822,7 @@ def cancel_subscription(
             detail=(
                 "No Stripe billing record found. "
                 "If you just subscribed, wait a moment and try again. "
-                "Contact support at onetechly@gmail.com if this persists."
+                f"Contact support at {SUPPORT_EMAIL} if this persists."
             ),
         )
 
