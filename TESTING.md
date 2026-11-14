@@ -61,7 +61,7 @@ The three older files in `tests/` (`test_api.py`, `test_screenshot.py`, `load_te
 | Routing contract | Which module serves each public path (this catches a reordered `include_router`), security headers, CORS, health, OpenAPI. |
 | Real browser | Real PNG at the requested size, pixel colours, `remove_elements`, dark mode, full page, JPEG, WebP and PDF, overlapping captures. Run with `--browser`, on both screenshot-service modules. |
 
-Bug injection: **53 realistic bugs**, each injected on its own on top of a green baseline run, were **all caught by a failing test**. 34 were in the original suite, 9 came with Release A (billing-safe deletion) 7 with Release B (capture engine) 2 with Release C (log safety) and 1 with Release E (contact addresses). One proposed mutation in each round was replaced because it could not change behaviour (an equivalent mutation).
+Bug injection: **55 realistic bugs**, each injected on its own on top of a green baseline run, were **all caught by a failing test**. 34 were in the original suite, 9 came with Release A (billing-safe deletion) 7 with Release B (capture engine) 2 with Release C (log safety) 1 with Release E (contact addresses) and 2 with Release F (paid checkout pause). One proposed mutation in each round was replaced because it could not change behaviour (an equivalent mutation).
 
 ## Findings
 

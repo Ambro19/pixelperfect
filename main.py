@@ -1635,12 +1635,35 @@ def _lookup_key(plan: str, billing_cycle: str) -> Optional[str]:
     )
     return k.strip() if k else None
 
+# New paid subscriptions can be switched off without a code change.
+# Set PAID_CHECKOUT_PAUSED=true on Render while paid plans must not be sold
+# (Nov 2026: until OneTechly's NY Certificate of Authority arrives and Stripe
+# Tax is set up). Read on every request, so flipping it needs only a restart.
+# The frontend hides the upgrade buttons too, but this is the real guard:
+# it also stops old cached pages and direct API calls.
+PAID_CHECKOUT_PAUSED_MESSAGE = (
+    "New paid subscriptions are paused for a short time while we finish a "
+    "billing update. Your Free plan keeps working as normal. Please check back "
+    "soon, or contact {support} with any questions."
+)
+
+
+def paid_checkout_paused() -> bool:
+    return (os.getenv("PAID_CHECKOUT_PAUSED") or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 @app.post("/billing/create_checkout_session")
 def create_checkout_session(
     payload:      BillingCheckoutIn,
     current_user: User    = Depends(get_current_user),
     db:           Session = Depends(get_db),
 ):
+    if paid_checkout_paused():
+        raise HTTPException(
+            status_code=503,
+            detail=PAID_CHECKOUT_PAUSED_MESSAGE.format(support=SUPPORT_EMAIL),
+        )
+
     if not stripe or not os.getenv("STRIPE_SECRET_KEY"):
         raise HTTPException(status_code=503, detail="Stripe is not configured")
 
@@ -1910,6 +1933,141 @@ def cancel_subscription(
         "cancel_at": cancel_at_iso,
     }
 
+# # ── Helper: first day of next calendar month, 00:00 UTC (naive, matches DB) ──
+# # def _first_of_next_month_utc(now: datetime) -> datetime:
+# #     if now.month == 12:
+# #         return datetime(now.year + 1, 1, 1)
+# #     return datetime(now.year, now.month + 1, 1)
+
+# # =====================================================================
+# # POST /billing/cancel_subscription (v8)
+# # Cancels at period end — user retains access until billing period expires.
+# # =====================================================================
+# @app.post("/billing/cancel_subscription")
+# def cancel_subscription(
+#     current_user: User    = Depends(get_current_user),
+#     db:           Session = Depends(get_db),
+# ):
+#     if not stripe or not os.getenv("STRIPE_SECRET_KEY"):
+#         raise HTTPException(
+#             status_code=503,
+#             detail="Stripe is not configured. Please contact support.",
+#         )
+
+#     tier = (getattr(current_user, "subscription_tier", "free") or "free").lower()
+#     if tier == "free":
+#         raise HTTPException(
+#             status_code=400,
+#             detail="You are on the Free plan — there is no paid subscription to cancel.",
+#         )
+
+#     customer_id = getattr(current_user, "stripe_customer_id", None)
+
+#     # ✅ Fix: email fallback when stripe_customer_id is None
+#     if not customer_id:
+#         email = (getattr(current_user, "email", "") or "").strip().lower()
+#         if email and stripe:
+#             try:
+#                 customers = stripe.Customer.list(email=email, limit=1)
+#                 if customers.data:
+#                     customer_id = customers.data[0].id
+#                     current_user.stripe_customer_id = customer_id
+#                     db.commit()
+#                     logger.info("cancel_subscription: found customer %s by email", customer_id)
+#             except Exception as e:
+#                 logger.warning("Stripe customer email lookup failed: %s", e)
+
+#     if not customer_id:
+#         raise HTTPException(
+#             status_code=400,
+#             detail=(
+#                 "No Stripe billing record found. "
+#                 "If you just subscribed, wait a moment and try again. "
+#                 "Contact support at onetechly@gmail.com if this persists."
+#             ),
+#         )
+
+#     try:
+#         subscriptions = stripe.Subscription.list(
+#             customer=customer_id,
+#             status="active",
+#             limit=5,
+#         )
+#     except Exception as e:
+#         logger.exception("❌ Stripe subscription list failed for user %s", current_user.id)
+#         raise HTTPException(
+#             status_code=500,
+#             detail=f"Could not retrieve subscription info from Stripe: {str(e)}",
+#         )
+
+#     active_subs = list(subscriptions.auto_paging_iter())
+
+#     if not active_subs:
+#         try:
+#             all_subs = stripe.Subscription.list(customer=customer_id, limit=5)
+#             for sub in all_subs.auto_paging_iter():
+#                 if sub.get("cancel_at_period_end"):
+#                     return {
+#                         "ok":        True,
+#                         "message":   "Your subscription is already scheduled to cancel at the end of the billing period.",
+#                         "cancel_at": sub.get("current_period_end"),
+#                     }
+#         except Exception:
+#             pass
+
+#         raise HTTPException(
+#             status_code=400,
+#             detail=(
+#                 "No active subscription found to cancel. "
+#                 "Your subscription may have already ended. "
+#                 "Contact support if you're still being charged."
+#             ),
+#         )
+
+#     cancelled_at = None
+#     for sub in active_subs:
+#         try:
+#             updated = stripe.Subscription.modify(
+#                 sub["id"],
+#                 cancel_at_period_end=True,
+#             )
+#             cancelled_at = updated.get("current_period_end")
+#             logger.info(
+#                 "✅ Subscription %s set to cancel at period end for user %s (ends %s)",
+#                 sub["id"], current_user.id, cancelled_at,
+#             )
+#         except Exception as e:
+#             logger.exception(
+#                 "❌ Failed to set cancel_at_period_end for sub %s (user %s): %s",
+#                 sub.get("id"), current_user.id, e,
+#             )
+#             raise HTTPException(
+#                 status_code=500,
+#                 detail=f"Failed to cancel subscription: {str(e)}",
+#             )
+
+#     cancel_at_iso = None
+#     if cancelled_at:
+#         try:
+#             cancel_at_iso = datetime.utcfromtimestamp(int(cancelled_at)).isoformat()
+#         except (ValueError, TypeError):
+#             cancel_at_iso = str(cancelled_at)
+
+#     return {
+#         "ok":      True,
+#         "message": (
+#             "Subscription cancellation scheduled. "
+#             "You retain full access until the end of your current billing period. "
+#             "No refund is issued for unused time."
+#         ),
+#         "cancel_at": cancel_at_iso,
+#     }
+
+# # ── Helper: first day of next calendar month, 00:00 UTC (naive, matches DB) ──
+# # def _first_of_next_month_utc(now: datetime) -> datetime:
+# #     if now.month == 12:
+# #         return datetime(now.year + 1, 1, 1)
+# #     return datetime(now.year, now.month + 1, 1)
  
 # =====================================================================
 # Subscription Status — direct DB count for all tiers (v1 fix)
