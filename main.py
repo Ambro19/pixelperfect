@@ -75,12 +75,13 @@ load_dotenv(dotenv_path=find_dotenv(".env"), override=False)
 from fastapi import FastAPI, HTTPException, Depends, Request, Response, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from fastapi.responses import ORJSONResponse, HTMLResponse, FileResponse
+from fastapi.responses import ORJSONResponse, HTMLResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.concurrency import run_in_threadpool
 from starlette.types import ASGIApp
 
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 from pydantic import BaseModel, EmailStr
@@ -846,11 +847,12 @@ def health():
             "screenshot_service": "ready"      if SCREENSHOT_READY else "not_ready",
             "contact_smtp":       "configured" if smtp_configured    else "not_configured",
         },
-        "screenshot_service_error":    SCREENSHOT_LAST_ERROR,
+        # Release G: the raw engine error text and the server's directory
+        # paths are no longer published here (internal details, F-19 family).
+        # The full error is still logged at startup for the operator.
+        "screenshot_service_error":    bool(SCREENSHOT_LAST_ERROR),
         "screenshot_service_error_at": SCREENSHOT_LAST_ERROR_AT,
         "tier_concurrency":  TIER_CONCURRENCY,
-        "screenshots_dir":   str(SCREENSHOTS_DIR),
-        "screenshots_dir_exists": SCREENSHOTS_DIR.exists(),
         "phase1_features": {
             "custom_js":        "Pro+",
             "device_emulation": "Pro+",
@@ -860,6 +862,55 @@ def health():
 @app.head("/health")
 def health_head():
     return Response(status_code=200)
+
+
+# ---------------------------------------------------------------------------
+# Release G: readiness check for the uptime monitor (Better Stack).
+# /health above only proves the web process answers. /health/ready answers
+# "could a customer take a screenshot right now?": the database responds, and
+# neither capture engine is wedged (a stuck capture that could not be killed)
+# or failing to start. An engine that is simply not started yet, or waiting
+# to restart after a forced kill, counts as fine: it starts on the next
+# capture. Returns 503 when not ready, so the monitor raises an incident.
+# Only "ok"/"failing" is published, never error text.
+# ---------------------------------------------------------------------------
+def _engine_usable(svc) -> bool:
+    return not getattr(svc, "_wedged", False) and not getattr(svc, "_init_error", None)
+
+
+def _readiness_checks() -> dict:
+    checks = {}
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        checks["database"] = "ok"
+    except Exception as e:
+        logger.warning("Readiness: database check failed: %s", e)
+        checks["database"] = "failing"
+
+    from services.screenshot_service import screenshot_service as api_engine
+    engines = (screenshot_service, api_engine)
+    checks["capture_engine"] = "ok" if all(_engine_usable(s) for s in engines) else "failing"
+    return checks
+
+
+@app.get("/health/ready")
+def health_ready():
+    checks = _readiness_checks()
+    ready = all(v == "ok" for v in checks.values())
+    return JSONResponse(
+        status_code=200 if ready else 503,
+        content={"status": "ready" if ready else "not_ready",
+                 "checks": checks,
+                 "timestamp": datetime.utcnow().isoformat()},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.head("/health/ready")
+def health_ready_head():
+    ready = all(v == "ok" for v in _readiness_checks().values())
+    return Response(status_code=200 if ready else 503, headers={"Cache-Control": "no-store"})
 
 @app.options("/{path:path}")
 async def options_handler(path: str):
