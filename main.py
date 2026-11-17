@@ -1985,6 +1985,45 @@ def cancel_subscription(
     }
 
 
+# =====================================================================
+# Subscription Status — direct DB count for all tiers (v1 fix)
+# ✅ Jul 2026: next_reset always included (see patch header)
+# ✅ Release D1 (Nov 2026): the function header and the first half of the body
+#    were deleted by accident in the 11-15 cleanup commit, which left the
+#    rest of the body as unreachable code inside cancel_subscription and
+#    removed GET /subscription_status entirely. Restored unchanged.
+# =====================================================================
+@app.get("/subscription_status")
+def subscription_status(
+    request:      Request,
+    current_user: User    = Depends(get_current_user),
+    db:           Session = Depends(get_db),
+):
+    try:
+        _apply_local_overdue_downgrade_if_possible(current_user, db)
+    except Exception as e:
+        logger.warning("Local downgrade check failed: %s", e)
+
+    if request.query_params.get("sync") == "1":
+        try:
+            sync_user_subscription_from_stripe(current_user, db)
+        except Exception as e:
+            logger.warning("Stripe sync failed: %s", e)
+
+    tier        = (getattr(current_user, "subscription_tier", "free") or "free").lower()
+    tier_limits = get_tier_limits(tier)
+
+    now = datetime.utcnow()
+
+    # ✅ FIX (Aug 2026 — quota bypass): usage now comes from
+    # usage_accounting.usage_summary(), which counts
+    #     live screenshots in period + tombstoned screenshots captured in period
+    # so deleting from the History page no longer refunds quota.
+    usage            = usage_summary(db, current_user)
+    screenshots_used = usage["screenshots"]
+    batch_used       = usage["batch_requests"]
+    api_calls_used   = usage["api_calls"]
+
     # ✅ REWRITTEN (Aug 2026 — billing-anniversary alignment).
     #
     # usage_reset_at is NO LONGER consulted. It is written by
