@@ -1,65 +1,63 @@
+# =============================================================================
+# backend/.gitignore - PixelPerfect API
+# Release D (Nov 2026): cleaned up. The old file ended with a pasted shell
+# snippet ("EOF", "git add .", ...) and did not cover SQLite WAL files,
+# zips or executables, which is how they ended up in the public repo.
+# =============================================================================
+
 # Python
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
-.Python
-env/
-venv/
-ENV/
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
 *.egg-info/
-.installed.cfg
-*.egg
+.eggs/
+build/
+dist/
 
-# Environment variables
+# Virtual environments (the project's venv lives one folder up)
+venv/
+.venv/
+env/
+ENV/
+
+# Secrets: only .env.example (placeholders) is committed
 .env
-.env.local
-.env.production
+.env.*
+!.env.example
 
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Logs
-*.log
-
-# Database
+# Local databases, including SQLite's write-ahead files
 *.db
+*.db-shm
+*.db-wal
 *.sqlite
+*.sqlite3
+
+# Release zips, downloaded tools and binaries
+*.zip
+*.exe
+stripe-cli/
+tools/
+
+# Runtime output
+screenshots/
+uploads/
+*.log
+.batch_jobs_snapshot.json
 
 # Testing
 .coverage
 htmlcov/
 .pytest_cache/
 
-# Uploads
-uploads/
-screenshots/
-EOF
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
 
-# README-Internal file
+# Internal notes
 INTERNAL.md
-
-# Commit and push
-git add .
-git commit -m "Initial commit - PixelPerfect API"
-git push origin main

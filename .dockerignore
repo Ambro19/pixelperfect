@@ -1,0 +1,47 @@
+# =============================================================================
+# backend/.dockerignore - PixelPerfect API (Release D, Nov 2026)
+# The Dockerfile ends with "COPY . /app". Without this file, everything in the
+# build context (git history, test suite, local databases, Windows binaries)
+# was copied into every production image. Only what the app needs at runtime
+# should reach the image.
+# =============================================================================
+.git
+.gitignore
+.dockerignore
+
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+
+tests/
+.pytest_cache/
+htmlcov/
+.coverage
+pytest.ini
+run_tests.ps1
+TESTING.md
+
+.env
+.env.*
+
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+*.zip
+*.exe
+stripe-cli/
+tools/
+
+screenshots/
+uploads/
+*.log
+.batch_jobs_snapshot.json
+
+.vscode/
+.idea/
+INTERNAL.md
