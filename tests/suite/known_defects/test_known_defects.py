@@ -361,7 +361,7 @@ def test_f19_errors_do_not_leak_internals(client, make_user, fake_shots):
 
 
 # ----------------------------------------------------------------------- F-20
-@defect("F-20", "forgot-password has no rate limit (one Gmail account sends every mail)")
+# Fixed in Release H (Nov 2026): kept as a regression test.
 def test_f20_forgot_password_is_rate_limited(client, make_user, sent_mail):
     make_user(email="target@example.com")
     codes = [client.post("/auth/forgot-password", json={"email": "target@example.com"}).status_code

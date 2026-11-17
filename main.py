@@ -91,6 +91,9 @@ from passlib.context import CryptContext
 
 # Local imports
 from email_utils import send_password_reset_email
+from mailer import send_email, provider as email_provider  # Release H
+from html import escape as html_escape
+import abuse_limits  # Release H: F-20 rate limits on email-sending endpoints
 from auth_utils import get_password_hash, verify_password
 from subscription_sync import sync_user_subscription_from_stripe, _apply_local_overdue_downgrade_if_possible
 
@@ -629,20 +632,18 @@ CATEGORY_LABELS = {
 def _send_email_sync(
     name: str, email: str, subject: str, message: str, category: str
 ):
-    smtp_host     = os.getenv("SMTP_HOST",      "smtp.gmail.com")
-    smtp_port     = int(os.getenv("SMTP_PORT",  "587"))
-    smtp_user     = os.getenv("SMTP_USERNAME",  "")
-    smtp_password = os.getenv("SMTP_PASSWORD",  "")
-    # Deliberately the Gmail inbox itself, not support@: the form is sent FROM
-    # that Gmail account, and Gmail hides a message it sent that is forwarded
-    # back to it (it stays in Sent only), so routing it via support@ would
-    # make contact-form messages invisible in the inbox.
+    # Deliberately the Gmail inbox itself, not support@: while mail can still
+    # go out through the Gmail SMTP fallback, a message Gmail sent that is
+    # forwarded back to it stays in Sent only, so routing it via support@
+    # would hide contact-form messages. Internal only; never shown to users.
     recipient     = os.getenv("CONTACT_RECIPIENT", "onetechly@gmail.com")
 
-    if not smtp_user or not smtp_password:
-        raise ValueError("SMTP credentials not configured on server.")
-
     category_label = CATEGORY_LABELS.get(category, category.title())
+    # Release H: the HTML copy escapes what the visitor typed, so a message
+    # containing HTML or links cannot dress itself up inside our inbox.
+    raw_name, raw_email, raw_subject = name, email, subject
+    name, email, subject = (html_escape(name), html_escape(email), html_escape(subject))
+    message_html = html_escape(message)
 
     text_body = (
         f"New contact form submission — PixelPerfect Screenshot API\n\n"
@@ -671,31 +672,31 @@ def _send_email_sync(
     <hr style="border:none;border-top:1px solid #e2e8f0;margin:16px 0;">
     <h4 style="color:#374151;margin:0 0 8px;">Message</h4>
     <p style="color:#374151;white-space:pre-wrap;background:white;padding:16px;
-       border-radius:6px;border:1px solid #e2e8f0;">{message}</p>
+       border-radius:6px;border:1px solid #e2e8f0;">{message_html}</p>
     <p style="color:#94a3b8;font-size:12px;margin-top:24px;">
       Reply directly to this email to respond to {name}.
     </p>
   </div>
 </body></html>"""
 
-    msg = MIMEMultipart("alternative")
-    msg["Subject"]  = f"[PixelPerfect] {category_label}: {subject}"
-    msg["From"]     = f"PixelPerfect Contact <{smtp_user}>"
-    msg["To"]       = recipient
-    msg["Reply-To"] = f"{name} <{email}>"
-    msg.attach(MIMEText(text_body, "plain"))
-    msg.attach(MIMEText(html_body, "html"))
-
-    with smtplib.SMTP(smtp_host, smtp_port) as server:
-        server.ehlo()
-        server.starttls()
-        server.login(smtp_user, smtp_password)
-        server.sendmail(smtp_user, recipient, msg.as_string())
-
-    logger.info("✅ Contact email sent: [%s] from %s", category_label, email)
+    # Release H: one sender for all mail (Resend, Gmail SMTP fallback).
+    # Reply-To is the visitor's bare address (no name), so a crafted name
+    # cannot inject extra mail headers.
+    subject_line = f"[PixelPerfect] {category_label}: {raw_subject}".replace("\r", " ").replace("\n", " ")
+    via = send_email(recipient, subject_line, text_body, html_body, reply_to=raw_email)
+    logger.info("✅ Contact email sent: [%s] from %s (via %s)", category_label, raw_email, via)
 
 @app.post("/contact")
-async def contact_form(payload: ContactFormRequest):
+async def contact_form(payload: ContactFormRequest, request: Request):
+    # Release H (F-20): each message uses the shared email quota.
+    allowed, retry_after = abuse_limits.contact_limiter.hit(abuse_limits.client_ip(request))
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail=("You've sent several messages in a short time. Please wait a while, "
+                    f"or email us directly at {SUPPORT_EMAIL}."),
+            headers={"Retry-After": str(retry_after)},
+        )
     if not payload.name.strip() or not payload.email.strip() or not payload.message.strip():
         raise HTTPException(status_code=422, detail="Name, email, and message are required.")
     if len(payload.message) > 5000:
@@ -803,7 +804,7 @@ async def on_startup():
     logger.info("Stripe configured:  %s", bool(stripe and os.getenv("STRIPE_SECRET_KEY")))
     logger.info("📸 Screenshot ready:  %s", SCREENSHOT_READY)
     logger.info("📸 Screenshots dir:   %s", SCREENSHOTS_DIR)
-    logger.info("📧 SMTP configured:   %s", smtp_configured)
+    logger.info("📧 Email provider:    %s", email_provider())  # resend | smtp | none
     logger.info("✅ Tier concurrency:  %s", TIER_CONCURRENCY)
     logger.info("⚡ Phase 1 features:  custom_js=Pro+, device_emulation=Pro+")
     if SCREENSHOT_LAST_ERROR:
@@ -846,6 +847,7 @@ def health():
             "stripe":             "configured" if os.getenv("STRIPE_SECRET_KEY") else "not_configured",
             "screenshot_service": "ready"      if SCREENSHOT_READY else "not_ready",
             "contact_smtp":       "configured" if smtp_configured    else "not_configured",
+            "email_provider":     email_provider(),
         },
         # Release G: the raw engine error text and the server's directory
         # paths are no longer published here (internal details, F-19 family).
@@ -1014,8 +1016,28 @@ def token_login_json(req: LoginJSON, db: Session = Depends(get_db)):
 def read_users_me(current_user: User = Depends(get_current_user)):
     return current_user
 
+def _limit_email_endpoint(request: Request, kind: str, email: str) -> bool:
+    """F-20 (Release H). Raises 429 when this IP is sending too many requests.
+    Returns False when this address has had enough emails of this kind for
+    now: the caller then answers "ok" as usual but sends nothing, so the
+    response never reveals whether the address has an account."""
+    allowed, retry_after = abuse_limits.ip_limiter.hit(abuse_limits.client_ip(request))
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many requests. Please wait a few minutes and try again.",
+            headers={"Retry-After": str(retry_after)},
+        )
+    ok, _ = abuse_limits.email_limiter.hit(f"{kind}:{email.strip().lower()}")
+    if not ok:
+        logger.warning("Rate limit: %s email to %s suppressed", kind, email)
+    return ok
+
+
 @app.post("/auth/forgot-password")
-def forgot_password(payload: ForgotPasswordIn, db: Session = Depends(get_db)):
+def forgot_password(payload: ForgotPasswordIn, request: Request, db: Session = Depends(get_db)):
+    if not _limit_email_endpoint(request, "reset", payload.email):
+        return {"ok": True}
     user = db.query(User).filter(User.email == payload.email).first()
     if user:
         token      = serializer.dumps({"email": payload.email})
@@ -1033,13 +1055,7 @@ def _send_username_reminder_email(email: str, username: str) -> None:
     Send a branded username reminder email via Gmail SMTP.
     Matches the style of the password reset email.
     """
-    smtp_host     = os.getenv("SMTP_HOST",      "smtp.gmail.com")
-    smtp_port     = int(os.getenv("SMTP_PORT",  "587"))
-    smtp_user     = os.getenv("SMTP_USERNAME",  "")
-    smtp_password = os.getenv("SMTP_PASSWORD",  "")
-    
-    if not smtp_user or not smtp_password:
-        raise ValueError("SMTP credentials not configured.")
+    # Release H: sent through mailer.send_email (Resend, Gmail SMTP fallback).
  
     text_body = (
         f"Hello,\n\n"
@@ -1077,27 +1093,14 @@ def _send_username_reminder_email(email: str, username: str) -> None:
   </div>
 </body></html>"""
  
-    msg = MIMEMultipart("alternative")
-    msg["Subject"]  = "Your PixelPerfect username"
-    msg["From"]     = f"PixelPerfect <{smtp_user}>"
-    msg["To"]       = email
- 
-    msg.attach(MIMEText(text_body, "plain"))
-    msg.attach(MIMEText(html_body, "html"))
- 
-    with smtplib.SMTP(smtp_host, smtp_port) as server:
-        server.ehlo()
-        server.starttls()
-        server.login(smtp_user, smtp_password)
-        server.sendmail(smtp_user, email, msg.as_string())
- 
-    logger.info("✅ Username reminder sent to %s (username=%s)", email, username)
+    via = send_email(email, "Your PixelPerfect username", text_body, html_body)
+    logger.info("✅ Username reminder sent to %s (via %s)", email, via)
  
  
 # ── Endpoint ─────────────────────────────────────────────────────────────────
  
 @app.post("/auth/forgot-username")
-def forgot_username(payload: ForgotUsernameIn, db: Session = Depends(get_db)):
+def forgot_username(payload: ForgotUsernameIn, request: Request, db: Session = Depends(get_db)):
     """
     Send a username reminder email.
  
@@ -1106,6 +1109,8 @@ def forgot_username(payload: ForgotUsernameIn, db: Session = Depends(get_db)):
     Never reveals in the response whether the email matched any account.
     """
     email = (payload.email or "").strip().lower()
+    if not _limit_email_endpoint(request, "username", email):
+        return {"ok": True}
     user  = db.query(User).filter(User.email == email).first()
  
     if user:

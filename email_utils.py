@@ -4,6 +4,11 @@
 # Author: OneTechly
 # Updated: April 2026
 #
+# ✅ Release H (Nov 2026): sends through mailer.send_email (Resend's API when
+#   RESEND_API_KEY is set, Gmail SMTP otherwise). The reset link is no longer
+#   written to the log in production when no provider is configured: a live
+#   reset link in a log is a way into the account.
+#
 # ✅ FIX (Apr 2026): Replaced SendGrid with Gmail SMTP.
 #
 #   Root cause of forgot-password emails never arriving:
@@ -24,44 +29,33 @@
 
 import os
 import logging
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+
+from mailer import send_email, provider  # Release H: Resend, with SMTP fallback
 
 log = logging.getLogger("pixelperfect")
 
 
 def send_password_reset_email(to_email: str, reset_link: str) -> None:
     """
-    Send a password reset email via Gmail SMTP.
+    Send a password reset email through mailer.send_email: Resend when
+    RESEND_API_KEY is set, otherwise Gmail SMTP (SMTP_USERNAME/SMTP_PASSWORD).
 
-    Uses the same env vars as the /contact endpoint:
-      SMTP_HOST       (default: smtp.gmail.com)
-      SMTP_PORT       (default: 587)
-      SMTP_USERNAME   onetechly@gmail.com
-      SMTP_PASSWORD   16-character Gmail app password
-
-    Raises smtplib.SMTPException (or similar) on delivery failure so that
+    Raises mailer.MailError on delivery failure so that
     main.py's /auth/forgot-password handler can log the error. The endpoint
     deliberately swallows the exception and returns {"ok": True} to prevent
     user enumeration — but the error IS logged for your visibility.
     """
-    smtp_host     = os.getenv("SMTP_HOST",     "smtp.gmail.com")
-    smtp_port     = int(os.getenv("SMTP_PORT", "587"))
-    smtp_user     = os.getenv("SMTP_USERNAME", "")
-    smtp_password = os.getenv("SMTP_PASSWORD", "")
-    from_name     = os.getenv("CONTACT_FROM_NAME", "PixelPerfect")
-
-    # ── Guard: SMTP not configured ────────────────────────────────────────
-    # In local dev with no SMTP vars set, log the link so you can test the
-    # reset flow without sending real email.
-    if not smtp_user or not smtp_password:
+    # ── Guard: no email provider configured ───────────────────────────────
+    # In local dev, log the link so the reset flow can be tested without
+    # sending real email. Never in production (see header).
+    if provider() == "none":
         log.warning(
-            "[PWD-RESET] SMTP not configured — reset email NOT sent to %s. "
-            "Set SMTP_USERNAME + SMTP_PASSWORD in Render environment.",
+            "[PWD-RESET] No email provider configured — reset email NOT sent to %s. "
+            "Set RESEND_API_KEY in Render environment.",
             to_email,
         )
-        log.info("[PWD-RESET] Dev reset link: %s", reset_link)
+        if os.getenv("ENVIRONMENT", "development").lower() != "production":
+            log.info("[PWD-RESET] Dev reset link: %s", reset_link)
         return
 
     # ── Email content ─────────────────────────────────────────────────────
@@ -134,26 +128,12 @@ pixelperfectapi.net
 </html>
 """
 
-    # ── Build MIME message ────────────────────────────────────────────────
-    msg = MIMEMultipart("alternative")
-    msg["Subject"]  = subject
-    msg["From"]     = f"{from_name} <{smtp_user}>"
-    msg["To"]       = to_email
-
-    msg.attach(MIMEText(text_body, "plain"))
-    msg.attach(MIMEText(html_body,  "html"))
-
     # ── Send ─────────────────────────────────────────────────────────────
-    # Any exception here propagates to the caller (main.py).
-    # The /auth/forgot-password endpoint catches it, logs it, and still
+    # Any MailError propagates to the caller (main.py). The
+    # /auth/forgot-password endpoint catches it, logs it, and still
     # returns {"ok": True} to prevent user enumeration.
-    with smtplib.SMTP(smtp_host, smtp_port) as server:
-        server.ehlo()
-        server.starttls()
-        server.login(smtp_user, smtp_password)
-        server.sendmail(smtp_user, to_email, msg.as_string())
-
-    log.info("✅ Password reset email sent to %s", to_email)
+    via = send_email(to_email, subject, text_body, html_body)
+    log.info("✅ Password reset email sent to %s (via %s)", to_email, via)
 
 # ===== END OF email_utils.py =================================================
 

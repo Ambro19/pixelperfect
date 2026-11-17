@@ -448,6 +448,8 @@ def clean_state(monkeypatch, tmp_path):
     _empty_all_tables()
     main._USER_LIMITERS.clear()
     main._IDEMP_STORE.clear()
+    import abuse_limits
+    abuse_limits.reset_all()                  # Release H: F-20 rate limits
     main._SUB_STATE_CACHE.clear()
     batch_module.JOBS.clear()
     yield

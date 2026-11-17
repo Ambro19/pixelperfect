@@ -238,6 +238,26 @@ MUTATIONS = [
      '        checks["database"] = "failing"',
      '        checks["database"] = "ok"',
      "Readiness reports the database as fine when it is down"),
+    ("M58", "main.py",
+     '    allowed, retry_after = abuse_limits.ip_limiter.hit(abuse_limits.client_ip(request))',
+     '    allowed, retry_after = True, 0',
+     "F-20: the per-IP limit on email endpoints is ignored"),
+    ("M59", "main.py",
+     '    ok, _ = abuse_limits.email_limiter.hit(f"{kind}:{email.strip().lower()}")',
+     '    ok = True',
+     "F-20: one address can be sent unlimited reset emails"),
+    ("M60", "mailer.py",
+     '    if os.getenv("RESEND_API_KEY", "").strip():\n        return "resend"',
+     '    if False:\n        return "resend"',
+     "Resend is never used even when its key is set"),
+    ("M61", "email_utils.py",
+     '        if os.getenv("ENVIRONMENT", "development").lower() != "production":\n',
+     '        if True:\n',
+     "A live password-reset link is written to the production log"),
+    ("M62", "main.py",
+     '@app.get("/subscription_status")\ndef subscription_status(',
+     'def subscription_status(',
+     "F-25 again: /subscription_status is no longer registered"),
     ("M34", "routers/screenshot.py",
      '    can_use, current, limit = check_user_screenshot_limit(current_user, db)\n    if not can_use:',
      '    can_use, current, limit = check_user_screenshot_limit(current_user, db)\n    if False:',
@@ -276,10 +296,16 @@ def _apply(root: Path, rel: str, old: str, new: str) -> None:
 
 
 def _copy_backend(dest: Path) -> None:
-    ignore = shutil.ignore_patterns(
+    base = shutil.ignore_patterns(
         "venv", ".venv", ".git", "__pycache__", "*.db", "*.db-*", "screenshots",
         "stripe-cli", "tools", "*.zip", "node_modules", ".env", ".env.*",
     )
+
+    def ignore(directory, names):
+        # Real .env files never leave the backend folder, but .env.example
+        # (placeholders only, checked by test_repo_hygiene.py) is needed.
+        return {n for n in base(directory, names) if n != ".env.example"}
+
     shutil.copytree(BACKEND, dest, ignore=ignore)
 
 
