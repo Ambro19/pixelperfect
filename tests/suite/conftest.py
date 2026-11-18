@@ -441,6 +441,17 @@ def _empty_all_tables() -> None:
             conn.execute(table.delete())
 
 
+# Release I (F-03): hostnames tests may point at private addresses.
+FAKE_DNS = {
+    "internal.attacker.test": ["10.1.2.3"],
+    "rebind.attacker.test": ["93.184.216.34", "127.0.0.1"],
+    "metadata.attacker.test": ["169.254.169.254"],
+    "v6-loopback.attacker.test": ["::1"],
+    "mapped.attacker.test": ["::ffff:192.168.1.10"],
+    "cgnat.attacker.test": ["100.64.0.9"],
+}
+
+
 @pytest.fixture(autouse=True)
 def clean_state(monkeypatch, tmp_path):
     """Every test starts with empty tables and empty in-process caches."""
@@ -450,6 +461,11 @@ def clean_state(monkeypatch, tmp_path):
     main._IDEMP_STORE.clear()
     import abuse_limits
     abuse_limits.reset_all()                  # Release H: F-20 rate limits
+    # Release I (F-03): no real DNS in tests. Hostnames resolve to a public
+    # documentation address unless a test maps them elsewhere.
+    import url_safety
+    monkeypatch.setattr(url_safety, "_resolve", lambda host: list(FAKE_DNS.get(host, ["93.184.216.34"])))
+    monkeypatch.delenv("ALLOW_PRIVATE_CAPTURE_TARGETS", raising=False)
     main._SUB_STATE_CACHE.clear()
     batch_module.JOBS.clear()
     yield

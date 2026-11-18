@@ -72,6 +72,8 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field, field_validator
+from starlette.concurrency import run_in_threadpool
+from url_safety import BLOCKED_MESSAGE, first_unsafe  # Release I (F-03)
 from sqlalchemy.orm import Session
 
 from auth_deps import get_current_user
@@ -520,6 +522,14 @@ def _job_to_out(job: Dict[str, Any]) -> BatchJobOut:
     return BatchJobOut(**{k: v for k, v in job.items() if k not in _INTERNAL_KEYS})
 
 
+async def _reject_private_urls(urls: List[str]) -> None:
+    """Release I (F-03): refuse the whole batch if any URL points at a private
+    or internal address. DNS lookups block, so they run in the thread pool."""
+    bad = await run_in_threadpool(first_unsafe, urls)
+    if bad is not None:
+        raise HTTPException(status_code=400, detail=f"{BLOCKED_MESSAGE} (URL: {bad})")
+
+
 def _enforce_tier_limits(urls: List[str], user: User) -> None:
     tier  = _get_user_tier(user)
     limit = _get_batch_limit(tier)
@@ -941,6 +951,7 @@ async def submit_batch(
     urls = request.collect_urls()
     if not urls:
         raise HTTPException(status_code=400, detail="No valid URLs found in request")
+    await _reject_private_urls(urls)                               # Release I (F-03)
     _enforce_tier_limits(urls, current_user)
     # ✅ NEW (Sep 2026): PDF + width gates (this router, not the legacy path,
     # is what actually serves POST /api/v1/batch/submit).
@@ -1029,6 +1040,7 @@ async def submit_batch_file(
         raise HTTPException(
             status_code=400, detail="No valid URLs found in uploaded file",
         )
+    await _reject_private_urls(urls)                               # Release I (F-03)
     _enforce_tier_limits(urls, current_user)
     _enforce_capture_gates(req.format, req.width, current_user)   # ✅ NEW
     _enforce_monthly_quota(urls, current_user, db)                # ✅ NEW

@@ -91,6 +91,8 @@ from typing import Optional, List, Dict, Any, Tuple, Union
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from pydantic import BaseModel, HttpUrl, Field
+from starlette.concurrency import run_in_threadpool
+from url_safety import UnsafeURL, assert_public_url  # Release I (F-03)
 
 from auth_deps import get_current_user
 from models import User, get_db, Screenshot, get_tier_limits, has_feature
@@ -368,6 +370,13 @@ async def send_webhook_notification(
     """
     if not webhook_url:
         return
+    # Release I (F-03): check again at delivery time, in case the webhook's
+    # DNS was changed to point inside our network after the request.
+    try:
+        await run_in_threadpool(assert_public_url, webhook_url)
+    except UnsafeURL:
+        logger.warning("❌ Webhook not sent: %s points to a private address", webhook_url)
+        return
 
     payload = {
         "event": "screenshot.completed",
@@ -521,6 +530,15 @@ async def create_screenshot(
                     )
                 ),
             )
+
+    # ── Release I (F-03): never fetch private / internal addresses ──────────
+    # DNS lookups block, so they run in the thread pool.
+    try:
+        await run_in_threadpool(assert_public_url, str(request.url))
+        if request.webhook_url:
+            await run_in_threadpool(assert_public_url, request.webhook_url)
+    except UnsafeURL as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
     # ── Capture ───────────────────────────────────────────────────────────────
     try:

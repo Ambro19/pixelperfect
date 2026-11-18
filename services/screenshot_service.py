@@ -96,6 +96,8 @@ from concurrent.futures import ThreadPoolExecutor
 from playwright.sync_api import sync_playwright, Browser, Error as PlaywrightError
 
 # ✅ NEW (Oct 2026 — F-14): shared time limits for page scripts and captures.
+import url_safety  # noqa: F401  (Release I, F-03)
+from url_safety import assert_public_final_url, block_private_requests
 from services.capture_guard import (
     CAPTURE_HARD_TIMEOUT_S,
     CUSTOM_JS_RUNNER,
@@ -810,6 +812,13 @@ class ScreenshotService:
                         "⚠️ Tracker blocking unavailable (non-fatal): %s", route_err
                     )
 
+            # Release I (F-03): Chromium refuses localhost and private IP
+            # addresses for the page, its redirects and every sub-resource.
+            # Registered AFTER the tracker routes on purpose: Playwright runs
+            # the most recently registered matching route first, and the
+            # tracker filter ends a request with continue_().
+            block_private_requests(page)
+
             page_loaded = False
             last_error: Optional[Exception] = None
 
@@ -993,6 +1002,10 @@ class ScreenshotService:
                     bbox_result["width"], bbox_result["height"],
                     device_scale_factor,
                 )
+
+            # Release I (F-03): the page may have redirected (or been sent by
+            # custom JavaScript) to a host that points inside our network.
+            assert_public_final_url(page.url)
 
             # ── 9. Capture ────────────────────────────────────────────────────
             # ✅ NEW (Aug 2026): `phase` lets the error handler tell the user

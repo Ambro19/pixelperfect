@@ -65,7 +65,7 @@ INTERNAL = [
 ]
 
 
-@defect("F-03", "capture URL may point at loopback / private / link-local addresses (SSRF)")
+# Fixed in Release I (Nov 2026): kept as a regression test.
 @pytest.mark.parametrize("target", INTERNAL)
 def test_f03_capture_refuses_internal_addresses(client, make_user, fake_shots, target):
     r = client.post("/api/v1/screenshot", headers=make_user("free").headers, json={"url": target})
@@ -73,7 +73,7 @@ def test_f03_capture_refuses_internal_addresses(client, make_user, fake_shots, t
     assert fake_shots.calls == []
 
 
-@defect("F-03", "batch URLs may point at internal addresses (SSRF)")
+# Fixed in Release I (Nov 2026): kept as a regression test.
 def test_f03_batch_refuses_internal_addresses(client, make_user, fake_shots):
     r = client.post("/api/v1/batch/submit", headers=make_user("pro").headers,
                     json={"urls": ["http://169.254.169.254/latest/meta-data/"]})
@@ -81,7 +81,7 @@ def test_f03_batch_refuses_internal_addresses(client, make_user, fake_shots):
     assert fake_shots.calls == []
 
 
-@defect("F-03", "webhook_url may point at internal addresses (SSRF)")
+# Fixed in Release I (Nov 2026): kept as a regression test.
 def test_f03_webhook_url_refuses_internal_addresses(client, make_user, monkeypatch):
     import routers.screenshot as rs
     sent = []

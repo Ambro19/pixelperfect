@@ -82,6 +82,13 @@ def site():
     srv.shutdown()
 
 
+@pytest.fixture(autouse=True)
+def _allow_local_test_site(monkeypatch):
+    # These pages are served from 127.0.0.1, which the SSRF guard (Release I,
+    # F-03) refuses in production. The guard itself is tested elsewhere.
+    monkeypatch.setenv("ALLOW_PRIVATE_CAPTURE_TARGETS", "1")
+
+
 @pytest.fixture(scope="module", autouse=True)
 def _chromium_path():
     exe = os.getenv("PP_CHROMIUM_EXECUTABLE")
