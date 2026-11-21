@@ -319,7 +319,7 @@ def test_f15_sync_never_adopts_a_stranger_customer(client, fake_stripe, db):
 
 
 # ----------------------------------------------------------------------- F-17
-@defect("F-17", "an API key alone can change the account email (then reset the password)")
+# Fixed in Release J (Nov 2026): kept as a regression test.
 def test_f17_api_key_cannot_change_email(client, make_user):
     u = make_user("pro", email="owner@example.com")
     r = client.put("/user/update_profile", headers=u.key_headers,
@@ -327,7 +327,7 @@ def test_f17_api_key_cannot_change_email(client, make_user):
     assert r.status_code in (400, 401, 403, 422)
 
 
-@defect("F-17", "an API key alone can delete the account")
+# Fixed in Release J (Nov 2026): kept as a regression test.
 def test_f17_api_key_cannot_delete_account(client, make_user):
     u = make_user("pro")
     assert client.delete("/user/delete_account", headers=u.key_headers).status_code in (401, 403)

@@ -2,7 +2,7 @@
 # AUTHENTICATION DEPENDENCIES - DUAL AUTH (JWT + API KEYS)
 # ============================================================================
 # File: backend/auth_deps.py
-# Updated: January 16, 2026
+# Updated: November 2026 (Release J: get_current_user_session, F-17)
 # Supports BOTH JWT tokens and API keys
 
 from fastapi import Depends, HTTPException, Header
@@ -156,6 +156,43 @@ def get_current_user(
         
         logger.debug(f"✅ JWT valid for user {user.username}")
         return user
+
+
+# ============================================================================
+# SIGNED-IN SESSION ONLY (Release J, F-17)
+# ============================================================================
+# An API key is meant to live in scripts, CI jobs and servers, where it is
+# much more likely to leak than a password. Before this release, the same key
+# could also change the account email, change the password, delete the
+# account, regenerate the key and open the billing portal, so anyone who
+# found a leaked key could take over or destroy the account.
+#
+# Account and billing endpoints now use this dependency instead of
+# get_current_user: they need the token the dashboard gets at sign-in, and an
+# API key is refused with 403. Screenshot, batch, history and read-only
+# endpoints (such as /users/me) keep accepting API keys.
+
+SESSION_REQUIRED_MESSAGE = (
+    "This action needs you to be signed in to your PixelPerfect account. "
+    "API keys can only be used for screenshot and read-only requests."
+)
+
+
+def is_api_key_credential(authorization: Optional[str]) -> bool:
+    """True when the Authorization header carries an API key, with or
+    without a scheme ("Bearer pk_...", "bearer pk_...", "pk_...")."""
+    parts = (authorization or "").strip().split()
+    return bool(parts) and parts[-1].startswith("pk_")
+
+
+def get_current_user_session(
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db)
+) -> User:
+    if is_api_key_credential(authorization):
+        logger.warning("Account endpoint called with an API key; refused (F-17)")
+        raise HTTPException(status_code=403, detail=SESSION_REQUIRED_MESSAGE)
+    return get_current_user(authorization=authorization, db=db)
 
 
 # ============================================================================

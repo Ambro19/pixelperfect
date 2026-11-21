@@ -121,7 +121,7 @@ from usage_accounting import (
     period_basis,           # ✅ NEW — "billing_cycle" | "calendar_month"
 )
 from db_migrations import run_startup_migrations
-from auth_deps import get_current_user
+from auth_deps import get_current_user, get_current_user_session  # Release J (F-17)
 from webhook_handler import handle_stripe_webhook
 
 from api_key_system import (
@@ -1151,7 +1151,7 @@ def reset_password(payload: ResetPasswordIn, db: Session = Depends(get_db)):
 @app.post("/user/change_password")
 async def change_password_endpoint(
     request:      ChangePasswordRequest,
-    current_user: User    = Depends(get_current_user),
+    current_user: User    = Depends(get_current_user_session),
     db:           Session = Depends(get_db),
 ):
     """Change password for logged-in user. Requires current password verification."""
@@ -1179,7 +1179,7 @@ async def change_password_endpoint(
 @app.put("/user/update_profile")
 async def update_profile_endpoint(
     request:      UpdateProfileRequest,
-    current_user: User    = Depends(get_current_user),
+    current_user: User    = Depends(get_current_user_session),
     db:           Session = Depends(get_db),
 ):
     """Update user profile information (username and/or email)."""
@@ -1338,7 +1338,7 @@ def _cancel_all_billing(user: User) -> int:
 # =====================================================================
 @app.delete("/user/delete_account")
 async def delete_account_endpoint(
-    current_user: User    = Depends(get_current_user),
+    current_user: User    = Depends(get_current_user_session),
     db:           Session = Depends(get_db),
 ):
     """Permanently deletes the authenticated user's account and all data."""
@@ -1479,7 +1479,7 @@ async def delete_account_endpoint(
 @app.get("/api/keys/current")
 async def get_current_api_key(
     db:           Session = Depends(get_db),
-    current_user: User    = Depends(get_current_user),
+    current_user: User    = Depends(get_current_user_session),
 ):
     api_key_record = db.query(ApiKey).filter(
         ApiKey.user_id  == current_user.id,
@@ -1517,7 +1517,7 @@ async def get_current_api_key(
 
 @app.post("/api/keys/regenerate")
 async def regenerate_api_key(
-    current_user: User    = Depends(get_current_user),
+    current_user: User    = Depends(get_current_user_session),
     db:           Session = Depends(get_db),
 ):
     return await regenerate_api_key_endpoint(current_user, db)
@@ -1711,7 +1711,7 @@ def paid_checkout_paused() -> bool:
 @app.post("/billing/create_checkout_session")
 def create_checkout_session(
     payload:      BillingCheckoutIn,
-    current_user: User    = Depends(get_current_user),
+    current_user: User    = Depends(get_current_user_session),
     db:           Session = Depends(get_db),
 ):
     if paid_checkout_paused():
@@ -1791,7 +1791,7 @@ def create_checkout_session(
 @app.post("/billing/create_portal_session")
 def create_portal_session(
     payload:      BillingPortalIn,
-    current_user: User    = Depends(get_current_user),
+    current_user: User    = Depends(get_current_user_session),
     db:           Session = Depends(get_db),
 ):
     if not stripe or not os.getenv("STRIPE_SECRET_KEY"):
@@ -1863,7 +1863,7 @@ def create_portal_session(
 # =====================================================================
 @app.post("/billing/cancel_subscription")
 def cancel_subscription(
-    current_user: User    = Depends(get_current_user),
+    current_user: User    = Depends(get_current_user_session),
     db:           Session = Depends(get_db),
 ):
     if not stripe or not os.getenv("STRIPE_SECRET_KEY"):

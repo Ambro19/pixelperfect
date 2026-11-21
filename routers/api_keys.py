@@ -13,7 +13,7 @@ from datetime import datetime
 from sqlalchemy.orm import Session
 
 from models import User, get_db
-from auth_deps import get_current_user
+from auth_deps import get_current_user_session  # Release J (F-17): key management needs a signed-in session
 from api_key_system import (
     create_api_key_for_user,
     regenerate_api_key,
@@ -57,7 +57,7 @@ class ApiKeyCreateRequest(BaseModel):
 
 @router.get("/", response_model=List[ApiKeyResponse])
 def list_api_keys(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user_session),
     db: Session = Depends(get_db)
 ):
     """
@@ -83,7 +83,7 @@ def list_api_keys(
 @router.post("/", response_model=ApiKeyCreateResponse)
 def create_api_key(
     request: ApiKeyCreateRequest,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user_session),
     db: Session = Depends(get_db)
 ):
     """
@@ -123,7 +123,7 @@ def create_api_key(
 
 @router.post("/regenerate", response_model=ApiKeyCreateResponse)
 def regenerate_key(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user_session),
     db: Session = Depends(get_db)
 ):
     """
@@ -153,7 +153,7 @@ def regenerate_key(
 @router.delete("/{key_id}")
 def delete_api_key(
     key_id: int,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user_session),
     db: Session = Depends(get_db)
 ):
     """
@@ -177,7 +177,7 @@ def delete_api_key(
 
 @router.get("/current")
 def get_current_api_key_info(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user_session),
     db: Session = Depends(get_db)
 ):
     """
