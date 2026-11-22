@@ -300,7 +300,7 @@ def _sub(sid="sub_V", status="active"):
             "current_period_end": 1_792_000_000}
 
 
-@defect("F-15", "sync adopts any Stripe customer with the same (unverified) email")
+# Fixed in Release K (Nov 2026): kept as a regression test.
 def test_f15_sync_never_adopts_a_stranger_customer(client, fake_stripe, db):
     # An orphaned customer (deleted account, or another product on the same
     # Stripe account) still holds a paid subscription.

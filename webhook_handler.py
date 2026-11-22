@@ -166,6 +166,19 @@ def _extract_email_from_checkout(obj: Dict[str, Any]) -> Optional[str]:
     return str(email).strip().lower() if email else None
 
 
+def _extract_app_user_id(obj: Dict[str, Any]) -> Optional[int]:
+    """The PixelPerfect user id a checkout session was created for
+    (client_reference_id, or metadata.app_user_id). None if absent."""
+    meta = obj.get("metadata") or {}
+    for raw in (obj.get("client_reference_id"), meta.get("app_user_id")):
+        try:
+            if raw is not None and str(raw).strip():
+                return int(str(raw).strip())
+        except ValueError:
+            continue
+    return None
+
+
 def _extract_period_end(event_type: str, obj: Dict[str, Any]) -> Optional[datetime]:
     if event_type.startswith("customer.subscription."):
         return _to_dt(obj.get("current_period_end"))
@@ -254,11 +267,23 @@ async def _process_event(db: Session, event_type: str, obj: Dict[str, Any]) -> d
                 event_type, user.username, user.id, customer_id,
             )
 
-    # ── Step 2: Checkout fallback — find by email, validate before writing ────
+    # ── Step 2: Checkout fallback — the user PixelPerfect named, not an email ─
+    # Release K (F-15): this used to look the user up by the checkout email.
+    # Emails are never verified, so a checkout created elsewhere on the same
+    # Stripe account (or by an old, deleted account) could attach a paid
+    # customer to whoever registered with that address. Every checkout
+    # PixelPerfect creates carries client_reference_id and
+    # metadata.app_user_id; only those decide the user now.
     if not user and event_type == "checkout.session.completed":
         email = _extract_email_from_checkout(obj)
-        if email:
-            candidate = _find_by_email(db, email)
+        app_user_id = _extract_app_user_id(obj)
+        if app_user_id is None:
+            logger.warning(
+                "Webhook %s: checkout has no PixelPerfect user id (customer_id=%s); "
+                "not matched by email. Ignored.", event_type, customer_id,
+            )
+        if app_user_id is not None:
+            candidate = db.get(User, app_user_id)
             if candidate:
                 # Guard: if another user already owns this customer_id, don't
                 # attach it here — that would corrupt the wrong account.
@@ -294,8 +319,8 @@ async def _process_event(db: Session, event_type: str, obj: Dict[str, Any]) -> d
                         user.stripe_customer_id = customer_id
             else:
                 logger.warning(
-                    "Webhook %s: no user found for email=%s (customer_id=%s)",
-                    event_type, email, customer_id,
+                    "Webhook %s: no user with id=%s (email=%s, customer_id=%s)",
+                    event_type, app_user_id, email, customer_id,
                 )
 
     # ── No user found ─────────────────────────────────────────────────────────

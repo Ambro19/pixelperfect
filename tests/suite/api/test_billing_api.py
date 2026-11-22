@@ -85,16 +85,45 @@ def test_webhook_unmapped_customer_is_acknowledged(client, fake_stripe, no_sync)
     assert r.status_code == 200 and r.json()["mapped_user"] is False
 
 
-def test_checkout_completed_attaches_customer_by_email(client, make_user, fake_stripe, no_sync, db):
+def test_checkout_completed_attaches_customer_to_the_user_it_was_created_for(
+        client, make_user, fake_stripe, no_sync, db):
+    # Release K (F-15): the checkout names its user (client_reference_id).
     u = make_user(email="payer@example.com")
     fake_stripe.webhook_event = _event(
         etype="checkout.session.completed", customer="cus_NEW",
+        client_reference_id=str(u.id),
         customer_details={"email": "Payer@Example.com"},
     )
     r = client.post("/webhook/stripe", content=b"{}")
     assert r.json()["user_id"] == u.id
     db.expire_all()
     assert db.get(models.User, u.id).stripe_customer_id == "cus_NEW"
+
+
+def test_checkout_metadata_app_user_id_also_identifies_the_user(
+        client, make_user, fake_stripe, no_sync, db):
+    u = make_user()
+    fake_stripe.webhook_event = _event(
+        etype="checkout.session.completed", customer="cus_META",
+        metadata={"app_user_id": str(u.id)},
+    )
+    assert client.post("/webhook/stripe", content=b"{}").json()["user_id"] == u.id
+
+
+def test_checkout_without_our_user_id_is_not_matched_by_email(
+        client, make_user, fake_stripe, no_sync, db):
+    # Release K (F-15): a checkout created outside PixelPerfect (another
+    # product on the same Stripe account) must not hand its customer to
+    # whoever registered here with the same, unverified email.
+    u = make_user(email="payer@example.com")
+    fake_stripe.webhook_event = _event(
+        etype="checkout.session.completed", customer="cus_ELSEWHERE",
+        customer_details={"email": "payer@example.com"},
+    )
+    r = client.post("/webhook/stripe", content=b"{}")
+    assert r.status_code == 200 and r.json()["mapped_user"] is False
+    db.expire_all()
+    assert db.get(models.User, u.id).stripe_customer_id is None
 
 
 def test_checkout_does_not_steal_a_customer_id_owned_by_someone_else(

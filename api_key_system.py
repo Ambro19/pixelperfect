@@ -222,16 +222,29 @@ def regenerate_api_key(
             ApiKey.user_id == user_id
         ).first()
     else:
-        # Get first active key
+        # Release K (F-26): the newest active key gives its name to the new one.
         old_key = db.query(ApiKey).filter(
             ApiKey.user_id == user_id,
             ApiKey.is_active == True
-        ).first()
+        ).order_by(ApiKey.created_at.desc(), ApiKey.id.desc()).first()
     
     # Deactivate old key
     if old_key:
         old_key.is_active = False
         logger.info(f"🔄 Deactivated old API key {old_key.key_prefix}")
+
+    # Release K (F-26): "Regenerate" must leave exactly one working key.
+    # Before, only the first active key the database returned was switched
+    # off; a user with two active keys (old backfill scripts, two dashboard
+    # tabs creating a key at the same moment) kept the other one working.
+    if not old_key_id:
+        others = db.query(ApiKey).filter(
+            ApiKey.user_id == user_id,
+            ApiKey.is_active == True
+        ).all()
+        for k in others:
+            k.is_active = False
+            logger.info(f"🔄 Deactivated extra active API key {k.key_prefix}")
     
     # Create new key
     new_key, new_record = create_api_key_for_user(

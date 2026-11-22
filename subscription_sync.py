@@ -2,7 +2,8 @@
 # SUBSCRIPTION SYNC — PixelPerfect Screenshot API
 # File: backend/subscription_sync.py
 # Author: OneTechly
-# Updated: August 2026 — PRODUCTION READY
+# Updated: November 2026 (Release K, F-15: adopt a Stripe customer only when
+#          its metadata.app_user_id names this user)
 # ============================================================================
 # Exports (imported by main.py — signatures unchanged):
 #   sync_user_subscription_from_stripe(user, db) -> None
@@ -370,7 +371,22 @@ def _list_entitled_subs(customer_id: str) -> Tuple[List[Dict[str, Any]], bool]:
     return subs, query_ok
 
 
-def _find_customer_with_sub_by_email(email: str) -> Tuple[Optional[Tuple[str, Dict[str, Any]]], bool]:
+def customer_belongs_to(customer: Any, user_id: Any) -> bool:
+    """Release K (F-15): a Stripe customer belongs to a PixelPerfect user only
+    when its metadata says so. Emails are never verified, so a matching email
+    proves nothing: anyone can register with someone else's address.
+    ensure_stripe_customer_for_user() stamps metadata.app_user_id on every
+    customer PixelPerfect creates."""
+    if user_id is None or not customer:
+        return False
+    try:
+        meta = customer.get("metadata") or {}
+    except AttributeError:
+        meta = getattr(customer, "metadata", None) or {}
+    return str(meta.get("app_user_id") or "") == str(user_id)
+
+
+def _find_customer_with_sub_by_email(email: str, user_id: Any = None) -> Tuple[Optional[Tuple[str, Dict[str, Any]]], bool]:
     """
     Duplicate-customer rescue: search ALL Stripe customers sharing this email
     and return the first that holds an active/trialing subscription.
@@ -397,6 +413,10 @@ def _find_customer_with_sub_by_email(email: str) -> Tuple[Optional[Tuple[str, Di
     for cust in customers.get("data") or []:
         cid = cust.get("id")
         if not cid:
+            continue
+        if not customer_belongs_to(cust, user_id):
+            # Release K (F-15): same email, but not created for this user.
+            logger.info("[sync] skipped customer %s: not owned by user %s", cid, user_id)
             continue
         subs, ok = _list_entitled_subs(cid)
         if not ok:
@@ -442,10 +462,11 @@ def sync_user_subscription_from_stripe(user, db) -> None:
     lookup_ok = True
     if not customer_id and email:
         try:
-            customers = stripe.Customer.list(email=email, limit=1)
-            data = customers.get("data") or []
-            if data:
-                customer_id = data[0].get("id")
+            customers = stripe.Customer.list(email=email, limit=10)
+            # Release K (F-15): only a customer stamped with this user's id.
+            owned = [c for c in (customers.get("data") or []) if customer_belongs_to(c, user_id)]
+            if owned:
+                customer_id = owned[0].get("id")
                 user.stripe_customer_id = customer_id
                 db.commit()
                 logger.info("[sync] recovered customer %s via email", customer_id)
@@ -467,7 +488,7 @@ def sync_user_subscription_from_stripe(user, db) -> None:
     # customer B (recreated customers, re-registration, manual deletions).
     corrected_customer_id: Optional[str] = None
     if sub is None and email:
-        rescued, rescue_ok = _find_customer_with_sub_by_email(email)
+        rescued, rescue_ok = _find_customer_with_sub_by_email(email, user_id)
         lookup_ok = lookup_ok and rescue_ok
         if rescued:
             new_customer_id, sub = rescued

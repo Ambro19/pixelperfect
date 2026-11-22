@@ -95,7 +95,7 @@ from mailer import send_email, provider as email_provider  # Release H
 from html import escape as html_escape
 import abuse_limits  # Release H: F-20 rate limits on email-sending endpoints
 from auth_utils import get_password_hash, verify_password
-from subscription_sync import sync_user_subscription_from_stripe, _apply_local_overdue_downgrade_if_possible
+from subscription_sync import sync_user_subscription_from_stripe, _apply_local_overdue_downgrade_if_possible, customer_belongs_to
 
 from models import (
     User,
@@ -1481,10 +1481,12 @@ async def get_current_api_key(
     db:           Session = Depends(get_db),
     current_user: User    = Depends(get_current_user_session),
 ):
+    # Release K (F-26): show the newest active key, not whichever the
+    # database happens to return first.
     api_key_record = db.query(ApiKey).filter(
         ApiKey.user_id  == current_user.id,
         ApiKey.is_active == True,
-    ).first()
+    ).order_by(ApiKey.created_at.desc(), ApiKey.id.desc()).first()
 
     if not api_key_record:
         try:
@@ -1886,9 +1888,13 @@ def cancel_subscription(
         email = (getattr(current_user, "email", "") or "").strip().lower()
         if email and stripe:
             try:
-                customers = stripe.Customer.list(email=email, limit=1)
-                if customers.data:
-                    customer_id = customers.data[0].id
+                customers = stripe.Customer.list(email=email, limit=10)
+                # Release K (F-15): never cancel a stranger's subscription
+                # because they share an (unverified) email address.
+                owned = [c for c in (customers.get("data") or [])
+                         if customer_belongs_to(c, current_user.id)]
+                if owned:
+                    customer_id = owned[0].get("id")
                     current_user.stripe_customer_id = customer_id
                     db.commit()
                     logger.info("cancel_subscription: found customer %s by email", customer_id)
