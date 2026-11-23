@@ -230,3 +230,45 @@ def test_delete_job_keeps_its_screenshots(client, make_user, db):
     assert db.get(models.BatchJob, job_id) is None
     rows = db.query(models.Screenshot).filter_by(user_id=u.id).all()
     assert len(rows) == 3 and all(r.batch_job_id is None for r in rows)   # ON DELETE SET NULL
+
+
+# ------------------------------------- Release L (F-02): trailing-slash spelling
+# "/api/v1/batch/submit/" used to reach an old wrapper in main.py that skipped
+# the period quotas, wrote no BatchJob row and captured inside the request.
+# Both spellings must now behave identically.
+@pytest.mark.parametrize("path", ["/api/v1/batch/submit", "/api/v1/batch/submit/"])
+def test_both_spellings_create_a_tracked_job(client, make_user, db, fake_shots, path):
+    u = make_user("pro")
+    # follow_redirects=False: served directly, not via a 307 redirect that
+    # curl (without -L) and some HTTP clients would not follow.
+    r = client.post(path, headers=u.headers, json={"urls": URLS}, follow_redirects=False)
+    assert r.status_code == 200, r.text
+    job_id = r.json()["id"]
+    assert db.get(models.BatchJob, job_id) is not None
+    assert len(fake_shots.calls) == 3
+
+
+def test_trailing_slash_counts_toward_the_batch_period_quota(client, make_user, monkeypatch):
+    monkeypatch.setenv("PRO_BATCH_LIMIT", "1")
+    u = make_user("pro")
+    assert client.post("/api/v1/batch/submit/", headers=u.headers,
+                       json={"urls": URLS[:1]}).status_code == 200
+    r = client.post("/api/v1/batch/submit", headers=u.headers, json={"urls": URLS[:1]})
+    assert r.status_code == 429
+
+
+def test_trailing_slash_refuses_free_tier_and_private_urls(client, make_user, fake_shots):
+    assert client.post("/api/v1/batch/submit/", headers=make_user("free").headers,
+                       json={"urls": URLS}).status_code == 403
+    r = client.post("/api/v1/batch/submit/", headers=make_user("pro").headers,
+                    json={"urls": ["http://127.0.0.1:10000/docs"]})
+    assert r.status_code == 400
+    assert fake_shots.calls == []
+
+
+def test_submit_file_with_trailing_slash(client, make_user):
+    r = client.post("/api/v1/batch/submit_file/", headers=make_user("pro").headers,
+                    files={"file": ("u.txt", io.BytesIO(b"https://a.example.com"), "text/plain")},
+                    follow_redirects=False)
+    assert r.status_code == 200, r.text
+    assert r.json()["total"] == 1

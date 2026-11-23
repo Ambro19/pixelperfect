@@ -13,6 +13,7 @@ import asyncio
 import io
 import os
 import threading
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -42,11 +43,41 @@ SELF_LOOP = (b"<!doctype html><html><body style='margin:0;height:3000px;backgrou
              b"<script>setTimeout(()=>{while(true){}}, 300)</script>loop</body></html>")
 # A page whose Content-Security-Policy forbids eval.
 CSP_PAGE = b"<!doctype html><html><body style='margin:0;background:#ff0000'>csp</body></html>"
+# Heavy-site behaviour (Release L check, Nov 2026). A page that keeps network
+# connections open forever, like analytics beacons, chat widgets and
+# long-polling: it never reaches "networkidle".
+BUSY_PAGE = (b"<!doctype html><html><body style='margin:0;background:#0000ff'>busy"
+             b"<script>for (let i = 0; i < 4; i++) fetch('/hang?' + i).catch(() => {});"
+             b"setInterval(() => fetch('/hang?poll' + Math.random()).catch(() => {}), 200);"
+             b"</script></body></html>")
+STREAM_HEAD = b"<!doctype html><html><body style='margin:0;background:#00ff00'>streaming"
+HITS = {"busy": 0}
 
 
 class _Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path.startswith("/hostile"):
+        import time
+        if self.path.startswith("/hang"):
+            time.sleep(30)               # never answers within a capture
+            return
+        if self.path.startswith("/stream"):
+            # Headers and the start of the page arrive at once; the rest of
+            # the HTML takes seconds, so "domcontentloaded" fires late.
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(STREAM_HEAD)
+            self.wfile.flush()
+            time.sleep(4)
+            try:
+                self.wfile.write(b"</body></html>")
+            except OSError:
+                pass
+            return
+        if self.path.startswith("/busy"):
+            HITS["busy"] += 1
+            body, headers = BUSY_PAGE, {}
+        elif self.path.startswith("/hostile"):
             body, headers = HOSTILE, {}
         elif self.path.startswith("/race"):
             body, headers = RACE_SABOTAGE, {}
@@ -320,3 +351,27 @@ async def test_page_that_freezes_itself_is_stopped_and_engine_recovers(svc, site
     assert _time.monotonic() - t0 < 60
     r = await svc.capture_screenshot(url=site, width=800, height=600)
     assert _pixel(r["filepath"], (400, 400)) == (255, 0, 0)
+
+
+# ------------------------------------------------------------ heavy websites
+async def test_page_that_never_goes_idle_is_captured_after_a_bounded_settle(svc, svc_module, site):
+    """A page that keeps connections open forever never reaches networkidle.
+    The engine navigates once, waits a bounded settle and captures anyway:
+    one download of the page, not one per retry."""
+    HITS["busy"] = 0
+    t0 = _time.monotonic()
+    r = await svc.capture_screenshot(url=site + "busy", width=800, height=600)
+    elapsed = _time.monotonic() - t0
+    assert _pixel(r["filepath"], (400, 300)) == (0, 0, 255)
+    assert HITS["busy"] == 1, "the page was downloaded more than once"
+    assert elapsed < svc_module.SETTLE_TIMEOUT_MS / 1000 + 15
+
+
+async def test_slow_html_falls_back_to_commit_and_still_captures(svc, svc_module, site, monkeypatch):
+    """When the HTML itself is too slow for domcontentloaded, the engine
+    retries with "commit" (response received) and captures what arrived."""
+    monkeypatch.setattr(svc_module, "NAV_TIMEOUT_MS", 1500)
+    monkeypatch.setattr(svc_module, "SETTLE_TIMEOUT_MS", 1000)
+    r = await svc.capture_screenshot(url=site + "stream", width=800, height=600)
+    assert Path(r["filepath"]).exists()
+

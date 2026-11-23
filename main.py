@@ -151,7 +151,6 @@ from routers.screenshot import (
 # but we leave the imports narrow to avoid breaking anything that might
 # import from this module transitively.
 from screenshot_endpoints import (
-    batch_screenshot_endpoint,
     regenerate_api_key_endpoint,
     BatchScreenshotRequest,
 )
@@ -1623,15 +1622,10 @@ async def capture_screenshot(
         db=db,
     )
 
-@app.post("/api/v1/batch/submit")
-@app.post("/api/v1/batch/submit/")
-async def batch_screenshot(
-    request:      BatchScreenshotRequest,
-    _guard:       None    = Depends(enforce_tier_concurrency),
-    current_user: User    = Depends(get_current_user),
-    db:           Session = Depends(get_db),
-):
-    return await batch_screenshot_endpoint(request, current_user, db)
+# Release L (F-02, Nov 2026): the old batch wrapper that lived here was
+# removed. batch.py's router serves POST /api/v1/batch/submit with and without
+# the trailing slash; the wrapper only ever answered the "/submit/" spelling,
+# and there it skipped the screenshot quota and the BatchJob record.
 
 # =====================================================================
 # Stripe webhook + billing

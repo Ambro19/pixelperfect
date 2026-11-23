@@ -39,7 +39,7 @@ URL = "https://example.com/"
 
 
 # ----------------------------------------------------------------------- F-02
-@defect("F-02", "POST /api/v1/batch/submit/ (trailing slash) skips the screenshot quota")
+# Fixed in Release L (Nov 2026): kept as a regression test.
 def test_f02_trailing_slash_batch_enforces_quota(client, make_user, add_screenshots,
                                                  monkeypatch, fake_shots, db):
     # The batch router owns /api/v1/batch/submit; main.py's legacy wrapper

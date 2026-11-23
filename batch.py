@@ -941,7 +941,11 @@ async def _process_job_async(
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
 
+# Release L (F-02): both spellings are served HERE. "/submit/" used to
+# fall through to an old wrapper in main.py that skipped the period quota,
+# wrote no BatchJob row and ran every capture inside the request.
 @router.post("/submit", response_model=BatchJobOut)
+@router.post("/submit/", response_model=BatchJobOut, include_in_schema=False)
 async def submit_batch(
     request:      BatchSubmitRequest = Body(...),
     current_user: User               = Depends(get_current_user),
@@ -987,6 +991,7 @@ async def submit_batch(
 
 
 @router.post("/submit_file", response_model=BatchJobOut)
+@router.post("/submit_file/", response_model=BatchJobOut, include_in_schema=False)
 async def submit_batch_file(
     file:            UploadFile       = File(...),
     format:          str              = Form(default="png"),
