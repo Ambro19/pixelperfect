@@ -239,6 +239,10 @@ TIER_CONCURRENCY: Dict[str, int] = {
     "starter":  2,
     "pro":      3,
     "business": 5,
+    # Release M (F-27, Nov 2026): Premium has its own entry. It used to be
+    # folded into "pro" by _normalize_tier, so Premium customers got 3
+    # concurrent captures, fewer than Business. 5 matches the Help Center.
+    "premium":  5,
 }
 
 CONCURRENCY_ACQUIRE_TIMEOUT_SECONDS = float(
@@ -248,7 +252,8 @@ CONCURRENCY_ACQUIRE_TIMEOUT_SECONDS = float(
 def _normalize_tier(raw: Optional[str]) -> str:
     t = (raw or "").strip().lower()
     if t in {"starter", "basic"}:        return "starter"
-    if t in {"pro", "premium"}:          return "pro"
+    if t == "pro":                       return "pro"
+    if t == "premium":                   return "premium"   # Release M (F-27)
     if t in {"business", "enterprise"}:  return "business"
     if t in {"free", ""}:               return "starter"
     return t
@@ -300,12 +305,14 @@ async def enforce_tier_concurrency(
             timeout=CONCURRENCY_ACQUIRE_TIMEOUT_SECONDS,
         )
     except asyncio.TimeoutError:
-        tier = _normalize_tier(getattr(current_user, "subscription_tier", None))
+        # Release M: name the plan the customer knows ("free", not the
+        # internal "starter" bucket).
+        tier = (getattr(current_user, "subscription_tier", None) or "free").strip().lower()
         raise HTTPException(
             status_code=429,
             detail=(
                 f"Too many concurrent screenshots for your plan "
-                f"(tier={tier}, limit={desired}). "
+                f"(plan={tier}, limit={desired}). "
                 "Please retry in a moment or upgrade for higher concurrency."
             ),
             headers={"Retry-After": "1"},

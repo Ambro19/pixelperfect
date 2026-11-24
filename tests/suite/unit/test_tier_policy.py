@@ -90,7 +90,8 @@ def test_batch_size_limits_agree_with_tier_limits_where_both_exist():
 
 @pytest.mark.parametrize("raw, normalized", [
     ("starter", "starter"), ("basic", "starter"), ("free", "starter"), ("", "starter"),
-    (None, "starter"), ("PRO", "pro"), ("premium", "pro"), ("enterprise", "business"),
+    (None, "starter"), ("PRO", "pro"), ("premium", "premium"), ("Premium", "premium"),
+    ("enterprise", "business"),
     ("business", "business"),
 ])
 def test_concurrency_tier_normalisation(raw, normalized):
@@ -134,3 +135,14 @@ def test_check_limit_premium_never_blocks(db, make_user, add_screenshots):
     add_screenshots(u.id, 5)
     allowed, current, limit = rs.check_user_screenshot_limit(db.get(models.User, u.id), db)
     assert (allowed, current, limit) == (True, 5, "unlimited")
+
+
+# Release M (F-27): every paid plan gets at least as many concurrent captures
+# as the plan below it. Premium used to be folded into Pro (3 < Business 5).
+def test_concurrency_never_decreases_with_a_higher_plan():
+    order = ["free", "pro", "business", "premium"]
+    class U:  # minimal stand-in for a User row
+        def __init__(self, tier): self.subscription_tier = tier
+    limits = [main._tier_limit_for_user(U(t)) for t in order]
+    assert limits == sorted(limits), dict(zip(order, limits))
+    assert main._tier_limit_for_user(U("premium")) >= main._tier_limit_for_user(U("business"))

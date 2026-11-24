@@ -92,7 +92,7 @@ def test_root_and_health(client):
     h = client.get("/health").json()
     assert h["status"] == "healthy"
     assert h["services"]["stripe"] == "not_configured"
-    assert h["tier_concurrency"] == {"starter": 2, "pro": 3, "business": 5}
+    assert h["tier_concurrency"] == {"starter": 2, "pro": 3, "business": 5, "premium": 5}   # F-27
     assert client.head("/").status_code == 200
     assert client.head("/health").status_code == 200
 

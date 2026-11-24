@@ -25,7 +25,7 @@ async def _burst(user, n, path="/api/v1/screenshot"):
         ])
 
 
-@pytest.mark.parametrize("tier, limit", [("free", 2), ("pro", 3), ("business", 5)])
+@pytest.mark.parametrize("tier, limit", [("free", 2), ("pro", 3), ("business", 5), ("premium", 5)])
 async def test_concurrency_limit_per_tier(make_user, fake_shots, fake_storage, tier, limit):
     fake_shots.delay_s = 1.5          # far longer than the 0.3 s acquire timeout
     u = make_user(tier)
@@ -79,3 +79,12 @@ async def test_upgrade_takes_effect_on_new_limiter(make_user, fake_shots, fake_s
     db.commit()
     responses = await _burst(u, 5)
     assert [r.status_code for r in responses] == [200] * 5
+
+
+async def test_429_names_the_customers_plan(make_user, fake_shots, fake_storage):
+    # Release M: the message used the internal bucket name ("starter").
+    fake_shots.delay_s = 1.5
+    u = make_user("free")
+    responses = await _burst(u, 3)
+    [r] = [r for r in responses if r.status_code == 429]
+    assert "plan=free" in r.json()["detail"] and "starter" not in r.json()["detail"]
